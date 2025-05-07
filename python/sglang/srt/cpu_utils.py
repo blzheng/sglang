@@ -24,8 +24,7 @@ def get_moe_padding_size(model_config, load_config):
     from sglang.srt.model_loader.loader import _get_quantization_config
 
     quant_config = _get_quantization_config(model_config, load_config)
-
-    if quant_config is not None and hasattr(quant_config, "weight_block_size"):
+    if quant_config is not None and hasattr(quant_config, "weight_block_size") and quant_config.weight_block_size is not None:
         # See NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
         weight_block_size = getattr(quant_config, "weight_block_size")
 
