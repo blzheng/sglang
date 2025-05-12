@@ -450,16 +450,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         if self.quant_config.activation_scheme == "static":
-            dtype = x.dtype
-            weight = torch.ops.quantized_decomposed.dequantize_per_tensor(
-                input=layer.weight,
-                scale=layer.weight_scale,
-                zero_point=0,
-                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
-                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
-                dtype=layer.weight.data.dtype,
-                out_dtype=dtype,
-            )
+            # dtype = x.dtype
+            # weight = torch.ops.quantized_decomposed.dequantize_per_tensor(
+            #     input=layer.weight,
+            #     scale=layer.weight_scale,
+            #     zero_point=0,
+            #     quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
+            #     quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
+            #     dtype=layer.weight.data.dtype,
+            #     out_dtype=dtype,
+            # )
 
             q_input = torch.ops.quantized_decomposed.quantize_per_tensor(
                 input=x,
@@ -469,16 +469,24 @@ class Fp8LinearMethod(LinearMethodBase):
                 quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
                 dtype=torch.float8_e4m3fn,
             )
-            dq_input = torch.ops.quantized_decomposed.dequantize_per_tensor(
-                input=q_input,
-                scale=layer.input_scale,
-                zero_point=0,
-                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
-                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
-                dtype=q_input.dtype,
-                out_dtype=dtype,
+            # dq_input = torch.ops.quantized_decomposed.dequantize_per_tensor(
+            #     input=q_input,
+            #     scale=layer.input_scale,
+            #     zero_point=0,
+            #     quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
+            #     quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
+            #     dtype=q_input.dtype,
+            #     out_dtype=dtype,
+            # )
+            # return torch.nn.functional.linear(dq_input, weight.T, bias)
+            return torch._scaled_mm(
+                q_input,
+                layer.weight,
+                bias = bias,
+                out_dtype=x.dtype,
+                scale_a = layer.input_scale,
+                scale_b = layer.weight_scale,
             )
-            return torch.nn.functional.linear(dq_input, weight.T, bias)
 
         return apply_fp8_linear(
             input=x,
