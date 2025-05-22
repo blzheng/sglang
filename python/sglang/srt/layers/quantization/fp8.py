@@ -400,7 +400,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
             # Update layer with new values.
-            layer.weight = Parameter(weight.t(), requires_grad=False)
+            layer.weight = Parameter(weight.t().contiguous(), requires_grad=False)
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             if self.quant_config.activation_scheme == "static":
                 layer.input_scale = Parameter(
@@ -417,6 +417,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        out_dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
 
         if self.use_marlin:
@@ -460,15 +461,17 @@ class Fp8LinearMethod(LinearMethodBase):
             #     dtype=layer.weight.data.dtype,
             #     out_dtype=dtype,
             # )
-
-            q_input = torch.ops.quantized_decomposed.quantize_per_tensor(
-                input=x,
-                scale=layer.input_scale,
-                zero_point=0,
-                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
-                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
-                dtype=torch.float8_e4m3fn,
-            )
+            if out_dtype is None:
+                out_dtype = x.dtype
+            if x.dtype != torch.float8_e4m3fn:
+                q_input = torch.ops.quantized_decomposed.quantize_per_tensor(
+                    input=x,
+                    scale=layer.input_scale,
+                    zero_point=0,
+                    quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
+                    quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
+                    dtype=torch.float8_e4m3fn,
+                )
             # dq_input = torch.ops.quantized_decomposed.dequantize_per_tensor(
             #     input=q_input,
             #     scale=layer.input_scale,
@@ -483,7 +486,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 q_input,
                 layer.weight,
                 bias = bias,
-                out_dtype=x.dtype,
+                out_dtype=out_dtype,
                 scale_a = layer.input_scale,
                 scale_b = layer.weight_scale,
             )

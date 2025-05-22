@@ -160,6 +160,12 @@ class LlamaAttention(nn.Module):
             rope_scaling=rope_scaling,
             is_neox_style=rope_is_neox_style,
         )
+        self.q_out_scale = torch.nn.Parameter(torch.tensor(1., dtype=torch.float32), requires_grad=False)
+        self.k_out_scale = torch.nn.Parameter(torch.tensor(1., dtype=torch.float32), requires_grad=False)
+        self.attn_weights_scale = torch.nn.Parameter(torch.tensor(1., dtype=torch.float32), requires_grad=False)
+        self.v_out_scale = torch.nn.Parameter(torch.tensor(1., dtype=torch.float32), requires_grad=False)
+        self.qk_out_scale = torch.nn.Parameter(torch.tensor(1., dtype=torch.float32), requires_grad=False)
+        self.attn_out_scale = torch.nn.Parameter(torch.tensor(1., dtype=torch.float32), requires_grad=False)
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -167,6 +173,8 @@ class LlamaAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
+            qk_out_scale=self.qk_out_scale,
+            attn_weights_scale=self.attn_weights_scale,
         )
 
     def forward(
@@ -175,8 +183,41 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if self.qkv_proj.weight.dtype == torch.float8_e4m3fn:
+            # acc issue with fp8 output
+            qkv, _ = self.qkv_proj(hidden_states, torch.float8_e4m3fn)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            dtype = hidden_states.dtype
+            q = torch.ops.quantized_decomposed.dequantize_per_tensor(
+                input=q,
+                scale=self.q_out_scale,
+                zero_point=0,
+                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
+                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
+                dtype=q.dtype,
+                out_dtype=dtype,
+            )
+            k = torch.ops.quantized_decomposed.dequantize_per_tensor(
+                input=k,
+                scale=self.k_out_scale,
+                zero_point=0,
+                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
+                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
+                dtype=k.dtype,
+                out_dtype=dtype,
+            )
+            v = torch.ops.quantized_decomposed.dequantize_per_tensor(
+                input=v,
+                scale=self.v_out_scale,
+                zero_point=0,
+                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
+                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
+                dtype=v.dtype,
+                out_dtype=dtype,
+            )
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)

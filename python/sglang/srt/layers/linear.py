@@ -181,6 +181,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        out_dtype = None,
     ) -> torch.Tensor:
 
         if layer.use_intel_amx_backend:
@@ -296,10 +297,10 @@ class ReplicatedLinear(LinearBase):
         assert param.size() == loaded_weight.size()
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, out_dtype=None) -> torch.Tensor:
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
-        output = self.quant_method.apply(self, x, bias)
+        output = self.quant_method.apply(self, x, bias, out_dtype)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
 
@@ -469,12 +470,12 @@ class ColumnParallelLinear(LinearBase):
             # However, we should fix this and avoid the branching here.
             param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, out_dtype=None):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        output_parallel = self.quant_method.apply(self, input_, bias, out_dtype)
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -1306,7 +1307,7 @@ class RowParallelLinear(LinearBase):
             # It does not support additional parameters.
             param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, out_dtype=None):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1320,7 +1321,7 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_, out_dtype=out_dtype)
         if self.reduce_results and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output_parallel)
         else:
