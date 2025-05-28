@@ -65,7 +65,10 @@ add_compile_options(
 
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 target_link_libraries(common_ops PRIVATE ${TORCH_LIBRARIES} ${NUMA_LIB})
-target_include_directories(common_ops PRIVATE ${TORCH_INCLUDE_DIRS})
+target_include_directories(common_ops PRIVATE
+    ${TORCH_INCLUDE_DIRS}
+    $ENV{CONDA_PREFIX}/include
+)
 
 install(TARGETS common_ops
     LIBRARY DESTINATION sgl_kernel
