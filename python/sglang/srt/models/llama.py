@@ -183,41 +183,8 @@ class LlamaAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.qkv_proj.weight.dtype == torch.float8_e4m3fn:
-            # acc issue with fp8 output
-            qkv, _ = self.qkv_proj(hidden_states, torch.float8_e4m3fn)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            dtype = hidden_states.dtype
-            q = torch.ops.quantized_decomposed.dequantize_per_tensor(
-                input=q,
-                scale=self.q_out_scale,
-                zero_point=0,
-                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
-                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
-                dtype=q.dtype,
-                out_dtype=dtype,
-            )
-            k = torch.ops.quantized_decomposed.dequantize_per_tensor(
-                input=k,
-                scale=self.k_out_scale,
-                zero_point=0,
-                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
-                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
-                dtype=k.dtype,
-                out_dtype=dtype,
-            )
-            v = torch.ops.quantized_decomposed.dequantize_per_tensor(
-                input=v,
-                scale=self.v_out_scale,
-                zero_point=0,
-                quant_min=int(torch.finfo(torch.float8_e4m3fn).min),
-                quant_max=int(torch.finfo(torch.float8_e4m3fn).max),
-                dtype=v.dtype,
-                out_dtype=dtype,
-            )
-        else:
-            qkv, _ = self.qkv_proj(hidden_states)
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
