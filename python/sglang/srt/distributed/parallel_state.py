@@ -416,8 +416,7 @@ class GroupCoordinator:
 
         if input_.is_cpu:
             # TODO: fix the binding of device_group
-            if False:
-                # if cpu_has_amx_support():
+            if cpu_has_amx_support():
                 # TODO: check correctness
                 torch.ops.sgl_kernel.shm_allreduce(
                     input_, self.device_group, torch.distributed.ReduceOp.SUM
@@ -539,8 +538,7 @@ class GroupCoordinator:
 
         if input_.is_cpu:
             # TODO: fix the binding of device_group
-            if False:
-                # if cpu_has_amx_support():
+            if cpu_has_amx_support():
                 return torch.ops.sgl_kernel.shm_allgather(
                     input_, get_tp_group().device_group, dim
                 )
