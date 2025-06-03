@@ -419,7 +419,7 @@ class GroupCoordinator:
             if cpu_has_amx_support():
                 # TODO: check correctness
                 torch.ops.sgl_kernel.shm_allreduce(
-                    input_, self.device_group, torch.distributed.ReduceOp.SUM
+                    input_, torch.distributed.ReduceOp.SUM
                 )
             else:
                 # fallback when intel amx backend not available
@@ -539,9 +539,7 @@ class GroupCoordinator:
         if input_.is_cpu:
             # TODO: fix the binding of device_group
             if cpu_has_amx_support():
-                return torch.ops.sgl_kernel.shm_allgather(
-                    input_, get_tp_group().device_group, dim
-                )
+                return torch.ops.sgl_kernel.shm_allgather(input_, dim)
             else:
                 torch.distributed.all_gather_into_tensor(
                     output_tensor, input_, group=self.device_group
