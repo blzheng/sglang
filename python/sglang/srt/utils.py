@@ -2189,8 +2189,13 @@ def cpu_has_amx_support():
     return torch._C._cpu._is_amx_tile_supported() and is_intel_amx_backend_available
 
 
-def is_shm_available(dtype):
-    return cpu_has_amx_support() and dtype in [torch.bfloat16, torch.float]
+def is_shm_available(dtype, world_size, local_size):
+    return (
+        cpu_has_amx_support()
+        and dtype in [torch.bfloat16, torch.float]
+        and world_size >= 1
+        and world_size == local_size
+    )
 
 
 def prepack_weight_if_needed(weight):
