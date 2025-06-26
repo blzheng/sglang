@@ -275,13 +275,13 @@ class TorchNativeAttnBackend(AttentionBackend):
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            kv_indices = create_torch_native_kv_indices(
+            create_torch_native_kv_indices(
                 req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
+                kv_indices,
                 kv_start_idx,
-                req_to_token.shape[1]
             )
         else:
             assert isinstance(spec_info, EagleDraftInput) or isinstance(
@@ -322,13 +322,13 @@ class TorchNativeAttnBackend(AttentionBackend):
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = torch.empty(seq_lens_sum, dtype=torch.int32)
-            kv_indices = create_torch_native_kv_indices(
+            create_torch_native_kv_indices(
                 req_to_token,
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
+                kv_indices,
                 kv_start_idx,
-                req_to_token.shape[1]
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
