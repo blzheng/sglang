@@ -20,6 +20,7 @@ class TorchNativeAttnBackend(AttentionBackend):
         self.forward_metadata = None
         self.device = model_runner.device
         max_bs = model_runner.req_to_token_pool.size
+        self.req_to_token = model_runner.req_to_token_pool.req_to_token.clone()
         self.kv_indptr = [
             torch.zeros(
                 (max_bs + 1,), dtype=torch.int32, device=model_runner.device
@@ -231,7 +232,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             o_,
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
+            self.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.extend_prefix_lens,
@@ -239,7 +240,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=not layer.is_cross_attention,
-            kv_indices=kv_indices,
+            kv_indices=kv_indices if layer.is_cross_attention else None,
         )
         o = o.view(-1, layer.tp_q_head_num*layer.v_head_dim)
         return o
@@ -295,6 +296,9 @@ class TorchNativeAttnBackend(AttentionBackend):
                     req_to_token,
                 )
             )
+        for i in range(bs):
+            req_pool_index = req_pool_indices[i]
+            self.req_to_token[req_pool_index, :kv_indptr[-1]] = kv_indices[:kv_indptr[-1]]
         return kv_indices[:kv_indptr[-1]]
 
 
@@ -333,6 +337,9 @@ class TorchNativeAttnBackend(AttentionBackend):
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
+        for i in range(bs):
+            req_pool_index = req_pool_indices[i].item()
+            self.req_to_token[req_pool_index, :kv_indptr[-1]] = kv_indices[:kv_indptr[-1]]
         return kv_indices[:kv_indptr[-1]]
 
     def forward_decode(
@@ -373,13 +380,13 @@ class TorchNativeAttnBackend(AttentionBackend):
             o_,
             forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
             forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            forward_batch.req_to_token_pool.req_to_token,
+            self.req_to_token,
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=False,
-            kv_indices=kv_indices,
+            kv_indices=kv_indices if layer.is_cross_attention else None,
         )
 
         return o
