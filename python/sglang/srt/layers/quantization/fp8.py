@@ -7,7 +7,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
-
+import os
+SGLANG_DEEPSEEK_FP8A8 = os.getenv("SGLANG_DEEPSEEK_FP8A8", "0") == "1"
 from sglang.srt.cpu_utils import _process_weight_after_loading, cpu_has_amx_support
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import (
@@ -186,6 +187,20 @@ def requantize_with_max_scale_cpu(
 
     return max_w_scale, weight
 
+def _quantize_fp8e4m3(t: torch.Tensor, channelwise: bool, scale: Optional[torch.Tensor] = None):
+    quant_max = torch.finfo(torch.float8_e4m3fn).max
+    eps = torch.Tensor([torch.finfo(torch.float32).eps])
+    if channelwise:
+        scale = scale or t.reshape(t.shape[0], -1).abs().max(-1)[0] / quant_max
+        scale = torch.max(scale, eps)
+        scale_reshape = scale.reshape((-1,) + (1,) * (t.dim() - 1))
+        qt = t / scale_reshape
+    else:
+        scale = scale or t.abs().max().reshape([1]) / quant_max
+        scale = torch.max(scale, eps) if isinstance(scale, torch.Tensor) else max(scale, eps.item())
+        qt = t / scale
+    qt = qt.to(torch.float8_e4m3fn)
+    return qt, scale
 
 class Fp8LinearMethod(LinearMethodBase):
     """Linear method for FP8.
@@ -342,6 +357,9 @@ class Fp8LinearMethod(LinearMethodBase):
                     cpu_has_amx_support()
                 ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
                 _process_weight_after_loading(layer, ["weight"])
+                if SGLANG_DEEPSEEK_FP8A8:
+                    layer.qw_packed = torch.ops.onednn.qlinear_prepack(layer.weight, None)
+                    layer.w_zp = torch.zeros_like(layer.weight_scale_inv).to(torch.int)
             else:
                 layer.weight = torch.nn.Parameter(
                     layer.weight.data, requires_grad=False
@@ -438,14 +456,23 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.block_quant:
             if layer.use_intel_amx_backend:
-                return sgl_kernel.cpu.fp8_scaled_mm(
-                    x,
-                    layer.weight,
-                    layer.weight_scale_inv,
-                    self.quant_config.weight_block_size,
-                    bias,
-                    x.dtype,
-                )
+                if SGLANG_DEEPSEEK_FP8A8:
+                    x_q, x_s = _quantize_fp8e4m3(x , False)
+                    x_zp = torch.zeros_like(x_s).to(torch.int)
+
+                    return torch.ops.onednn.qlinear_pointwise.tensor(
+                            x_q, x_s, x_zp, layer.qw_packed, layer.weight_scale_inv, layer.w_zp,
+                            None, 1, 0, torch.bfloat16,
+                            "none", (), "none")
+                else:
+                    return sgl_kernel.cpu.fp8_scaled_mm(
+                        x,
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        self.quant_config.weight_block_size,
+                        bias,
+                        x.dtype,
+                    )
 
             return apply_w8a8_block_fp8_linear(
                 input=x,
