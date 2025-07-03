@@ -149,6 +149,7 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     get_bool_env_var,
     get_zmq_socket,
+    is_cpu,
     kill_itself_when_parent_died,
     point_to_point_pyobj,
     pyspy_dump_schedulers,
@@ -167,6 +168,7 @@ TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
+_is_cpu = is_cpu()
 
 @dataclass
 class GenerationBatchResult:
@@ -2115,11 +2117,12 @@ class Scheduler(
             "kvcache": round(
                 self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
             ),
-            "cuda_graph": round(
-                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
-            ),
             "token_capacity": int(self.max_total_num_tokens),
         }
+        if not _is_cpu:
+            ret["memory_usage"]["cuda_graph"] = round(
+                self.tp_worker.worker.model_runner.cuda_graph_mem_usage, 2
+            )
         if not self.spec_algorithm.is_none() and self.cum_spec_accept_count > 0:
             ret["avg_spec_accept_length"] = (
                 self.cum_spec_accept_length / self.cum_spec_accept_count
