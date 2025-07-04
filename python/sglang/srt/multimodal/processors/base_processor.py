@@ -14,8 +14,9 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import encode_video, load_audio, load_image
+from sglang.srt.utils import encode_video, load_audio, load_image, is_cpu
 
+_is_cpu = is_cpu()
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
@@ -144,7 +145,7 @@ class BaseMultimodalProcessor(ABC):
         processor = self._processor
         if hasattr(processor, "image_processor") and isinstance(
             processor.image_processor, BaseImageProcessorFast
-        ):
+        ) and not _is_cpu:
             kwargs["device"] = "cuda"
         result = processor.__call__(
             text=[input_text],
@@ -316,7 +317,6 @@ class BaseMultimodalProcessor(ABC):
         assert isinstance(prompt, str)
         # split text into list of normal text and special tokens
         text_parts = re.split(multimodal_tokens_pattern, prompt)
-
         futures, task_info = self.submit_data_loading_tasks(
             text_parts=text_parts,
             multimodal_tokens=multimodal_tokens,
