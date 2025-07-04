@@ -13,8 +13,9 @@ from PIL import Image
 from transformers import BaseImageProcessorFast
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
-from sglang.srt.utils import load_audio, load_image, load_video, logger
+from sglang.srt.utils import load_audio, load_image, load_video, logger, is_cpu
 
+_is_cpu = is_cpu()
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
@@ -209,7 +210,7 @@ class BaseMultimodalProcessor(ABC):
         processor = self._processor
         if hasattr(processor, "image_processor") and isinstance(
             processor.image_processor, BaseImageProcessorFast
-        ):
+        ) and not _is_cpu:
             kwargs["device"] = "cuda"
         result = processor.__call__(
             text=[input_text],
