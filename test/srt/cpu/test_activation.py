@@ -4,7 +4,7 @@ import unittest
 import sgl_kernel
 import torch
 import torch.nn.functional as F
-from utils import SiluAndMul, GeluAndMul, precision
+from utils import GeluAndMul, SiluAndMul, precision
 
 from sglang.test.test_utils import CustomTestCase
 
