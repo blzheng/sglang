@@ -44,9 +44,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import add_prefix, make_layers
-
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, make_layers
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
