@@ -887,7 +887,7 @@ def sample_mmmu_requests(
                                         "role": "user",
                                         "content": [
                                             {"type": "image", "image": image_data},
-                                            {"type": "text", "text": prompt}
+                                            {"type": "text", "text": prompt},
                                         ],
                                     }
                                 ],
