@@ -34,6 +34,9 @@ from sglang.srt.utils import (
     is_npu,
     set_weight_attrs,
     use_intel_amx_backend,
+    native_w8a8_per_token_matmul,
+    per_token_quant_int8_cpu,
+    torch_w8a8_per_column_moe,
 )
 
 _is_cuda = is_cuda()
@@ -308,14 +311,15 @@ class W8A8Int8LinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: W8A8Int8Config):
         self.quantization_config = quantization_config
+        self.cpu_wo_amx_warning_echoed = False
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8LinearMethod on CPU requires that CPU has AMX support"
-            _amx_process_weight_after_loading(layer, ["weight"])
-            return
+            if _is_cpu_amx_available:
+                _amx_process_weight_after_loading(layer, ["weight"])
+                return
+            else:
+                layer.use_intel_amx_backend = False
 
         layer.weight = Parameter(layer.weight.t(), requires_grad=False)
         layer.weight_scale = Parameter(layer.weight_scale.data, requires_grad=False)
@@ -365,6 +369,11 @@ class W8A8Int8LinearMethod(LinearMethodBase):
                 bias,
                 x.dtype,
                 True,  # is_vnni
+            )
+        elif layer.weight.device == torch.device("cpu"):
+            x_q, x_scale = per_token_quant_int8_cpu(x)
+            return native_w8a8_per_token_matmul(
+                x_q, layer.weight, x_scale, layer.weight_scale, bias, x.dtype
             )
 
         x_q, x_scale = per_token_quant_int8(x)
@@ -462,11 +471,11 @@ class W8A8Int8MoEMethod:
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "W8A8Int8MoEMethod on CPU requires that CPU has AMX support"
-            _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
-            return
+            if _is_cpu_amx_available:
+                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+                return
+            else:
+                layer.use_intel_amx_backend = False
 
         layer.w13_weight = Parameter(layer.w13_weight, requires_grad=False)
         layer.w2_weight = Parameter(layer.w2_weight, requires_grad=False)
@@ -531,7 +540,17 @@ class W8A8Int8MoEMethod:
                 layer.w2_input_scale,  # a2_scale
                 True,  # is_vnni
             )
-
+        elif all(w.device.type == "cpu" for w in [layer.w13_weight, layer.w2_weight]):
+            return torch_w8a8_per_column_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                topk_weights,
+                topk_ids,
+                top_k,
+            )
         return fused_experts(
             x,
             layer.w13_weight,

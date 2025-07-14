@@ -42,7 +42,7 @@ _is_cpu = is_cpu()
 
 if _is_cuda:
     from sgl_kernel import gelu_and_mul, silu_and_mul
-elif _is_cpu and _is_cpu_amx_available:
+elif _is_cpu:
     pass
 else:
     from vllm import _custom_ops as vllm_ops
