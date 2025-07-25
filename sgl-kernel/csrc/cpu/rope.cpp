@@ -104,23 +104,9 @@ void rotary_embedding_neox_2D_kernel_impl(
 
       bVec _q_x = bVec::loadu(qk + out_x);
       bVec _q_y = bVec::loadu(qk + out_y);
-      fVec _cos_0, _cos_1;
-      std::tie(_cos_0, _cos_1) = at::vec::convert_to_float(_cos);
-      fVec _sin_0, _sin_1;
-      std::tie(_sin_0, _sin_1) = at::vec::convert_to_float(_sin);
-      fVec _q_x_0, _q_x_1;
-      std::tie(_q_x_0, _q_x_1) = at::vec::convert_to_float(_q_x);
-      fVec _q_y_0, _q_y_1;
-      std::tie(_q_y_0, _q_y_1) = at::vec::convert_to_float(_q_y);
-
-      auto out1_0 = _q_x_0 * _cos_0 - _q_y_0 * _sin_0;
-      auto out1_1 = _q_x_1 * _cos_1 - _q_y_1 * _sin_1;
-      auto out1 = convert_from_float_ext<scalar_t>(out1_0, out1_1);
+      auto out1 = _q_x * _cos - _q_y * _sin;
+      auto out2 = _q_y * _cos + _q_x * _sin;
       out1.store(qk + out_x);
-
-      auto out2_0 = _q_y_0 * _cos_0 + _q_x_0 * _sin_0;
-      auto out2_1 = _q_y_1 * _cos_1 + _q_x_1 * _sin_1;
-      auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
       out2.store(qk + out_y);
     }
     if (!flag) {
