@@ -879,8 +879,7 @@ def sample_mmmu_requests(
                 prompt = f"Question: {question}\n\nAnswer: "
                 if apply_chat_template:
                     try:
-                        if "gemma" in tokenizer.name_or_path:
-                            # For Gemma, we need to use the <image> tag
+                        if "llama" in tokenizer.name_or_path.lower() or "gemma" in tokenizer.name_or_path.lower():
                             prompt = tokenizer.apply_chat_template(
                                 [
                                     {
