@@ -3,10 +3,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from torch.nn.functional import scaled_dot_product_attention
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from torch.nn.functional import scaled_dot_product_attention
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -110,7 +111,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             end_q = start_q + extend_seq_len_q
             if encoder_lens is not None:
                 start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
-                end_kv = encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+                end_kv = (
+                    encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+                )
             else:
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
@@ -168,8 +171,8 @@ class IntelAMXAttnBackend(AttentionBackend):
             output: [num_tokens, num_heads, head_size]
             k_cache: [max_total_num_tokens, num_heads, head_size]
             v_cache: [max_total_num_tokens, num_heads, head_size]
-            req_to_token: torch.Tensor,
-            req_pool_indices: torch.Tensor,
+            req_to_token: [max_num_reqs, max_context_len],
+            req_pool_indices: [num_seqs],
             seq_lens: [num_seqs]
             encoder_lens: [num_seqs] or None
             scaling: float or None
@@ -190,11 +193,13 @@ class IntelAMXAttnBackend(AttentionBackend):
             # Need optimize the performance later.
 
             seq_len_q = 1
-            seq_len_kv = encoder_lens[seq_idx] if is_cross_attn else seq_lens[seq_idx]
+            seq_len_kv = seq_lens[seq_idx]
             end_q = start_q + seq_len_q
             if encoder_lens is not None:
                 start_kv = 0 if is_cross_attn else encoder_lens[seq_idx]
-                end_kv = encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+                end_kv = (
+                    encoder_lens[seq_idx] if is_cross_attn else start_kv + seq_len_kv
+                )
             else:
                 start_kv = 0
                 end_kv = start_kv + seq_len_kv
@@ -226,7 +231,6 @@ class IntelAMXAttnBackend(AttentionBackend):
 
         return output
 
-
     def forward_extend(
         self,
         q,
@@ -248,9 +252,7 @@ class IntelAMXAttnBackend(AttentionBackend):
         if save_kv_cache:
             if k is not None:
                 assert v is not None
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v
-                )
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         _, max_extend_len = self.forward_metadata
         if k is not None:
