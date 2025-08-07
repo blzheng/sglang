@@ -582,7 +582,8 @@ void extend_attention_kernel_impl(
 // seq_lens: [num_seqs] int64
 // extend_seq_lens: [num_seqs]
 // extend_start_loc: [num_seqs]
-// encoder_lens: [num_seqs] int64
+// encoder_lens: [num_seqs] int64 or None
+// sinks: [num_heads] or None
 //
 void extend_attention_cpu(
     at::Tensor& q_extend,
@@ -600,7 +601,8 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
-    std::optional<at::Tensor> encoder_lens) {
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks) {
   RECORD_FUNCTION(
       "sgl-kernel::extend_attention_cpu",
       std::vector<c10::IValue>(

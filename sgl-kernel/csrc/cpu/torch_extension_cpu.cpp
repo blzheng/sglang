@@ -82,7 +82,8 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
-    std::optional<at::Tensor> encoder_lens);
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 void extend_attention_cpu(
     at::Tensor& q_extend,
@@ -100,7 +101,8 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
-    std::optional<at::Tensor> encoder_lens);
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks);
 
 // weight prepack
 at::Tensor convert_weight_packed(at::Tensor& weight);
@@ -300,7 +302,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor output, Tensor? key, Tensor? value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap, bool is_cross_attn, Tensor? encoder_lens) -> ()");
+      "float logit_cap, bool is_cross_attn, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
@@ -308,7 +310,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_attention_cpu(Tensor q_extend, Tensor? k_extend, Tensor? v_extend, Tensor o_extend, Tensor k_buffer, "
       "Tensor v_buffer, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor extend_seq_lens, Tensor "
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap, bool is_cross_attn, Tensor? "
-      "encoder_lens) -> ()");
+      "encoder_lens, Tensor? sinks) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
   // weight prepack

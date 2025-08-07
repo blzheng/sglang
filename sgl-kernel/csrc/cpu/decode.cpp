@@ -812,12 +812,14 @@ template <typename scalar_t>
 void decode_accumulate_kv_splits(
     scalar_t* __restrict__ output,
     float* __restrict__ attn_logits,
+    const scalar_t* __restrict__ sinks_ptr,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size_v,
     int64_t num_kv_splits,
     int64_t l_stride1,
-    int64_t l_stride2) {
+    int64_t l_stride2,
+    bool has_sink) {
   using Vec = at::vec::Vectorized<float>;
 
   // parallel on [batches, num_heads]
@@ -853,7 +855,9 @@ void decode_accumulate_kv_splits(
         s_prime = s_prime * m_delta + e_logic;
         m_prime = m_i;
       }
-
+      if (has_sink) {
+        s_prime += std::exp(sinks_ptr[i % num_heads] - m_prime);
+      }
       copy_stub<scalar_t>(output + i * head_size_v, acc, 1 / s_prime, head_size_v);
     }
   });
@@ -870,6 +874,7 @@ void decode_attention_kernel_impl(
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
     const int64_t* __restrict__ encoder_lens,
+    const scalar_t* __restrict__ sinks,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size,
@@ -887,7 +892,8 @@ void decode_attention_kernel_impl(
     int64_t max_context_len,
     int64_t max_total_num_tokens,
     bool is_cross_attn,
-    bool has_encoder_lens) {
+    bool has_encoder_lens,
+    bool has_sink) {
   using Vec = at::vec::Vectorized<float>;
 
   // strides
@@ -1004,7 +1010,7 @@ void decode_attention_kernel_impl(
   });
 
   decode_accumulate_kv_splits(
-      output, attn_logits, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2);
+      output, attn_logits, sinks, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2, has_sink);
 }  // MHA
 
 template <typename scalar_t, typename index_t, int64_t BLOCK_N>
@@ -1018,6 +1024,7 @@ void decode_attention_mla_kernel_impl(
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
     scalar_t* __restrict__ buffer,
+    const scalar_t* __restrict__ sinks,
     int64_t batches,
     int64_t num_heads,
     int64_t head_size,
@@ -1034,7 +1041,8 @@ void decode_attention_mla_kernel_impl(
     int64_t max_num_reqs,
     int64_t max_context_len,
     int64_t max_total_num_tokens,
-    int64_t buffer_size_per_thread) {
+    int64_t buffer_size_per_thread,
+    bool has_sink) {
   using Vec = at::vec::Vectorized<float>;
 
   // block length for heads
@@ -1200,7 +1208,7 @@ void decode_attention_mla_kernel_impl(
   });
 
   decode_accumulate_kv_splits(
-      output, attn_logits, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2);
+      output, attn_logits, sinks, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2, has_sink);
 }  // MLA
 
 template <typename scalar_t, typename index_t, int64_t BLOCK_N>
@@ -1214,6 +1222,7 @@ void decode_attention_grouped_kernel_impl(
     const int64_t* __restrict__ req_pool_indices,
     const int64_t* __restrict__ seq_lens,
     const int64_t* __restrict__ encoder_lens,
+    const scalar_t* __restrict__ sinks,
     int64_t batches,
     int64_t num_heads,
     int64_t num_heads_kv,
@@ -1232,7 +1241,8 @@ void decode_attention_grouped_kernel_impl(
     int64_t max_context_len,
     int64_t max_total_num_tokens,
     bool is_cross_attn,
-    bool has_encoder_lens) {
+    bool has_encoder_lens,
+    bool has_sink) {
   using Vec = at::vec::Vectorized<float>;
 
   // block length for heads
@@ -1376,7 +1386,7 @@ void decode_attention_grouped_kernel_impl(
   });
 
   decode_accumulate_kv_splits(
-      output, attn_logits, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2);
+      output, attn_logits, sinks, batches, num_heads, head_size_v, num_kv_splits, l_stride1, l_stride2, has_sink);
 }  // GQA/MQA
 
 }  // anonymous namespace
@@ -1390,6 +1400,7 @@ void decode_attention_grouped_kernel_impl(
 // req_pool_indices: [num_seqs] int64
 // seq_lens:         [num_seqs] int64
 // encoder_lens:     [num_seqs] int64 or None
+// sinks:            [num_heads] or None
 //
 void decode_attention_cpu(
     at::Tensor& query,
@@ -1406,7 +1417,8 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
-    std::optional<at::Tensor> encoder_lens) {
+    std::optional<at::Tensor> encoder_lens,
+    std::optional<at::Tensor> sinks) {
   RECORD_FUNCTION(
       "sgl-kernel::decode_attention_cpu",
       std::vector<c10::IValue>(
@@ -1478,6 +1490,10 @@ void decode_attention_cpu(
     encoder_lens_t = encoder_lens.value();
     CHECK_EQ(encoder_lens_t.size(0), num_seqs);
   }
+  bool has_sink = sinks.has_value();
+  at::Tensor sinks_tensor = has_sink ? sinks.value() : at::empty({num_heads}, query.options());
+  CHECK_DIM(1, sinks_tensor);
+  CHECK_EQ(sinks_tensor.size(0), num_heads);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "decode_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "decode_attention_indices", [&] {
       if (key.has_value()) {
@@ -1529,6 +1545,7 @@ void decode_attention_cpu(
             req_pool_indices.data_ptr<int64_t>(),
             seq_lens.data_ptr<int64_t>(),
             encoder_lens_t.data_ptr<int64_t>(),
+            sinks_tensor.data_ptr<scalar_t>(),
             num_seqs,
             num_heads,
             head_size,
@@ -1546,7 +1563,8 @@ void decode_attention_cpu(
             max_context_len,
             max_total_num_tokens,
             is_cross_attn,
-            has_encoder_lens);
+            has_encoder_lens,
+            has_sink);
       } else if (is_mla) {
         // MLA
         decode_attention_mla_kernel_impl<scalar_t, index_t, BLOCK_N>(
@@ -1559,6 +1577,7 @@ void decode_attention_cpu(
             req_pool_indices.data_ptr<int64_t>(),
             seq_lens.data_ptr<int64_t>(),
             buffer.data_ptr<scalar_t>(),
+            sinks_tensor.data_ptr<scalar_t>(),
             num_seqs,
             num_heads,
             head_size,
@@ -1575,7 +1594,8 @@ void decode_attention_cpu(
             max_num_reqs,
             max_context_len,
             max_total_num_tokens,
-            size_per_thread);
+            size_per_thread,
+            has_sink);
       } else {
         // GQA/MQA
         decode_attention_grouped_kernel_impl<scalar_t, index_t, BLOCK_N>(
@@ -1588,6 +1608,7 @@ void decode_attention_cpu(
             req_pool_indices.data_ptr<int64_t>(),
             seq_lens.data_ptr<int64_t>(),
             encoder_lens_t.data_ptr<int64_t>(),
+            sinks_tensor.data_ptr<scalar_t>(),
             num_seqs,
             num_heads,
             num_heads_kv,
@@ -1606,7 +1627,8 @@ void decode_attention_cpu(
             max_context_len,
             max_total_num_tokens,
             is_cross_attn,
-            has_encoder_lens);
+            has_encoder_lens,
+            has_sink);
       }
     });
   });
