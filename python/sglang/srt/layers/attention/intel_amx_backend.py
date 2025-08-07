@@ -91,6 +91,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.logit_cap,
             layer.is_cross_attention,
             forward_batch.encoder_lens,
+            sk,
         )
         return o
 
@@ -133,6 +134,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.logit_cap,
             layer.is_cross_attention,
             forward_batch.encoder_lens,
+            sk,
         )
         return o
 

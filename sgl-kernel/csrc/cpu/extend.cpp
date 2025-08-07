@@ -236,6 +236,7 @@ void extend_attention_kernel_impl(
     const index_t* __restrict__ extend_seq_lens,
     const index_t* __restrict__ extend_start_loc,
     const void* __restrict__ buffer,
+    const scalar_t* __restrict__ sinks,
     int batches,
     int num_heads,
     int num_heads_kv,
@@ -260,7 +261,8 @@ void extend_attention_kernel_impl(
     int buffer_size_per_thread,
     bool is_prefix_skipped,
     bool is_cross_attn,
-    bool has_encoder_lens) {
+    bool has_encoder_lens,
+    bool has_sink) {
   using Vec = at::vec::Vectorized<float>;
 
   // strides
@@ -555,6 +557,9 @@ void extend_attention_kernel_impl(
       }
       scalar_t* __restrict__ out_ptr = o_extend + (seq_extend_start_loc + m) * o_strideM + head_id * o_strideH;
       for (int row = 0; row < m_size; ++row) {
+        if (has_sink) {
+          s_prime[row] += std::exp(sinks[head_id] - m_prime[row]);
+        }
         float s = 1 / s_prime[row];
         copy_stub<scalar_t>(out_ptr + row * o_strideM, v_prime + row * head_size_v, s, head_size_v);
       }
@@ -707,6 +712,10 @@ void extend_attention_cpu(
     encoder_lens_t = encoder_lens.value();
     CHECK_EQ(encoder_lens_t.size(0), num_seqs);
   }
+  bool has_sink = sinks.has_value();
+  at::Tensor sinks_tensor = has_sink ? sinks.value() : at::empty({num_heads}, q_extend.options());
+  CHECK_DIM(1, sinks_tensor);
+  CHECK_EQ(sinks_tensor.size(0), num_heads);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q_extend.scalar_type(), "extend_attention_kernel", [&] {
     AT_DISPATCH_INDEX_TYPES(index_dtype, "extend_attention_indices", [&] {
       extend_attention_kernel_impl<scalar_t, index_t, BLOCK_M, BLOCK_N>(
@@ -723,6 +732,7 @@ void extend_attention_cpu(
           extend_seq_lens.data_ptr<index_t>(),
           extend_start_loc.data_ptr<index_t>(),
           buffer.data_ptr(),
+          sinks_tensor.data_ptr<scalar_t>(),
           num_seqs,
           num_heads,
           num_heads_kv,
@@ -747,7 +757,8 @@ void extend_attention_cpu(
           size_per_thread,
           is_prefix_skipped,
           is_cross_attn,
-          has_encoder_lens);
+          has_encoder_lens,
+          has_sink);
     });
   });
 }
