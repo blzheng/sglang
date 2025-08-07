@@ -82,6 +82,7 @@ void decode_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
+    int64_t slidling_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks);
 
@@ -306,7 +307,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cache, Tensor output, Tensor? key, Tensor? value, "
       "Tensor loc, Tensor attn_logits, Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, float sm_scale, "
-      "float logit_cap, bool is_cross_attn, Tensor? encoder_lens, Tensor? sinks) -> ()");
+      "float logit_cap, bool is_cross_attn, int sliding_window_size, Tensor? encoder_lens, Tensor? sinks) -> ()");
   m.impl("decode_attention_cpu", torch::kCPU, &decode_attention_cpu);
 
   // extend
