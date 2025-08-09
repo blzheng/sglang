@@ -259,6 +259,7 @@ void extend_attention_kernel_impl(
     int max_total_num_tokens,
     int max_len_extend,
     int buffer_size_per_thread,
+    int64_t sliding_window_size,
     bool is_prefix_skipped,
     bool is_cross_attn,
     bool has_encoder_lens,
@@ -302,6 +303,7 @@ void extend_attention_kernel_impl(
 
     // init Btmp just once for each thread to prevent NaN
     fill_stub(Btmp, 0.f, BLOCK_N * ldb_tmp);
+    fill_stub(s_delta2, 0.f, BLOCK_M * BLOCK_N);
 
     alignas(64) float s_prime[BLOCK_M];
     alignas(64) float m_prime[BLOCK_M];
@@ -373,6 +375,13 @@ void extend_attention_kernel_impl(
 
         const Vec scale_vec = Vec(scaling);
         for (int row = 0; row < m_size; ++row) {
+          if (sliding_window_size > 0) {
+            int last_col = seq_len_prefix + row + m - sliding_window_size + 1;
+            if (last_col >= n + n_size) {
+              continue;
+            }
+            fill_stub(s_i + row * BLOCK_N, -std::numeric_limits<float>::infinity(), last_col - n);
+          }
           // s_i <- s_i * scale
           at::vec::map<float>(
               [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
@@ -484,6 +493,15 @@ void extend_attention_kernel_impl(
 
           const Vec scale_vec = Vec(scaling);
           for (int row = 0; row < m_size; ++row) {
+            if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size - 1 &&
+                row + m + 1 < n + sliding_window_size + n_size) {
+              fill_stub(
+                  s_i + row * BLOCK_N,
+                  -std::numeric_limits<float>::infinity(),
+                  row + m - n - sliding_window_size + 1);
+            } else if (sliding_window_size > 0 && row + m + 1 >= n + sliding_window_size) {
+              continue;
+            }
             // s_i <- s_i * scale
             at::vec::map<float>(
                 [scale_vec](Vec x) { return x * scale_vec; }, s_i + row * BLOCK_N, s_i + row * BLOCK_N, n_size);
@@ -606,6 +624,7 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap,
     bool is_cross_attn,
+    int64_t sliding_window_size,
     std::optional<at::Tensor> encoder_lens,
     std::optional<at::Tensor> sinks) {
   RECORD_FUNCTION(
@@ -755,6 +774,7 @@ void extend_attention_cpu(
           max_total_num_tokens,
           max_len_extend,
           size_per_thread,
+          sliding_window_size,
           is_prefix_skipped,
           is_cross_attn,
           has_encoder_lens,

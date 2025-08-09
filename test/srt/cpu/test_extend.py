@@ -180,7 +180,17 @@ class TestExtendAttention(CustomTestCase):
         return output
 
     def _test_extend_attention_once(
-        self, B, N_CTX, H_Q, H_KV, D, DV, has_sink=False, mla=False, is_cross_attn=False
+        self,
+        B,
+        N_CTX,
+        H_Q,
+        H_KV,
+        D,
+        DV,
+        sliding_window=None,
+        has_sink=False,
+        mla=False,
+        is_cross_attn=False,
     ):
         dtype = torch.bfloat16
 
@@ -272,7 +282,7 @@ class TestExtendAttention(CustomTestCase):
                 H_KV,
                 H_Q // H_KV if enable_gqa else 1,
                 scaling=sm_scale,
-                sliding_window=None,
+                sliding_window=sliding_window,
                 attention_sinks=sinks,
             )
         else:
@@ -310,29 +320,38 @@ class TestExtendAttention(CustomTestCase):
             sm_scale,
             logit_cap,
             is_cross_attn,
+            sliding_window if sliding_window is not None else 0,
             encoder_lens,
             sinks if has_sink else None,
         )
-
         torch.testing.assert_close(o_ref, o_extend, atol=1e-2, rtol=1e-2)
 
     def test_extend_attention(self):
         for has_sink in [True, False]:
-            self._test_extend_attention_once(1, 123, 1, 1, 128, 128, has_sink, False, False)
-            self._test_extend_attention_once(1, 123, 16, 1, 128, 128, has_sink, False, False)
-            self._test_extend_attention_once(1, 123, 16, 4, 128, 128, has_sink, False, False)
+            for sliding_window in [None, 10, 128]:
+                if not has_sink and sliding_window is not None:
+                    continue
+                self._test_extend_attention_once(
+                    1, 123, 16, 4, 64, 64, sliding_window, has_sink, False, False
+                )
+                self._test_extend_attention_once(
+                    1, 20, 16, 1, 64, 64, sliding_window, has_sink, False, False
+                )
+                self._test_extend_attention_once(
+                    1, 20, 1, 1, 64, 64, sliding_window, has_sink, False, False
+                )
         for is_mla in [True, False]:
             for is_cross_attn in [True, False]:
                 if is_mla and is_cross_attn:
                     continue
                 self._test_extend_attention_once(
-                    1, 123, 1, 1, 128, 96, False, is_mla, is_cross_attn
+                    1, 123, 1, 1, 128, 96, None, False, is_mla, is_cross_attn
                 )
                 self._test_extend_attention_once(
-                    1, 123, 16, 1, 128, 96, False, is_mla, is_cross_attn
+                    1, 123, 16, 1, 128, 96, None, False, is_mla, is_cross_attn
                 )
                 self._test_extend_attention_once(
-                    4, 1230, 16, 4, 128, 96, False, is_mla, is_cross_attn
+                    4, 1230, 16, 4, 128, 96, None, False, is_mla, is_cross_attn
                 )
 
 
