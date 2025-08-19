@@ -20,6 +20,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_native_rope = get_bool_env_var("SGLANG_USE_NATIVE_ROPE")
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -202,7 +203,7 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if _is_cpu_amx_available:
+        if not _use_native_rope and _is_cpu_amx_available:
             positions = (
                 torch.add(positions, offsets) if offsets is not None else positions
             )
