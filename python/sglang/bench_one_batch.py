@@ -91,6 +91,7 @@ class BenchArgs:
     cut_len: int = 4
     log_decode_step: int = 0
     profile: bool = False
+    profile_record_shapes: bool = False
     profile_filename_prefix: str = "profile"
 
     @staticmethod
@@ -121,6 +122,11 @@ class BenchArgs:
         )
         parser.add_argument(
             "--profile", action="store_true", help="Use Torch Profiler."
+        )
+        parser.add_argument(
+            "--profile-record-shapes",
+            action="store_true",
+            help="Record tensor shapes in profiling results.",
         )
         parser.add_argument(
             "--profile-filename-prefix",
@@ -283,6 +289,15 @@ def _maybe_prepare_mlp_sync_batch(batch: ScheduleBatch, model_runner):
             require_mlp_tp_gather=require_mlp_tp_gather(model_runner.server_args),
         )
 
+def _save_profile_trace_results(profiler, filename):
+    parent_dir = os.path.dirname(os.path.abspath(filename))
+    os.makedirs(parent_dir, exist_ok=True)
+    profiler.export_chrome_trace(filename)
+    print(
+        profiler.key_averages(group_by_input_shape=True).table(
+            sort_by="self_cpu_time_total"
+        )
+    )
 
 def correctness_test(
     server_args,
@@ -344,6 +359,7 @@ def latency_test_run_once(
     device,
     log_decode_step,
     profile,
+    profile_record_shapes,
     profile_filename_prefix,
 ):
     max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
@@ -374,6 +390,7 @@ def latency_test_run_once(
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             with_stack=True,
+            record_shapes=profile_record_shapes,
         )
         profiler.start()
 
@@ -391,10 +408,29 @@ def latency_test_run_once(
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
 
+    if profile:
+        profiler.stop()
+        profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_prefill.trace.json.gz"
+        _save_profile_trace_results(profiler, profile_filename)
+        rank_print(
+            f"torch profiler chrome trace for prefill saved to {profile_filename}"
+        )
+
     # Decode
     decode_latencies = []
     for i in range(output_len - 1):
         synchronize(device)
+        if profile and i == output_len / 2:
+            profiler = None
+            profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                with_stack=True,
+                record_shapes=profile_record_shapes,
+            )
+            profiler.start()
         tic = time.perf_counter()
         next_token_ids, _ = decode(next_token_ids, batch, model_runner)
         synchronize(device)
@@ -407,13 +443,13 @@ def latency_test_run_once(
                 f"Decode {i}. Batch size: {batch_size}, latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
             )
 
-    if profile:
-        profiler.stop()
-        profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}.trace.json.gz"
-        parent_dir = os.path.dirname(os.path.abspath(profile_filename))
-        os.makedirs(parent_dir, exist_ok=True)
-        profiler.export_chrome_trace(profile_filename)
-        rank_print(f"torch profiler chrome trace saved to {profile_filename}")
+        if profile and i == output_len / 2:
+            profiler.stop()
+            profile_filename = f"{profile_filename_prefix}_batch{batch_size}_input{input_len}_output{output_len}_decode.trace.json.gz"
+            _save_profile_trace_results(profiler, profile_filename)
+            rank_print(
+                f"torch profiler chrome trace for decoding 1 token saved to {profile_filename}"
+            )
 
     # Record decode timing from 2nd output
     if output_len > 1:
@@ -469,6 +505,7 @@ def latency_test(
         server_args.device,
         log_decode_step=0,
         profile=False,
+        profile_record_shapes=False,
         profile_filename_prefix="",  # not used
     )
 
@@ -527,6 +564,7 @@ def latency_test(
             server_args.device,
             bench_args.log_decode_step,
             bench_args.profile if tp_rank == 0 else None,
+            bench_args.profile_record_shapes if tp_rank == 0 else None,
             bench_args.profile_filename_prefix,
         )
         if ret is not None:
