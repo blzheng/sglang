@@ -2,6 +2,7 @@ FROM ubuntu:24.04
 SHELL ["/bin/bash", "-c"]
 
 ARG VER_SGLANG=beilei/gemma_support
+ARG VER_TRITON=3.3.1
 
 RUN apt-get update && \
     apt-get full-upgrade -y && \
@@ -35,7 +36,7 @@ RUN git clone https://github.com/blzheng/sglang.git && \
     cd sglang && \
     git checkout ${VER_SGLANG} && \
     pip install -e "python[all_cpu]" && \
-    pip install --pre torch torchvision  triton --force-reinstall --index-url https://download.pytorch.org/whl/nightly/cpu && \
+    pip install --pre torch torchvision  triton==${VER_TRITON} --force-reinstall --index-url https://download.pytorch.org/whl/nightly/cpu && \
     cd sgl-kernel && \
     cp pyproject_cpu.toml pyproject.toml && \
     pip install -v .
