@@ -118,7 +118,9 @@ from sglang.srt.utils import (
     make_layers,
     use_intel_amx_backend,
 )
+import concurrent.futures
 
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -530,6 +532,64 @@ class DeepseekV2MoE(nn.Module):
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states
+
+    def forward_heteroflow(
+        self,
+        hidden_states: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+    ) -> torch.Tensor:
+        # router_logits: (num_tokens, n_experts)
+        router_logits = self.gate(hidden_states)
+        topk_output = self.topk(hidden_states, router_logits)
+        def cpu_task(hidden_states, topk_output):
+            return self.experts(hidden_states=hidden_states, topk_output=topk_output)
+        fused_experts_out = executor.submit(cpu_task, hidden_states.cpu(), topk_output.cpu()).result().cuda()
+
+        assert use_intel_amx_backend(
+            self.shared_experts.gate_up_proj
+        ) == use_intel_amx_backend(self.shared_experts.down_proj)
+        # [Note] inplace should be False in fused_experts.
+        # If inplace is True in fused_experts (self.experts), hidden_states will be changed after fused_experts
+        # While hidden_states is still needed in shared_expert.
+        final_hidden_states = torch.ops.sgl_kernel.shared_expert_cpu(
+            hidden_states,
+            self.shared_experts.gate_up_proj.weight,
+            self.shared_experts.down_proj.weight,
+            fused_experts_out,
+            self.routed_scaling_factor,
+            True,  # inplace
+            self.shared_experts_is_int8,  # use_int8_w8a8
+            self.shared_experts_is_fp8,  # use_fp8_w8a16
+            (
+                self.shared_experts.gate_up_proj.weight_scale
+                if self.shared_experts_is_int8
+                else (
+                    self.shared_experts.gate_up_proj.weight_scale_inv
+                    if self.shared_experts_is_fp8
+                    else None
+                )
+            ),  # w1_scale
+            (
+                self.shared_experts.down_proj.weight_scale
+                if self.shared_experts_is_int8
+                else (
+                    self.shared_experts.down_proj.weight_scale_inv
+                    if self.shared_experts_is_fp8
+                    else None
+                )
+            ),  # w2_scale
+            (
+                self.shared_experts_weight_block_size
+                if self.shared_experts_is_fp8
+                else None
+            ),  # block_size
+            None,  # a1_scale
+            None,  # a2_scale
+            True,  # is_vnni
+        )
+        if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
