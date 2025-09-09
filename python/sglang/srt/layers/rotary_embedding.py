@@ -195,25 +195,25 @@ class RotaryEmbedding(CustomOp):
             )
             return query_out, key_out
 
-    # def forward_cpu(
-    #     self,
-    #     positions: torch.Tensor,
-    #     query: torch.Tensor,
-    #     key: torch.Tensor,
-    #     offsets: Optional[torch.Tensor] = None,
-    # ) -> Tuple[torch.Tensor, torch.Tensor]:
-    #     positions = torch.add(positions, offsets) if offsets is not None else positions
-    #     if _is_cpu_amx_available:
-    #         return torch.ops.sgl_kernel.rotary_embedding_cpu(
-    #             positions,
-    #             query,
-    #             key,
-    #             self.head_size,
-    #             self.cos_sin_cache,
-    #             self.is_neox_style,
-    #         )
-    #     else:
-    #         return self.forward_native(positions, query, key, offsets)
+    def forward_cpu(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.add(positions, offsets) if offsets is not None else positions
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.is_neox_style,
+            )
+        else:
+            return self.forward_native(positions, query, key, offsets)
 
     def forward_cuda(
         self,

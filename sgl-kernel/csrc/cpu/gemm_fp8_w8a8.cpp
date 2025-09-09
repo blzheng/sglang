@@ -6,6 +6,7 @@
 #include "dispatcher.h"
 
 
+
 namespace {
 
 #define BLOCK_N 32
@@ -53,10 +54,7 @@ static void initialize_e4m3_to_16bit_tables() {
 }
 
 template <typename T>
-static void cvt_e4m3_16bit_intrinsic_lut(
-    const at::Float8_e4m3fn* __restrict__ in,
-    T* out,
-    int64_t len) {
+static void cvt_e4m3_16bit_intrinsic_lut(const at::Float8_e4m3fn* __restrict__ in, T* out, int64_t len) {
   for (size_t i = 0; i < len; i += 64) {
     __m512i fp8_vec = _mm512_loadu_si512((__m512i*)&in[i]);
     __m128i group0 = _mm512_castsi512_si128(fp8_vec);
@@ -76,9 +74,7 @@ static void cvt_e4m3_16bit_intrinsic_lut(
     __m512i bf16_i32_vec3 = _mm512_i32gather_epi32(indices3, e4m3_to_16bit, 2);
 
     // Helper lambda: Convert 16 32-bit ints (in a __m512i) to 16 16-bit ints.
-    auto convert_32_to_16 = [](__m512i vec) -> __m256i {
-      return _mm512_cvtepi32_epi16(vec);
-    };
+    auto convert_32_to_16 = [](__m512i vec) -> __m256i { return _mm512_cvtepi32_epi16(vec); };
 
     __m256i bf16_i16_vec0 = convert_32_to_16(bf16_i32_vec0);
     __m256i bf16_i16_vec1 = convert_32_to_16(bf16_i32_vec1);
@@ -92,10 +88,7 @@ static void cvt_e4m3_16bit_intrinsic_lut(
   }
 }
 
-static void _convert_B_to_bf16(
-    const at::Float8_e4m3fn* __restrict__ B,
-    at::BFloat16* dqB,
-    int64_t len) {
+static void _convert_B_to_bf16(const at::Float8_e4m3fn* __restrict__ B, at::BFloat16* dqB, int64_t len) {
   initialize_e4m3_to_16bit_tables<at::BFloat16>();
   int tail = len % 64;
   cvt_e4m3_16bit_intrinsic_lut<at::BFloat16>(B, dqB, len - tail);
@@ -104,12 +97,8 @@ static void _convert_B_to_bf16(
   }
 }
 
-static void _convert_A_to_bf16(
-    const at::Float8_e4m3fn* __restrict__ A,
-    at::BFloat16* dqA,
-    int64_t M,
-    int64_t K,
-    int64_t lda) {
+static void
+_convert_A_to_bf16(const at::Float8_e4m3fn* __restrict__ A, at::BFloat16* dqA, int64_t M, int64_t K, int64_t lda) {
   initialize_e4m3_to_16bit_tables<at::BFloat16>();
   for (int m = 0; m < M; ++m) {
     int tail = K % 64;
@@ -178,21 +167,14 @@ static void _store_result(
 }
 
 #else
-static void _convert_B_to_bf16(
-    const at::Float8_e4m3fn* B,
-    at::BFloat16* dqB,
-    int64_t len) {
+static void _convert_B_to_bf16(const at::Float8_e4m3fn* B, at::BFloat16* dqB, int64_t len) {
   for (int i = 0; i < len; ++i) {
     dqB[i] = (at::BFloat16)B[i];
   }
 }
 
-static void _convert_A_to_bf16(
-    const at::Float8_e4m3fn* __restrict__ A,
-    at::BFloat16* dqA,
-    int64_t M,
-    int64_t K,
-    int64_t lda) {
+static void
+_convert_A_to_bf16(const at::Float8_e4m3fn* __restrict__ A, at::BFloat16* dqA, int64_t M, int64_t K, int64_t lda) {
   for (int m = 0; m < M; ++m) {
     for (int k = 0; k < K; ++k) {
       dqA[m * K + k] = (at::BFloat16)A[m * lda + k];
@@ -228,30 +210,10 @@ void _micro_gemm(
     float C_f32[M * N];
 #ifdef CPUBLAS_BRGEMM_F8F8F32
     at::native::cpublas::brgemm(
-        M,
-        N,
-        K,
-        lda /*lda*/,
-        N /*ldb*/,
-        N /*ldc*/,
-        false /* add_C */,
-        A,
-        B,
-        C_f32,
-        true /* is_vnni */);
+        M, N, K, lda /*lda*/, N /*ldb*/, N /*ldc*/, false /* add_C */, A, B, C_f32, true /* is_vnni */);
 #else
     at::native::cpublas::brgemm(
-        M,
-        N,
-        K,
-        K /*lda*/,
-        N /*ldb*/,
-        N /*ldc*/,
-        false /* add_C */,
-        dqA,
-        dqB,
-        C_f32,
-        true /* is_vnni */);
+        M, N, K, K /*lda*/, N /*ldb*/, N /*ldc*/, false /* add_C */, dqA, dqB, C_f32, true /* is_vnni */);
 #endif
     _mm_prefetch(B + N * K, _MM_HINT_T0);
     _mm_prefetch(A + K, _MM_HINT_T0);
@@ -373,7 +335,6 @@ void _float8_linear_impl(
   int64_t K = input.size(-1);
   auto input_view = input.view({-1, K});
   int64_t M = input_view.size(0);
-
   // weight shape = [Nc, Kc, block_k, block_n]
   // scales shape = [Nc, G, block_n]
   int64_t Nc = weight.size(0);
@@ -402,8 +363,7 @@ void _float8_linear_impl(
   int64_t num_groups = wei_quant_mode == PER_TENSOR ? 1 : weight_scales.size(1);
   TORCH_CHECK(K % num_groups == 0, "K should be divisible by num_groups");
   int64_t group_size = K / num_groups;
-  TORCH_CHECK(group_size % block_k == 0,
-              "Float8 linear: group_size should be divisible by block_k");
+  TORCH_CHECK(group_size % block_k == 0, "Float8 linear: group_size should be divisible by block_k");
   int64_t block_per_group = group_size / block_k;
   TORCH_CHECK(input_scales.numel() == 1 || input_scales.numel() == M || input_scales.numel() == M * num_groups, "Float8 linear: unexpected input scales shape");
   auto ldsa = act_quant_mode == PER_TENSOR ? 0 : act_quant_mode == PER_ROW ? 1 : num_groups;
