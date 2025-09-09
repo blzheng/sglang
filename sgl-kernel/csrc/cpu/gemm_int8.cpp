@@ -3,65 +3,62 @@
 #include "vec.h"
 
 namespace {
-template <typename scalar_t>
-inline void copy_stub(scalar_t* __restrict__ out, const int32_t* __restrict__ input, const int32_t* __restrict__ bcomp, const float* __restrict__ Bs, int64_t size, float scale) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  using iVec = at::vec::Vectorized<int32_t>;
-  constexpr int kVecSize = bVec::size();
-  constexpr int kVecSizef = fVec::size();
-  constexpr int kVecSizei = iVec::size();
 
-  int64_t d;
-  #pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    iVec input_vec0 = iVec::loadu(input + d);
-    iVec input_vec1 = iVec::loadu(input + d + kVecSizei);
-    iVec bcomp_vec0 = iVec::loadu(bcomp + d);
-    iVec bcomp_vec1 = iVec::loadu(bcomp + d + kVecSizei);
-    fVec bs_vec0 = fVec::loadu(Bs + d);
-    fVec bs_vec1 = fVec::loadu(Bs + d + kVecSizef);
-    fVec scale_vec = fVec(scale);
-    fVec data0 = convert<float>(input_vec0 - bcomp_vec0) * scale_vec * bs_vec0;
-    fVec data1 = convert<float>(input_vec1 - bcomp_vec1) * scale_vec * bs_vec1;
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
-    out_vec.store(out + d);
+template <typename scalar_t, bool has_bias, int BLOCK_N>
+struct scale_C {
+  static inline void apply(
+      scalar_t* __restrict__ C,
+      const int32_t* __restrict__ Ctmp,
+      const int32_t* __restrict__ Bcomp,
+      const float* __restrict__ bias,
+      float As,
+      const float* __restrict__ Bs) {
+    TORCH_CHECK(false, "scale_C: scalar path not implemented!");
   }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>((input[d]-bcomp[d]) * scale * Bs[d]);
-  }
-}
+};
 
-template <typename scalar_t>
-inline void copy_add_stub(scalar_t* __restrict__ out, const int32_t* __restrict__ input, const int32_t* __restrict__ bcomp, const float* __restrict__ Bs, const float* __restrict__ bias, int64_t size, float scale) {
-  using bVec = at::vec::Vectorized<scalar_t>;
-  using fVec = at::vec::Vectorized<float>;
-  using iVec = at::vec::Vectorized<int32_t>;
-  constexpr int kVecSize = bVec::size();
-  constexpr int kVecSizef = fVec::size();
-  constexpr int kVecSizei = iVec::size();
+#if defined(CPU_CAPABILITY_AVX512)
+template <bool has_bias, int BLOCK_N>
+struct scale_C<at::BFloat16, has_bias, BLOCK_N> {
+  static inline void apply(
+      at::BFloat16* __restrict__ C,
+      const int32_t* __restrict__ Ctmp,
+      const int32_t* __restrict__ Bcomp,
+      const float* __restrict__ bias,
+      float As,
+      const float* __restrict__ Bs) {
+    constexpr int COLS = BLOCK_N / 16;
+    static_assert(COLS % 2 == 0);
 
-  int64_t d;
-  #pragma GCC unroll 4
-  for (d = 0; d <= size - kVecSize; d += kVecSize) {
-    iVec input_vec0 = iVec::loadu(input + d);
-    iVec input_vec1 = iVec::loadu(input + d + kVecSizei);
-    iVec bcomp_vec0 = iVec::loadu(bcomp + d);
-    iVec bcomp_vec1 = iVec::loadu(bcomp + d + kVecSizei);
-    fVec bs_vec0 = fVec::loadu(Bs + d);
-    fVec bs_vec1 = fVec::loadu(Bs + d + kVecSizef);
-    fVec scale_vec = fVec(scale);
-    fVec bias_vec0 = fVec::loadu(bias + d);
-    fVec bias_vec1 = fVec::loadu(bias + d + kVecSizef);
-    fVec data0 = convert<float>(input_vec0 - bcomp_vec0) * scale_vec * bs_vec0 + bias_vec0;
-    fVec data1 = convert<float>(input_vec1 - bcomp_vec1) * scale_vec * bs_vec1 + bias_vec1;
-    bVec out_vec = convert_from_float_ext<scalar_t>(data0, data1);
-    out_vec.store(out + d);
+    __m512 vc[COLS];
+    __m512 vd0 = _mm512_set1_ps(As);
+
+    auto compute = [&](auto col) {
+      __m512 vd1 = _mm512_loadu_ps(Bs + col * 16);
+      __m512i vcomp = _mm512_loadu_si512(Bcomp + col * 16);
+      __m512i vc32 = _mm512_loadu_si512(Ctmp + col * 16);
+      vc[col] = _mm512_cvtepi32_ps(_mm512_sub_epi32(vc32, vcomp));
+      if constexpr (has_bias) {
+        __m512 vbias = _mm512_loadu_ps(bias + col * 16);
+        vc[col] = _mm512_fmadd_ps(_mm512_mul_ps(vc[col], vd0), vd1, vbias);
+      } else {
+        vc[col] = _mm512_mul_ps(_mm512_mul_ps(vc[col], vd0), vd1);
+      }
+    };
+    Unroll<COLS>{}(compute);
+
+    auto storec = [&](auto col) {
+      // for COLS = 2, 4 use 512bit store
+      if constexpr (col % 2 == 0) {
+        _mm512_storeu_si512(
+            reinterpret_cast<__m512i*>((C + col * 16)), (__m512i)(_mm512_cvtne2ps_pbh(vc[col + 1], vc[col + 0])));
+      }
+    };
+    Unroll<COLS>{}(storec);
   }
-  for (; d < size; ++d) {
-    out[d] = static_cast<scalar_t>((input[d]-bcomp[d]) * scale * Bs[d]);
-  }
-}
+};
+#endif
+
 template <typename scalar_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn {
   static inline void apply(
@@ -209,31 +206,6 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       ldc);
 
 template <typename scalar_t, bool has_bias>
-struct brgemm {
-  static inline void apply(
-      const uint8_t* __restrict__ A, const int8_t* __restrict__ B, scalar_t* __restrict__ C,
-      int32_t* __restrict__ Ctmp, const int32_t* __restrict__ Bcomp, const float* __restrict__ As, const float* __restrict__ Bs,
-      const float* __restrict__ bias, int64_t M, int64_t N, int64_t K, int64_t lda, int64_t ldb,
-      int64_t ldc) {
-
-    constexpr int BLOCK_N = block_size_n();
-    at::native::cpublas::brgemm(
-        M, N, K, lda, ldb, BLOCK_N, /* add_C */false,
-        A, B, Ctmp);
-
-    // copy from Ctmp to C
-    for (int64_t m = 0; m < M; ++m) {
-      float as = As[m];
-      if constexpr (has_bias) {
-        copy_add_stub(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, Bs, bias, N, as);
-      } else {
-        copy_stub(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, Bs, N, as);
-      }
-    }
-  }
-};
-
-template <typename scalar_t, bool has_bias>
 void tinygemm_kernel(
     const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B,
@@ -251,11 +223,17 @@ void tinygemm_kernel(
     bool brg) {
   // B compensation
   const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + block_size_n() * K);
+
   if (brg) {
-    brgemm<scalar_t, has_bias>::apply(A, B, C, Ctmp, Bcomp, As, Bs, bias, M, N, K, lda, ldb, ldc);
+    constexpr int BLOCK_N = block_size_n();
+    at::native::cpublas::brgemm(M, N, K, lda, ldb, BLOCK_N, /* add_C */ false, A, B, Ctmp);
+
+    // apply compensation and scale
+    for (int64_t m = 0; m < M; ++m) {
+      scale_C<scalar_t, has_bias, BLOCK_N>::apply(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, bias, As[m], Bs);
+    }
     return;
   }
-
 
   // pattern: 1-4-16
   constexpr int64_t BLOCK_M = 4;
@@ -321,23 +299,17 @@ void int8_scaled_mm_kernel_impl(
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
-  // TODO: find this threshold
-  const bool use_brgemm = M > 4;
+  const bool use_brgemm = can_use_brgemm<int8_t>(M);
 
   // K + 4 after compensation
   const int64_t packed_row_size = get_row_size<int8_t>(K);
 
-  // l2 cache block for n
-  int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N, K);
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    parallel_2d(MB, NB, [&](int64_t begin_mb, int64_t end_mb, int64_t begin_nb, int64_t end_nb) {
-
+    parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
       // for brgemm, use int32_t for accumulate
       alignas(64) int32_t Ctmp[BLOCK_M * BLOCK_N];
 
-      for (int64_t nbb = begin_nb; nbb < end_nb; nbb += cache_blocks_nb) {
-      for (int64_t mb = begin_mb; mb < end_mb; ++mb) {
-      for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, end_nb); ++nb) {
+      loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
         int mb_start = mb * BLOCK_M;
         int mb_size = std::min(M - mb_start, BLOCK_M);
         int nb_start = nb * BLOCK_N;
@@ -358,8 +330,8 @@ void int8_scaled_mm_kernel_impl(
             /* ldb */ nb_size,
             /* ldc */ N,
             /* brg */ use_brgemm);
+      });
 
-      }}}
       if (use_brgemm) {
         at::native::cpublas::brgemm_release();
       }
