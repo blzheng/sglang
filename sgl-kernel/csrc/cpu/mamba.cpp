@@ -276,6 +276,58 @@ std::tuple<at::Tensor, at::Tensor> causal_conv1d_fn_kernel_inner(
   }
   return std::make_tuple(std::move(out), std::move(final_states_out));
 }
+
+template <typename scalar_t>
+void fused_recurrent_gated_delta_rule_kernel_impl(
+    const scalar_t* __restrict__ q_ptr,
+    const scalar_t* __restrict__ k_ptr,
+    const scalar_t* __restrict__ v_ptr,
+    const float* __restrict__ g_ptr,
+    const scalar_t* __restrict__ beta_ptr,
+    const int32_t* __restrict__ indices_ptr,
+    float* __restrict__ state_ptr,
+    scalar_t* __restrict__ o_ptr,
+    int64_t seq_len,
+    int64_t batch_size,
+    int64_t num_heads,
+    int64_t head_dim,
+    int64_t v_num_heads,
+    int64_t v_head_dim,
+    bool use_qk_l2norm_in_kernel) {
+  int64_t group_size = v_num_heads / num_heads;
+  double scale = 1 / std::sqrt(head_dim);
+  for (int bi = 0; bi < batch_size; ++bi) {
+    for(int si = 0; si < seq_len; ++si) {
+      for(int ni = 0; ni < v_num_heads; ++ni) {
+        int64_t cache_index = indices_ptr[bi];
+        int64_t state_offset = (cache_index * v_num_heads + ni) * head_dim * v_head_dim;
+        float g_val = g_ptr[bi * v_num_heads + ni];
+        int64_t qk_offset = ((si * batch_size + bi) * num_heads + (ni / group_size)) * head_dim;
+        int64_t v_offset = ((si * batch_size + bi) * v_num_heads + ni) * v_head_dim;
+        int64_t o_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
+        float beta_val = beta_ptr[bi * v_num_heads + ni];
+        for (int dvi = 0; dvi < v_head_dim; ++dvi) {
+          float kv_mem_val = 0.0;
+          float v_val = v_ptr[v_offset + dvi];
+          float o_val = o_ptr[o_offset + dvi];
+          for (int di = 0; di < head_dim; ++di) {
+            float k_val = k_ptr[qk_offset + di];
+            state_ptr[state_offset + di * v_head_dim + dvi] *= std::exp(g_val);
+            kv_mem_val += state_ptr[state_offset + di * v_head_dim + dvi] * k_val;
+          }
+          for (int di = 0; di < head_dim; ++di) {
+            float q_val = q_ptr[qk_offset + di];
+            float k_val = k_ptr[qk_offset + di];
+            float delta_val = (v_val - kv_mem_val) * beta_val;
+            state_ptr[state_offset + di * v_head_dim + dvi] += k_val * delta_val;
+            o_val += state_ptr[state_offset + di * v_head_dim + dvi] * q_val * scale;
+          }
+          o_ptr[o_offset + dvi] = o_val;
+        }
+      }
+    }
+  }
+}
 }  // anonymous namespace
 
 // A_log: [num_v_heads]
@@ -385,4 +437,82 @@ std::tuple<at::Tensor, at::Tensor> causal_conv1d_fn_cpu(
     TORCH_CHECK(
         false, "Only support bfloat16, float16 and float for causal_conv1d_fn");
   }
+}
+
+// query: [seq_len, batch_size, num_heads, head_dim]
+// key: [seq_len, batch_size, num_heads, head_dim]
+// value: [seq_len, batch_size, v_num_heads, v_head_dim]
+// g: [batch_size, v_num_heads]
+// beta: [batch_size, v_num_heads]
+// cache_indices: [batch_size]
+// initial_state:[num_tokens, v_num_heads, head_dim, v_head_dim]
+at::Tensor fused_recurrent_gated_delta_rule_cpu(
+  const at::Tensor& query,
+  const at::Tensor& key,
+  const at::Tensor& value,
+  const at::Tensor& g,
+  const at::Tensor& beta,
+  const at::Tensor& cache_indices,
+  at::Tensor& initial_state,
+  bool use_qk_l2norm_in_kernel
+) {
+  RECORD_FUNCTION("sgl-kernel::fused_recurrent_gated_delta_rule_cpu", std::vector<c10::IValue>({query, key, value, g, beta, initial_state}));
+  CHECK_DIM(4, query);
+  CHECK_DIM(4, key);
+  CHECK_DIM(4, value);
+  CHECK_DIM(2, g);
+  CHECK_DIM(2, beta);
+  CHECK_DIM(4, initial_state);
+  CHECK_CONTIGUOUS(query);
+  CHECK_CONTIGUOUS(key);
+  CHECK_CONTIGUOUS(value);
+  CHECK_CONTIGUOUS(g);
+  CHECK_CONTIGUOUS(beta);
+  CHECK_CONTIGUOUS(initial_state);
+  int64_t seq_len = query.size(0);
+  int64_t batch_size = query.size(1);
+  int64_t num_heads = query.size(2);
+  int64_t head_dim = query.size(3);
+  int64_t v_num_heads = value.size(2);
+  int64_t v_head_dim = value.size(3);
+  CHECK_EQ(key.size(0), seq_len);
+  CHECK_EQ(key.size(1), batch_size);
+  CHECK_EQ(key.size(2), num_heads);
+  CHECK_EQ(key.size(3), head_dim);
+  CHECK_EQ(value.size(0), seq_len);
+  CHECK_EQ(value.size(1), batch_size);
+  CHECK_EQ(value.size(2), v_num_heads);
+  CHECK_EQ(value.size(3), v_head_dim);
+  CHECK_EQ(g.size(0), batch_size);
+  CHECK_EQ(g.size(1), v_num_heads);
+  CHECK_EQ(beta.size(0), batch_size);
+  CHECK_EQ(beta.size(1), v_num_heads);
+  CHECK_EQ(cache_indices.size(0), batch_size);
+  CHECK(initial_state.size(0) >= seq_len);
+  CHECK_EQ(initial_state.size(1), v_num_heads);
+  CHECK_EQ(initial_state.size(2), head_dim);
+  CHECK_EQ(initial_state.size(3), v_head_dim);
+  CHECK_EQ(v_num_heads % num_heads, 0);
+
+  at::Tensor core_attn_out = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kBFloat16);
+ 
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "fused_recurrent_gated_delta_rule_kernel_impl", [&] {
+    fused_recurrent_gated_delta_rule_kernel_impl<scalar_t>(
+        query.data_ptr<scalar_t>(),
+        key.data_ptr<scalar_t>(),
+        value.data_ptr<scalar_t>(),
+        g.data_ptr<float>(),
+        beta.data_ptr<scalar_t>(),
+        cache_indices.data_ptr<int32_t>(),
+        initial_state.data_ptr<float>(),
+        core_attn_out.data_ptr<scalar_t>(),
+        seq_len,
+        batch_size,
+        num_heads,
+        head_dim,
+        v_num_heads,
+        v_head_dim,
+        use_qk_l2norm_in_kernel);
+  });
+  return core_attn_out;
 }
