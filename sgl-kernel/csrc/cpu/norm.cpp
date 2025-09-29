@@ -483,6 +483,32 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
   return output;
 }
 
+
+// input : {batch_size, hidden_size} or {batch_size, seq_len, num_head, head_dim}
+at::Tensor qwen3_next_l2norm_cpu(at::Tensor& input, double eps) {
+  RECORD_FUNCTION("sgl-kernel::qwen3_next_l2norm_cpu", std::vector<c10::IValue>({input}));
+
+  CHECK_INPUT(input);
+  CHECK_CONTIGUOUS(input);
+  TORCH_CHECK(input.dim() == 2 || input.dim() == 4, "qwen3_next_l2norm_cpu: input must be 2D or 4D, got ", input.dim(), "D");
+  int64_t numel = input.numel();
+  int64_t hidden_size = input.size(-1);
+  int64_t batch_size = numel / hidden_size;
+  at::Tensor output = at::empty_like(input);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "l2norm_kernel", [&] {
+    l2norm_kernel_impl<scalar_t>(
+      output.data_ptr<scalar_t>(),
+      input.data_ptr<scalar_t>(),
+      batch_size,
+      hidden_size,
+      [](float x, int64_t n) { return x;},
+      eps);
+  });
+  return output;
+}
+
+
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {

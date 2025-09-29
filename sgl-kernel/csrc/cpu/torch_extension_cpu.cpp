@@ -29,6 +29,7 @@ at::Tensor gelu_and_mul_cpu(const at::Tensor& input);
 
 // l2norm
 at::Tensor l2norm_cpu(at::Tensor& input, double eps);
+at::Tensor qwen3_next_l2norm_cpu(at::Tensor& input, double eps);
 
 // rmsnorm
 at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps);
@@ -287,6 +288,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gemma_rmsnorm_cpu", torch::kCPU, &gemma_rmsnorm_cpu);
   m.def("l2norm_cpu(Tensor input, float eps) -> Tensor");
   m.impl("l2norm_cpu", torch::kCPU, &l2norm_cpu);
+  m.def("qwen3_next_l2norm_cpu(Tensor input, float eps) -> Tensor");
+  m.impl("qwen3_next_l2norm_cpu", torch::kCPU, &qwen3_next_l2norm_cpu);
   m.def("qwen3_next_rmsnorm_gated_cpu(Tensor input, Tensor weight, Tensor gate, float eps) -> Tensor");
   m.impl("qwen3_next_rmsnorm_gated_cpu", torch::kCPU, &qwen3_next_rmsnorm_gated_cpu);
   m.def("fused_add_rmsnorm_cpu(Tensor(a!) input, Tensor residual, Tensor weight, float eps) -> ()");
