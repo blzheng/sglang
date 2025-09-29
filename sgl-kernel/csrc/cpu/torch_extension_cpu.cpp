@@ -237,7 +237,7 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     bool is_neox);
 
 // fused_gdn_gating
-at::Tensor fused_gdn_gating_cpu(at::Tensor& A_log, at::Tensor& a, at::Tensor& dt_bias);
+at::Tensor fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& dt_bias);
 // fused_recurrent_gated_delta_rule
 at::Tensor fused_recurrent_gated_delta_rule_cpu(
   const at::Tensor& query,
@@ -245,6 +245,19 @@ at::Tensor fused_recurrent_gated_delta_rule_cpu(
   const at::Tensor& value,
   const at::Tensor& g,
   const at::Tensor& beta,
+  const at::Tensor& cache_indices,
+  at::Tensor& initial_state,
+  bool use_qk_l2norm_in_kernel
+);
+// fused_sigmoid_gating_delta_rule_update
+at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
+  const at::Tensor& query,
+  const at::Tensor& key,
+  const at::Tensor& value,
+  const at::Tensor& A_log,
+  const at::Tensor& a,
+  const at::Tensor& dt_bias,
+  const at::Tensor& b,
   const at::Tensor& cache_indices,
   at::Tensor& initial_state,
   bool use_qk_l2norm_in_kernel
@@ -417,6 +430,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // fused_recurrent_gated_delta_rule
   m.def("fused_recurrent_gated_delta_rule_cpu(Tensor query, Tensor key, Tensor value, Tensor g, Tensor beta, Tensor cache_indices, Tensor(a!) initial_state, bool use_qk_l2norm_in_kernel) -> Tensor");
   m.impl("fused_recurrent_gated_delta_rule_cpu", torch::kCPU, &fused_recurrent_gated_delta_rule_cpu);
+  // fused_sigmoid_gating_delta_rule_update
+m.def("fused_sigmoid_gating_delta_rule_update_cpu(Tensor query, Tensor key, Tensor value, Tensor A_log, Tensor a, Tensor dt_bias, Tensor b, Tensor cache_indices, Tensor(a!) initial_state, bool use_qk_l2norm_in_kernel) -> Tensor");
+  m.impl("fused_sigmoid_gating_delta_rule_update_cpu", torch::kCPU, &fused_sigmoid_gating_delta_rule_update_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
