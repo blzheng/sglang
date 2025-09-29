@@ -296,12 +296,14 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
     bool use_qk_l2norm_in_kernel) {
   int64_t group_size = v_num_heads / num_heads;
   double scale = 1 / std::sqrt(head_dim);
-  for (int bi = 0; bi < batch_size; ++bi) {
-    for(int si = 0; si < seq_len; ++si) {
-      for(int ni = 0; ni < v_num_heads; ++ni) {
+  at::parallel_for(0, batch_size * seq_len * v_num_heads, 0, [&](int64_t begin, int64_t end) {
+    int64_t bi{0}, si{0}, ni{0};
+    data_index_init(begin, bi, batch_size, si, seq_len, ni, v_num_heads);
+    for (int64_t i = begin; i < end; ++i) {
         int64_t cache_index = indices_ptr[bi];
         int64_t state_offset = (cache_index * v_num_heads + ni) * head_dim * v_head_dim;
         float g_val = g_ptr[bi * v_num_heads + ni];
+        float g_val_exp = std::exp(g_val);
         int64_t qk_offset = ((si * batch_size + bi) * num_heads + (ni / group_size)) * head_dim;
         int64_t v_offset = ((si * batch_size + bi) * v_num_heads + ni) * v_head_dim;
         int64_t o_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
@@ -312,7 +314,7 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
           float o_val = o_ptr[o_offset + dvi];
           for (int di = 0; di < head_dim; ++di) {
             float k_val = k_ptr[qk_offset + di];
-            state_ptr[state_offset + di * v_head_dim + dvi] *= std::exp(g_val);
+            state_ptr[state_offset + di * v_head_dim + dvi] *= g_val_exp;
             kv_mem_val += state_ptr[state_offset + di * v_head_dim + dvi] * k_val;
           }
           for (int di = 0; di < head_dim; ++di) {
@@ -324,9 +326,9 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
           }
           o_ptr[o_offset + dvi] = o_val;
         }
-      }
     }
-  }
+    data_index_step(bi, batch_size, si, seq_len, ni, v_num_heads);
+  });
 }
 }  // anonymous namespace
 
