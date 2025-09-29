@@ -83,12 +83,14 @@ class TestMambaAttention(CustomTestCase):
         query = torch.rand(batch_size, seq_len, num_heads, head_k_dim, dtype=torch.bfloat16)
         key = torch.rand(batch_size, seq_len, num_heads, head_k_dim, dtype=torch.bfloat16)
         value = torch.rand(batch_size, seq_len, num_value_heads, head_v_dim, dtype=torch.bfloat16)
-        g = torch.rand(batch_size, num_value_heads, dtype=torch.float32)
-        beta = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
+        A_log = torch.rand(num_value_heads, dtype=torch.float32)
+        a = torch.rand(batch_size, num_value_heads, dtype=torch.float32)
+        dt_bias = torch.rand(num_value_heads, dtype=torch.float32)
+        g = -A_log.exp() * softplus(a + dt_bias)
+        beta = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16).sigmoid()
         ssm_states = torch.rand(513, num_value_heads, head_k_dim, head_v_dim, dtype=torch.float32)
         cache_indices = torch.randint(0, 513, (batch_size,), dtype=torch.int32)
-        # use_qk_l2norm_in_kernel = True
-        use_qk_l2norm_in_kernel = False
+        use_qk_l2norm_in_kernel = True
         query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
         query_ref = query.clone()
         key_ref = key.clone()
@@ -116,7 +118,7 @@ class TestMambaAttention(CustomTestCase):
             use_qk_l2norm_in_kernel
         )
         last_recurrent_state = ssm_states[cache_indices]
-        atol = rtol = precision[g.dtype]
+        atol = rtol = precision[core_attn_out.dtype]
         self.assertTrue(torch.allclose(core_attn_out, core_attn_out_ref, atol=atol, rtol=rtol))
         self.assertTrue(torch.allclose(last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol))
 

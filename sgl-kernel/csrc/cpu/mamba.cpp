@@ -293,8 +293,7 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
     int64_t num_heads,
     int64_t head_dim,
     int64_t v_num_heads,
-    int64_t v_head_dim,
-    bool use_qk_l2norm_in_kernel) {
+    int64_t v_head_dim) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
@@ -380,6 +379,9 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
   });
 }
 }  // anonymous namespace
+
+extern at::Tensor qwen3_next_l2norm_cpu(at::Tensor& input, double eps);
+
 
 // A_log: [num_v_heads]
 // a: [batch, num_v_heads]
@@ -547,10 +549,16 @@ at::Tensor fused_recurrent_gated_delta_rule_cpu(
 
   at::Tensor core_attn_out = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kBFloat16);
   at::Tensor kv_mem = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kFloat);
+  at::Tensor query_ = query;
+  at::Tensor key_ = key;
+  if (use_qk_l2norm_in_kernel) {
+    query_ = qwen3_next_l2norm_cpu(query_, 1e-6);
+    key_ = qwen3_next_l2norm_cpu(key_, 1e-6);
+  }
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "fused_recurrent_gated_delta_rule_kernel_impl", [&] {
     fused_recurrent_gated_delta_rule_kernel_impl<scalar_t>(
-        query.data_ptr<scalar_t>(),
-        key.data_ptr<scalar_t>(),
+        query_.data_ptr<scalar_t>(),
+        key_.data_ptr<scalar_t>(),
         value.data_ptr<scalar_t>(),
         g.data_ptr<float>(),
         beta.data_ptr<scalar_t>(),
@@ -563,8 +571,7 @@ at::Tensor fused_recurrent_gated_delta_rule_cpu(
         num_heads,
         head_dim,
         v_num_heads,
-        v_head_dim,
-        use_qk_l2norm_in_kernel);
+        v_head_dim);
   });
   return core_attn_out;
 }
