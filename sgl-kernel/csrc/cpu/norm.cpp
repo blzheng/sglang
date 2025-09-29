@@ -5,12 +5,13 @@ namespace {
 
 // NB: avoid using `at::vec::map<>` on bfloat16 or half
 // Llama4TextL2Norm
-template <typename scalar_t>
+template <typename scalar_t, typename func_t>
 void l2norm_kernel_impl(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
     int64_t batch_size,
     int64_t hidden_size,
+    const func_t& f,
     float eps = 1e-5) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
@@ -42,7 +43,7 @@ void l2norm_kernel_impl(
       }
 
       sum_val += vec_reduce_sum(sum_fvec);
-      float rsqrt_var = float(1) / std::sqrt(sum_val / hidden_size + eps);
+      float rsqrt_var = float(1) / std::sqrt(f(sum_val, hidden_size) + eps);
       const fVec scale_fvec = fVec(rsqrt_var);
 
 #pragma GCC unroll 4
@@ -471,7 +472,13 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
   at::Tensor output = at::empty_like(input);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "l2norm_kernel", [&] {
-    l2norm_kernel_impl<scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), batch_size, hidden_size, eps);
+    l2norm_kernel_impl<scalar_t>(
+      output.data_ptr<scalar_t>(),
+      input.data_ptr<scalar_t>(),
+      batch_size,
+      hidden_size,
+      [](float x, int64_t n) { return x / n;},
+      eps);
   });
   return output;
 }
