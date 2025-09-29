@@ -438,21 +438,16 @@ class MambaAttnBackend(AttentionBackend):
         beta = b.sigmoid()
         # g = torch_gdn_gating(A_log, a, dt_bias)
         g = self.fused_gdn_gating(A_log, a, dt_bias)
-        if num_value_heads // num_heads > 1:
-            query = query.repeat_interleave(num_value_heads // num_heads, dim=2)
-            key = key.repeat_interleave(num_value_heads // num_heads, dim=2)
-        batch_size = forward_batch.batch_size
-        core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
-            query=query.transpose(0,1).view(batch_size, -1, *query.shape[2:]),
-            key=key.transpose(0,1).view(batch_size, -1, *key.shape[2:]),
-            value=value.transpose(0, 1).view(batch_size, -1, *value.shape[2:]),
-            g=g.unsqueeze(0),
-            beta=beta.unsqueeze(0),
-            initial_state=ssm_states[cache_indices],
-            output_final_state=True,
-            use_qk_l2norm_in_kernel=True,
+        core_attn_out = torch.ops.sgl_kernel.fused_recurrent_gated_delta_rule_cpu(
+            query,
+            key,
+            value,
+            g,
+            beta,
+            cache_indices,
+            ssm_states,
+            True,
         )
-        ssm_states[cache_indices] = last_recurrent_state.to(ssm_states.dtype, copy=False)
         return core_attn_out
 
     def forward_extend(
