@@ -287,6 +287,7 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
     const int32_t* __restrict__ indices_ptr,
     float* __restrict__ state_ptr,
     scalar_t* __restrict__ o_ptr,
+    float* __restrict__ kv_mem_ptr,
     int64_t seq_len,
     int64_t batch_size,
     int64_t num_heads,
@@ -294,8 +295,14 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
     int64_t v_num_heads,
     int64_t v_head_dim,
     bool use_qk_l2norm_in_kernel) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int64_t VecSize = bVec::size();
+  constexpr int64_t fVecSize = fVec::size();
   int64_t group_size = v_num_heads / num_heads;
   double scale = 1 / std::sqrt(head_dim);
+  fVec scale_vec = fVec(scale);
   at::parallel_for(0, batch_size * seq_len * v_num_heads, 0, [&](int64_t begin, int64_t end) {
     int64_t bi{0}, si{0}, ni{0};
     data_index_init(begin, bi, batch_size, si, seq_len, ni, v_num_heads);
@@ -304,24 +311,66 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
         int64_t state_offset = (cache_index * v_num_heads + ni) * head_dim * v_head_dim;
         float g_val = g_ptr[bi * v_num_heads + ni];
         float g_val_exp = std::exp(g_val);
+        fVec g_val_exp_vec = fVec(g_val_exp);
         int64_t qk_offset = ((si * batch_size + bi) * num_heads + (ni / group_size)) * head_dim;
         int64_t v_offset = ((si * batch_size + bi) * v_num_heads + ni) * v_head_dim;
         int64_t o_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
+        int64_t dt_kv_mem_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
         float beta_val = beta_ptr[bi * v_num_heads + ni];
-        for (int dvi = 0; dvi < v_head_dim; ++dvi) {
-          float kv_mem_val = 0.0;
-          float v_val = v_ptr[v_offset + dvi];
-          float o_val = o_ptr[o_offset + dvi];
+        fVec beta_vec = fVec(beta_val);
+        int64_t dvi = 0;
+        for (; dvi <= v_head_dim - fVecSize; dvi += fVecSize) {
+          for (int di = 0; di < head_dim; ++di) {
+            fVec k_val_vec = fVec(k_ptr[qk_offset + di]);
+            fVec state_vec = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
+            fVec kv_mem_vec = fVec::loadu(kv_mem_ptr + dt_kv_mem_offset + dvi);
+            state_vec = state_vec * g_val_exp_vec;
+            kv_mem_vec = kv_mem_vec + state_vec * k_val_vec;
+            state_vec.store(state_ptr + state_offset + di * v_head_dim + dvi);
+            kv_mem_vec.store(kv_mem_ptr + dt_kv_mem_offset + dvi);
+          }
+        }
+        for(; dvi < v_head_dim; ++dvi) {
           for (int di = 0; di < head_dim; ++di) {
             float k_val = k_ptr[qk_offset + di];
             state_ptr[state_offset + di * v_head_dim + dvi] *= g_val_exp;
-            kv_mem_val += state_ptr[state_offset + di * v_head_dim + dvi] * k_val;
+            kv_mem_ptr[dt_kv_mem_offset + dvi] += state_ptr[state_offset + di * v_head_dim + dvi] * k_val;
           }
+        }
+        for (dvi = 0; dvi <= v_head_dim - VecSize; dvi += VecSize) {
+          bVec v_bvec = bVec::loadu(v_ptr + v_offset + dvi);
+          fVec v_vec0, v_vec1;
+          std::tie(v_vec0, v_vec1) = at::vec::convert_to_float(v_bvec);
+          fVec kv_mem_vec0 = fVec::loadu(kv_mem_ptr + dt_kv_mem_offset + dvi);
+          fVec kv_mem_vec1 = fVec::loadu(kv_mem_ptr + dt_kv_mem_offset + dvi + fVecSize);
+          fVec dt_vec0 = (v_vec0 - kv_mem_vec0) * beta_vec;
+          fVec dt_vec1 = (v_vec1 - kv_mem_vec1) * beta_vec;
+          bVec o_vec = bVec::loadu(o_ptr + o_offset + dvi);
+          fVec o_vec0, o_vec1;
+          std::tie(o_vec0, o_vec1) = at::vec::convert_to_float(o_vec);
+          for (int di = 0; di < head_dim; ++di) {
+            fVec q_vec = fVec(q_ptr[qk_offset + di]);
+            fVec k_vec = fVec(k_ptr[qk_offset + di]);
+            fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
+            fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
+            state_vec0 = state_vec0 + k_vec * dt_vec0;
+            state_vec1 = state_vec1 + k_vec * dt_vec1;
+            o_vec0 = o_vec0 + state_vec0 * q_vec * scale_vec;
+            o_vec1 = o_vec1 + state_vec1 * q_vec * scale_vec;
+            state_vec0.store(state_ptr + state_offset + di * v_head_dim + dvi);
+            state_vec1.store(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
+          }
+          o_vec = at::vec::convert_from_float<scalar_t>(o_vec0, o_vec1);
+          o_vec.store(o_ptr + o_offset + dvi);
+        }
+        for (; dvi < v_head_dim; ++dvi) {
+          float v_val = v_ptr[v_offset + dvi];
+          float dt_val = (v_val - kv_mem_ptr[dt_kv_mem_offset + dvi]) * beta_val;
+          float o_val = o_ptr[o_offset + dvi];
           for (int di = 0; di < head_dim; ++di) {
             float q_val = q_ptr[qk_offset + di];
             float k_val = k_ptr[qk_offset + di];
-            float delta_val = (v_val - kv_mem_val) * beta_val;
-            state_ptr[state_offset + di * v_head_dim + dvi] += k_val * delta_val;
+            state_ptr[state_offset + di * v_head_dim + dvi] += k_val * dt_val;
             o_val += state_ptr[state_offset + di * v_head_dim + dvi] * q_val * scale;
           }
           o_ptr[o_offset + dvi] = o_val;
@@ -497,7 +546,7 @@ at::Tensor fused_recurrent_gated_delta_rule_cpu(
   CHECK_EQ(v_num_heads % num_heads, 0);
 
   at::Tensor core_attn_out = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kBFloat16);
- 
+  at::Tensor kv_mem = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kFloat);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "fused_recurrent_gated_delta_rule_kernel_impl", [&] {
     fused_recurrent_gated_delta_rule_kernel_impl<scalar_t>(
         query.data_ptr<scalar_t>(),
@@ -508,6 +557,7 @@ at::Tensor fused_recurrent_gated_delta_rule_cpu(
         cache_indices.data_ptr<int32_t>(),
         initial_state.data_ptr<float>(),
         core_attn_out.data_ptr<scalar_t>(),
+        kv_mem.data_ptr<float>(),
         seq_len,
         batch_size,
         num_heads,
