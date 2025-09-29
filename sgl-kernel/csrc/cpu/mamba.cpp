@@ -386,7 +386,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
     const scalar_t* __restrict__ k_ptr,
     const scalar_t* __restrict__ v_ptr,
     const float* __restrict__ g_ptr,
-    const scalar_t* __restrict__ beta_ptr,
+    const scalar_t* __restrict__ b_ptr,
     const int32_t* __restrict__ indices_ptr,
     float* __restrict__ state_ptr,
     scalar_t* __restrict__ o_ptr,
@@ -418,7 +418,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         int64_t v_offset = ((si * batch_size + bi) * v_num_heads + ni) * v_head_dim;
         int64_t o_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
         int64_t dt_kv_mem_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
-        float beta_val = beta_ptr[bi * v_num_heads + ni];
+        float beta_val = 1 / (1 + std::exp(-b_ptr[bi * v_num_heads + ni]));
         fVec beta_vec = fVec(beta_val);
         int64_t dvi = 0;
         for (; dvi <= v_head_dim - fVecSize; dvi += fVecSize) {
@@ -753,14 +753,13 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     key_ = qwen3_next_l2norm_cpu(key_, 1e-6);
   }
   at::Tensor g = fused_gdn_gating_cpu(A_log, a, dt_bias);
-  at::Tensor beta = at::sigmoid(b);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "fused_sigmoid_gating_delta_rule_update_kernel_impl", [&] {
     fused_sigmoid_gating_delta_rule_update_kernel_impl<scalar_t>(
         query_.data_ptr<scalar_t>(),
         key_.data_ptr<scalar_t>(),
         value.data_ptr<scalar_t>(),
         g.data_ptr<float>(),
-        beta.data_ptr<scalar_t>(),
+        b.data_ptr<scalar_t>(),
         cache_indices.data_ptr<int32_t>(),
         initial_state.data_ptr<float>(),
         core_attn_out.data_ptr<scalar_t>(),
