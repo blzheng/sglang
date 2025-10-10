@@ -29,19 +29,19 @@ def torch_recurrent_gated_delta_rule(
         x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
     ]
 
-    batch_size, sequence_length, num_heads, k_head_dim = key.shape
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
     scale = 1 / (query.shape[-1] ** 0.5)
     query = query * scale
 
-    core_attn_out = torch.zeros(batch_size, sequence_length, num_heads, v_head_dim).to(value)
+    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(value)
     last_recurrent_state = (
-        torch.zeros(batch_size, sequence_length, k_head_dim, v_head_dim).to(value)
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
         if initial_state is None
         else initial_state.to(value)
     )
 
-    for i in range(num_heads):
+    for i in range(sequence_length):
         q_t = query[:, :, i]
         k_t = key[:, :, i]
         v_t = value[:, :, i]
@@ -89,9 +89,9 @@ class TestMambaAttention(CustomTestCase):
         head_v_dim = 128
         num_heads = 16
         seq_len = 1
-        query = torch.rand(batch_size, seq_len, num_heads, head_k_dim, dtype=torch.bfloat16)
-        key = torch.rand(batch_size, seq_len, num_heads, head_k_dim, dtype=torch.bfloat16)
-        value = torch.rand(batch_size, seq_len, num_value_heads, head_v_dim, dtype=torch.bfloat16)
+        query = torch.rand(seq_len, batch_size, num_heads, head_k_dim, dtype=torch.bfloat16)
+        key = torch.rand(seq_len, batch_size, num_heads, head_k_dim, dtype=torch.bfloat16)
+        value = torch.rand(seq_len, batch_size, num_value_heads, head_v_dim, dtype=torch.bfloat16)
         A_log = torch.rand(num_value_heads, dtype=torch.float32)
         a = torch.rand(batch_size, num_value_heads, dtype=torch.float32)
         dt_bias = torch.rand(num_value_heads, dtype=torch.float32)
@@ -138,12 +138,12 @@ class TestMambaAttention(CustomTestCase):
         head_v_dim = 128
         num_heads = 16
         seq_len = 1
-        query = torch.rand(batch_size, seq_len, num_heads, head_k_dim, dtype=torch.bfloat16)
-        key = torch.rand(batch_size, seq_len, num_heads, head_k_dim, dtype=torch.bfloat16)
-        value = torch.rand(batch_size, seq_len, num_value_heads, head_v_dim, dtype=torch.bfloat16)
+        query = torch.rand(seq_len, batch_size, num_heads, head_k_dim, dtype=torch.bfloat16)
+        key = torch.rand(seq_len, batch_size, num_heads, head_k_dim, dtype=torch.bfloat16)
+        value = torch.rand(seq_len, batch_size, num_value_heads, head_v_dim, dtype=torch.bfloat16)
         A_log = torch.rand(num_value_heads, dtype=torch.float32)
-        a = torch.rand(seq_len, num_value_heads, dtype=torch.bfloat16)
-        b = torch.rand(seq_len, num_value_heads, dtype=torch.bfloat16)
+        a = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
+        b = torch.rand(batch_size, num_value_heads, dtype=torch.bfloat16)
         dt_bias = torch.rand(num_value_heads, dtype=torch.bfloat16)
         ssm_states = torch.rand(513, num_value_heads, head_k_dim, head_v_dim, dtype=torch.float32)
         cache_indices = torch.randint(0, 513, (batch_size,), dtype=torch.int32)

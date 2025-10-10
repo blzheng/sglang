@@ -435,15 +435,14 @@ class MambaAttnBackend(AttentionBackend):
         query = query.view(1, seq_len, num_heads, head_k_dim)
         key = key.view(1, seq_len, num_heads, head_k_dim)
         value = value.view(1, seq_len, num_value_heads, head_v_dim)
-        beta = b.sigmoid()
-        # g = torch_gdn_gating(A_log, a, dt_bias)
-        g = self.fused_gdn_gating(A_log, a, dt_bias)
-        core_attn_out = torch.ops.sgl_kernel.fused_recurrent_gated_delta_rule_cpu(
-            query,
-            key,
+        core_attn_out = torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu(
+            query.contiguous(),
+            key.contiguous(),
             value,
-            g,
-            beta,
+            A_log,
+            a,
+            dt_bias,
+            b,
             cache_indices,
             ssm_states,
             True,
@@ -545,15 +544,15 @@ class MambaAttnBackend(AttentionBackend):
         beta = beta.unsqueeze(0)
 
         if is_target_verify:
-            core_attn_out, last_recurrent_state = torch_recurrent_gated_delta_rule(
-                query=query,
-                key=key,
-                value=value,
-                g=g,
-                beta=beta,
-                initial_state=ssm_states[cache_indices],
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=True,
+            core_attn_out = torch.ops.sgl_kernel.fused_recurrent_gated_delta_rule_cpu(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                cache_indices,
+                ssm_states,
+                True,
             )
         else:
             recurrent_state = ssm_states[cache_indices]
