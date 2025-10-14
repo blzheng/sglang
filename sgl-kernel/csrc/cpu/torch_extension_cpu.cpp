@@ -212,6 +212,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> qkv_proj_with_rope_fused_weight(
     int64_t kv_lora_rank,
     int64_t qk_rope_head_dim);
 
+// deepseekv3.2 index
+at::Tensor deepseek_index_cpu(
+    at::Tensor& query,
+    at::Tensor& weight,
+    at::Tensor& key);
+
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -363,6 +369,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // deepseekv3.2 index
+  m.def("deepseek_index_cpu(Tensor query, Tensor weight, Tensor key) -> Tensor");
+  m.impl("deepseek_index_cpu", torch::kCPU, &deepseek_index_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
