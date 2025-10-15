@@ -35,7 +35,7 @@ class TestDeepSeekV32(CustomTestCase):
         N = 14
         query = torch.rand(B, M, H, D, dtype=torch.bfloat16)
         key = torch.rand(B, N, D, dtype=torch.bfloat16)
-        weight = torch.rand(B, M, H, dtype=torch.float32)
+        weight = torch.rand(B, M, H, dtype=torch.bfloat16)
         out_ref = self._deepseekv32_index_native(query, weight, key)
         out = torch.ops.sgl_kernel.deepseek_index_cpu(query, weight, key)
         atol = rtol = precision[out_ref.dtype]

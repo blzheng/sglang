@@ -6,7 +6,7 @@ namespace {
 template <typename scalar_t>
 void deepseek_index_kernel_impl(
   const scalar_t* __restrict__ query,
-  const float* __restrict__ weight,
+  const scalar_t* __restrict__ weight,
   const scalar_t* __restrict__ key,
   float* __restrict__ out,
   int64_t B,
@@ -55,7 +55,7 @@ void deepseek_index_kernel_impl(
 template <>
 void deepseek_index_kernel_impl(
   const at::BFloat16* __restrict__ query,
-  const float* __restrict__ weight,
+  const at::BFloat16* __restrict__ weight,
   const at::BFloat16* __restrict__ key,
   float* __restrict__ out,
   int64_t B,
@@ -130,7 +130,7 @@ at::Tensor deepseek_index_cpu(
   AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "deepseek_index_kernel", [&] {
     deepseek_index_kernel_impl<scalar_t>(
         query.data_ptr<scalar_t>(),
-        weight.data_ptr<float>(),
+        weight.data_ptr<scalar_t>(),
         key.data_ptr<scalar_t>(),
         out.data_ptr<float>(),
         B,
