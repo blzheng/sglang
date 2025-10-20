@@ -673,15 +673,84 @@ class Indexer(CustomOp):
 
         return topk_indices
 
-    def forward_indexer(
+    def forward_indexer_bs_1_bf16(
         self,
-        q_fp8: torch.Tensor,
+        query: torch.Tensor,
         weights: torch.Tensor,
         forward_batch: ForwardBatch,
         topk: int,
         layer_id: int,
     ) -> Optional[torch.Tensor]:
-        return self.forward_indexer_bs_1(q_fp8, weights, forward_batch, topk, layer_id)
+        # if not is_npu():
+        #     from sglang.srt.layers.attention.nsa.tilelang_kernel import fp8_index
+
+        page_size = forward_batch.token_to_kv_pool.page_size
+        assert page_size == 64, "only support page size 64"
+
+        assert len(weights.shape) == 3
+        weights = weights.squeeze(-1)
+
+        topk_indices_list = []
+        req_to_token = forward_batch.req_to_token_pool.req_to_token
+        req_pool_indices = forward_batch.req_pool_indices
+
+
+        q_len_start = 0
+
+        for i in range(forward_batch.batch_size):
+            seq_len = forward_batch.seq_lens[i].item()
+            q_len = (
+                forward_batch.extend_seq_lens_cpu[i]
+                if forward_batch.forward_mode.is_extend()
+                else 1
+            )
+            q_len_end = q_len_start + q_len
+
+            q_partial = query[q_len_start:q_len_end]
+            q_partial = q_partial.unsqueeze(0).contiguous()
+
+            weights_partial = weights[q_len_start:q_len_end]
+            weights_partial = weights_partial.squeeze(-1).unsqueeze(0).contiguous()
+
+            # query = q_fp8_partial.to(torch.float32).to(torch.bfloat16)
+            req_pool_idx = req_pool_indices[i].item()
+            per_req_tokens = req_to_token[req_pool_idx, :seq_len]
+            key = forward_batch.token_to_kv_pool.get_index_k(
+                layer_id,
+            )[per_req_tokens].unsqueeze(0).contiguous()
+            index_score = torch.ops.sgl_kernel.deepseek_index_cpu(
+                q_partial,
+                weights_partial,
+                key,
+            )
+            end_pos = seq_len
+            topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
+
+            pad_len = align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
+            topk_indices = torch.nn.functional.pad(
+                topk_indices, (0, pad_len), "constant", -1
+            )
+
+            topk_indices_list.append(topk_indices)
+
+            q_len_start = q_len_end
+
+        topk_indices = torch.cat(topk_indices_list, dim=0)
+
+        return topk_indices
+
+
+    def forward_indexer(
+        self,
+        query: torch.Tensor,
+        weights: torch.Tensor,
+        forward_batch: ForwardBatch,
+        topk: int,
+        layer_id: int,
+    ) -> Optional[torch.Tensor]:
+        if query.dtype == torch.bfloat16:
+            return self.forward_indexer_bs_1_bf16(query, weights, forward_batch, topk, layer_id)
+        return self.forward_indexer_bs_1(query, weights, forward_batch, topk, layer_id)
 
     def _forward(
         self,
@@ -693,7 +762,6 @@ class Indexer(CustomOp):
     ) -> Optional[torch.Tensor]:
         # if not is_npu():
         #     from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
-
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
@@ -729,23 +797,21 @@ class Indexer(CustomOp):
         else:
             # q_fp8, q_scale = act_quant(query, self.block_size, self.scale_fmt)
             # k_fp8, k_scale = act_quant(key, self.block_size, self.scale_fmt)
-            q_fp8, q_scale = act_quant_py(query, self.block_size, self.scale_fmt)
-            k_fp8, k_scale = act_quant_py(key, self.block_size, self.scale_fmt)
-
+            q_scale = 1.0
         # k_fp8: (seq_len, head_dim) fp8_e4m3fn
         # k_buffer: (num_total_tokens + page_size, head_dim) fp8_e4m3fn
         # k_scale: (seq_len, head_dim // block_size = 1) fp8_e4m3fn
         # k_scale_cache: (num_total_tokens + page_size, head_dim // block_size = 1) fp8_e4m3fn
-        forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
-            layer_id=layer_id,
-            loc=forward_batch.out_cache_loc,
-            index_k=k_fp8,
-            index_k_scale=k_scale,
-        )
-
+        
         weights = self._get_logits_head_gate(x, q_scale)
 
         if is_cuda():
+            forward_batch.token_to_kv_pool.set_index_k_and_scale_buffer(
+                layer_id=layer_id,
+                loc=forward_batch.out_cache_loc,
+                index_k=k_fp8,
+                index_k_scale=k_scale,
+            )
             assert forward_batch.seq_lens_cpu is not None
             if len(forward_batch.seq_lens_cpu) == 0:
                 # this seems b/c max-pad, no worries?
@@ -766,8 +832,13 @@ class Indexer(CustomOp):
                     forward_batch, layer_id, q_fp8, weights, metadata
                 )
         else:
+            forward_batch.token_to_kv_pool.set_index_k_buffer(
+                layer_id=layer_id,
+                loc=forward_batch.out_cache_loc,
+                index_k=key,
+            )
             topk_result = self.forward_indexer(
-                q_fp8.contiguous(),
+                query.contiguous(),
                 weights,
                 forward_batch,
                 topk=self.index_topk,

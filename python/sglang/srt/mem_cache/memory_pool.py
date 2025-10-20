@@ -1382,6 +1382,17 @@ class NSATokenToKVPool(MLATokenToKVPool):
             )
             for _ in range(layer_num)
         ]
+        self.index_k_buffer = [
+            torch.zeros(
+                (
+                    size + page_size,
+                    index_head_dim,
+                ),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            for _ in range(layer_num)
+        ]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         if self.layer_transfer_counter is not None:
@@ -1422,6 +1433,20 @@ class NSATokenToKVPool(MLATokenToKVPool):
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
+
+    def set_index_k_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> None:
+        self.index_k_buffer[layer_id - self.start_layer][loc] = index_k
+
+    def get_index_k(
+        self,
+        layer_id: int,
+    ):
+        return self.index_k_buffer[layer_id - self.start_layer]
 
 
 class AscendMLAPagedTokenToKVPool(MLATokenToKVPool):
