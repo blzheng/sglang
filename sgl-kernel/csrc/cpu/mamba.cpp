@@ -1455,9 +1455,7 @@ at::Tensor fused_recurrent_gated_delta_rule_cpu(
 
 
 
-// query: [seq_len, batch_size, num_heads, head_dim]
-// key: [seq_len, batch_size, num_heads, head_dim]
-// value: [seq_len, batch_size, v_num_heads, v_head_dim]
+// mixed_qkv: [batch_size, key_dim * 2 + value_dim]
 // A_log: [v_num_heads]
 // a: [batch_size, v_num_heads]
 // dt_bias: [v_num_heads]
@@ -1465,9 +1463,7 @@ at::Tensor fused_recurrent_gated_delta_rule_cpu(
 // cache_indices: [batch_size]
 // initial_state:[num_tokens, v_num_heads, head_dim, v_head_dim]
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
-  const at::Tensor& query,
-  const at::Tensor& key,
-  const at::Tensor& value,
+  const at::Tensor& mixed_qkv,
   const at::Tensor& A_log,
   const at::Tensor& a,
   const at::Tensor& dt_bias,
@@ -1476,35 +1472,27 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   at::Tensor& initial_state,
   bool use_qk_l2norm_in_kernel
 ) {
-  RECORD_FUNCTION("sgl-kernel::fused_sigmoid_gating_delta_rule_update_cpu", std::vector<c10::IValue>({query, key, value, A_log, a, dt_bias, b, initial_state}));
-  CHECK_DIM(4, query);
-  CHECK_DIM(4, key);
-  CHECK_DIM(4, value);
+  RECORD_FUNCTION("sgl-kernel::fused_sigmoid_gating_delta_rule_update_cpu", std::vector<c10::IValue>({mixed_qkv, A_log, a, dt_bias, b, initial_state}));
+  CHECK_DIM(2, mixed_qkv);
   CHECK_DIM(1, A_log);
   CHECK_DIM(2, a);
   CHECK_DIM(1, dt_bias);
   CHECK_DIM(2, b);
   CHECK_DIM(4, initial_state);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(value);
   CHECK_CONTIGUOUS(a);
   CHECK_CONTIGUOUS(b);
   CHECK_CONTIGUOUS(initial_state);
-  int64_t seq_len = query.size(0);
-  int64_t batch_size = query.size(1);
-  int64_t num_heads = query.size(2);
-  int64_t head_dim = query.size(3);
-  int64_t v_num_heads = value.size(2);
-  int64_t v_head_dim = value.size(3);
-  CHECK_EQ(key.size(0), seq_len);
-  CHECK_EQ(key.size(1), batch_size);
-  CHECK_EQ(key.size(2), num_heads);
-  CHECK_EQ(key.size(3), head_dim);
-  CHECK_EQ(value.size(0), seq_len);
-  CHECK_EQ(value.size(1), batch_size);
-  CHECK_EQ(value.size(2), v_num_heads);
-  CHECK_EQ(value.size(3), v_head_dim);
+  int64_t seq_len = 1;
+  int64_t batch_size = mixed_qkv.size(0);
+  int64_t v_num_heads = initial_state.size(1);
+  int64_t head_dim = initial_state.size(2);
+  int64_t v_head_dim = initial_state.size(3);
+  int64_t mixed_qkv_dim = mixed_qkv.size(1);
+  int64_t v_dim = v_head_dim * v_num_heads;
+  int64_t k_dim = (mixed_qkv_dim - v_dim) / 2;
+  int64_t num_heads = k_dim / head_dim;
+  CHECK_EQ(mixed_qkv_dim, k_dim * 2 + v_dim);
+  CHECK_EQ(v_num_heads % num_heads, 0);
   CHECK_EQ(a.size(0), batch_size);
   CHECK_EQ(a.size(1), v_num_heads);
   CHECK_EQ(dt_bias.size(0), v_num_heads);
@@ -1513,13 +1501,13 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   CHECK_EQ(A_log.size(0), v_num_heads);
   CHECK_EQ(cache_indices.size(0), batch_size);
   CHECK(initial_state.size(0) >= batch_size);
-  CHECK_EQ(initial_state.size(1), v_num_heads);
-  CHECK_EQ(initial_state.size(2), head_dim);
-  CHECK_EQ(initial_state.size(3), v_head_dim);
-  CHECK_EQ(v_num_heads % num_heads, 0);
 
   at::Tensor core_attn_out = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kBFloat16);
   at::Tensor kv_mem = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kFloat);
+  auto qkv = at::split(mixed_qkv, {k_dim, k_dim, v_dim}, -1);
+  at::Tensor query = qkv[0].view({1, batch_size, num_heads, head_dim});
+  at::Tensor key = qkv[1].view({1, batch_size, num_heads, head_dim});
+  at::Tensor value = qkv[2].view({1, batch_size, v_num_heads, v_head_dim});
   at::Tensor query_ = query;
   at::Tensor key_ = key;
   if (use_qk_l2norm_in_kernel) {
