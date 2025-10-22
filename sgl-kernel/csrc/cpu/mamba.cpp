@@ -420,7 +420,6 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
     const int32_t* __restrict__ indices_ptr,
     float* __restrict__ state_ptr,
     scalar_t* __restrict__ o_ptr,
-    float* __restrict__ kv_mem_ptr,
     int64_t seq_len,
     int64_t batch_size,
     int64_t num_heads,
@@ -524,58 +523,51 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         int64_t k_offset = q_offset + k_dim;
         int64_t v_offset = bi * qkv_strideB + k_dim * 2 + ni * v_head_dim;
         int64_t o_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
-        int64_t dt_kv_mem_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
         float beta_val = 1 / (1 + std::exp(-b_ptr[ni]));
         fVec beta_vec = fVec(beta_val);
         int64_t dvi = 0;
-        for (; dvi <= v_head_dim - fVecSize; dvi += fVecSize) {
+        for (; dvi <= v_head_dim - VecSize; dvi += VecSize) {
+          fVec kv_mem_vec0 = fVec(float(0));
+          fVec kv_mem_vec1 = fVec(float(0));
           for (int di = 0; di < head_dim; ++di) {
             fVec k_val_vec = fVec(qkv_ptr[k_offset + di]);
-            fVec state_vec = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
-            fVec kv_mem_vec = fVec::loadu(kv_mem_ptr + dt_kv_mem_offset + dvi);
-            state_vec = state_vec * g_val_exp_vec;
-            kv_mem_vec = kv_mem_vec + state_vec * k_val_vec;
-            state_vec.store(state_ptr + state_offset + di * v_head_dim + dvi);
-            kv_mem_vec.store(kv_mem_ptr + dt_kv_mem_offset + dvi);
+            fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
+            fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
+            kv_mem_vec0 = kv_mem_vec0 + state_vec0 * g_val_exp_vec * k_val_vec;
+            kv_mem_vec1 = kv_mem_vec1 + state_vec1 * g_val_exp_vec * k_val_vec;
           }
-        }
-        for(; dvi < v_head_dim; ++dvi) {
-          for (int di = 0; di < head_dim; ++di) {
-            float k_val = qkv_ptr[k_offset + di];
-            state_ptr[state_offset + di * v_head_dim + dvi] *= g_val_exp;
-            kv_mem_ptr[dt_kv_mem_offset + dvi] += state_ptr[state_offset + di * v_head_dim + dvi] * k_val;
-          }
-        }
-        for (dvi = 0; dvi <= v_head_dim - VecSize; dvi += VecSize) {
           bVec v_bvec = bVec::loadu(qkv_ptr + v_offset + dvi);
           fVec v_vec0, v_vec1;
           std::tie(v_vec0, v_vec1) = at::vec::convert_to_float(v_bvec);
-          fVec kv_mem_vec0 = fVec::loadu(kv_mem_ptr + dt_kv_mem_offset + dvi);
-          fVec kv_mem_vec1 = fVec::loadu(kv_mem_ptr + dt_kv_mem_offset + dvi + fVecSize);
           fVec dt_vec0 = (v_vec0 - kv_mem_vec0) * beta_vec;
           fVec dt_vec1 = (v_vec1 - kv_mem_vec1) * beta_vec;
-          bVec o_vec = bVec::loadu(o_ptr + o_offset + dvi);
-          fVec o_vec0, o_vec1;
-          std::tie(o_vec0, o_vec1) = at::vec::convert_to_float(o_vec);
+          fVec o_vec0 = fVec(float(0));
+          fVec o_vec1 = fVec(float(0));
           for (int di = 0; di < head_dim; ++di) {
             fVec q_vec = fVec(qkv_ptr[q_offset + di]);
             fVec k_vec = fVec(qkv_ptr[k_offset + di]);
             fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
             fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
-            state_vec0 = state_vec0 + k_vec * dt_vec0;
-            state_vec1 = state_vec1 + k_vec * dt_vec1;
+            state_vec0 = state_vec0 * g_val_exp_vec + k_vec * dt_vec0;
+            state_vec1 = state_vec1 * g_val_exp_vec + k_vec * dt_vec1;
             o_vec0 = o_vec0 + state_vec0 * q_vec * scale_vec;
             o_vec1 = o_vec1 + state_vec1 * q_vec * scale_vec;
             state_vec0.store(state_ptr + state_offset + di * v_head_dim + dvi);
             state_vec1.store(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
           }
-          o_vec = at::vec::convert_from_float<scalar_t>(o_vec0, o_vec1);
+          bVec o_vec = at::vec::convert_from_float<scalar_t>(o_vec0, o_vec1);
           o_vec.store(o_ptr + o_offset + dvi);
         }
-        for (; dvi < v_head_dim; ++dvi) {
+        for(; dvi < v_head_dim; ++dvi) {
+          float kv_mem_val = 0;
+          for (int di = 0; di < head_dim; ++di) {
+            float k_val = qkv_ptr[k_offset + di];
+            state_ptr[state_offset + di * v_head_dim + dvi] *= g_val_exp;
+            kv_mem_val += state_ptr[state_offset + di * v_head_dim + dvi] * k_val;
+          }
           float v_val = qkv_ptr[v_offset + dvi];
-          float dt_val = (v_val - kv_mem_ptr[dt_kv_mem_offset + dvi]) * beta_val;
-          float o_val = o_ptr[o_offset + dvi];
+          float dt_val = (v_val - kv_mem_val) * beta_val;
+          float o_val = 0;
           for (int di = 0; di < head_dim; ++di) {
             float q_val = qkv_ptr[q_offset + di];
             float k_val = qkv_ptr[k_offset + di];
@@ -1569,8 +1561,7 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
   CHECK_EQ(cache_indices.size(0), batch_size);
   CHECK(initial_state.size(0) >= batch_size);
 
-  at::Tensor core_attn_out = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kBFloat16);
-  at::Tensor kv_mem = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kFloat);
+  at::Tensor core_attn_out = at::empty({batch_size, seq_len, v_num_heads, v_head_dim}, at::kBFloat16);
   int64_t qkv_strideB = mixed_qkv.stride(0);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(mixed_qkv.scalar_type(), "fused_sigmoid_gating_delta_rule_update_kernel_impl", [&] {
     fused_sigmoid_gating_delta_rule_update_kernel_impl<scalar_t>(
@@ -1582,7 +1573,6 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
         cache_indices.data_ptr<int32_t>(),
         initial_state.data_ptr<float>(),
         core_attn_out.data_ptr<scalar_t>(),
-        kv_mem.data_ptr<float>(),
         seq_len,
         batch_size,
         num_heads,
