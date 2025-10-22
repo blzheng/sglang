@@ -264,7 +264,7 @@ at::Tensor fused_recurrent_gated_delta_rule_cpu(
 );
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
-  const at::Tensor& mixed_qkv,
+  at::Tensor& mixed_qkv,
   const at::Tensor& A_log,
   const at::Tensor& a,
   const at::Tensor& dt_bias,

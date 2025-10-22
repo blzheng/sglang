@@ -412,9 +412,7 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
 
 template <typename scalar_t>
 void fused_sigmoid_gating_delta_rule_update_kernel_impl(
-    const scalar_t* __restrict__ q_ptr,
-    const scalar_t* __restrict__ k_ptr,
-    const scalar_t* __restrict__ v_ptr,
+    scalar_t* __restrict__ qkv_ptr,
     const float* __restrict__ g_ptr,
     const scalar_t* __restrict__ b_ptr,
     const int32_t* __restrict__ indices_ptr,
@@ -427,15 +425,10 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
     int64_t head_dim,
     int64_t v_num_heads,
     int64_t v_head_dim,
-    int64_t q_strideB,
-    int64_t q_strideS,
-    int64_t q_strideH,
-    int64_t k_strideB,
-    int64_t k_strideS,
-    int64_t k_strideH,
-    int64_t v_strideB,
-    int64_t v_strideS,
-    int64_t v_strideH) {
+    int64_t k_dim,
+    int64_t v_dim,
+    int64_t qkv_strideB,
+    bool use_qk_l2norm_in_kernel) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
@@ -444,6 +437,78 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
   int64_t group_size = v_num_heads / num_heads;
   double scale = 1 / std::sqrt(head_dim);
   fVec scale_vec = fVec(scale);
+  if (use_qk_l2norm_in_kernel) {
+    float eps = 1e-5;
+    at::parallel_for(0, batch_size * num_heads, 0, [&](int64_t begin, int64_t end) {
+      int64_t bi{0}, ni{0};
+      data_index_init(begin, bi, batch_size, ni, num_heads);
+      for (int64_t i = begin; i < end; ++i) {
+        float sum_q = float(0);
+        float sum_k = float(0);
+        fVec sum_q_fvec = fVec(float(0));
+        fVec sum_k_fvec = fVec(float(0));
+        int64_t q_offset = bi * qkv_strideB + ni * head_dim;
+        int64_t k_offset = q_offset + k_dim;
+        int64_t d;
+#pragma GCC unroll 4
+        for (d = 0; d <= head_dim - VecSize; d += VecSize) {
+          bVec q_bvec = bVec::loadu(qkv_ptr + q_offset + d);
+          fVec q_fvec0, q_fvec1;
+          std::tie(q_fvec0, q_fvec1) = at::vec::convert_to_float(q_bvec);
+          sum_q_fvec += q_fvec0 * q_fvec0;
+          sum_q_fvec += q_fvec1 * q_fvec1;
+          bVec k_bvec = bVec::loadu(qkv_ptr + k_offset + d);
+          fVec k_fvec0, k_fvec1;
+          std::tie(k_fvec0, k_fvec1) = at::vec::convert_to_float(k_bvec);
+          sum_k_fvec += k_fvec0 * k_fvec0;
+          sum_k_fvec += k_fvec1 * k_fvec1;
+        }
+#pragma GCC unroll 4
+        for (; d < head_dim; ++d) {
+          float q_val = static_cast<float>(qkv_ptr[q_offset + d]);
+          sum_q += q_val * q_val;
+          float k_val = static_cast<float>(qkv_ptr[k_offset + d]);
+          sum_k += k_val * k_val;
+        }
+
+        sum_q += vec_reduce_sum(sum_q_fvec);
+        sum_k += vec_reduce_sum(sum_k_fvec);
+        float q_rsqrt_var = float(1) / std::sqrt(sum_q + eps);
+        float k_rsqrt_var = float(1) / std::sqrt(sum_k + eps);
+        const fVec q_scale_fvec = fVec(q_rsqrt_var);
+        const fVec k_scale_fvec = fVec(k_rsqrt_var);
+
+#pragma GCC unroll 4
+        for (d = 0; d <= head_dim - VecSize; d += VecSize) {
+          bVec q_bvec = bVec::loadu(qkv_ptr + q_offset + d);
+          fVec q_fvec0, q_fvec1;
+          std::tie(q_fvec0, q_fvec1) = at::vec::convert_to_float(q_bvec);
+
+          q_fvec0 = q_fvec0 * q_scale_fvec;
+          q_fvec1 = q_fvec1 * q_scale_fvec;
+          bVec out_bvec = convert_from_float_ext<scalar_t>(q_fvec0, q_fvec1);
+          out_bvec.store(qkv_ptr + q_offset + d);
+          bVec k_bvec = bVec::loadu(qkv_ptr + k_offset + d);
+          fVec k_fvec0, k_fvec1;
+          std::tie(k_fvec0, k_fvec1) = at::vec::convert_to_float(k_bvec);
+
+          k_fvec0 = k_fvec0 * k_scale_fvec;
+          k_fvec1 = k_fvec1 * k_scale_fvec;
+          out_bvec = convert_from_float_ext<scalar_t>(k_fvec0, k_fvec1);
+          out_bvec.store(qkv_ptr + k_offset + d);
+        }
+#pragma GCC unroll 4
+        for (; d < head_dim; ++d) {
+          float q_val = static_cast<float>(qkv_ptr[q_offset + d]);
+          float k_val = static_cast<float>(qkv_ptr[k_offset + d]);
+          qkv_ptr[q_offset + d] = static_cast<scalar_t>(q_val * q_rsqrt_var);
+          qkv_ptr[k_offset + d] = static_cast<scalar_t>(k_val * k_rsqrt_var);
+        }
+
+        data_index_step(bi, batch_size, ni, num_heads);
+      }
+    });
+  }
   at::parallel_for(0, batch_size * seq_len * v_num_heads, 0, [&](int64_t begin, int64_t end) {
     int64_t bi{0}, si{0}, ni{0};
     data_index_init(begin, bi, batch_size, si, seq_len, ni, v_num_heads);
@@ -453,9 +518,9 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         float g_val = g_ptr[ni];
         float g_val_exp = std::exp(g_val);
         fVec g_val_exp_vec = fVec(g_val_exp);
-        int64_t q_offset = si * q_strideS + bi * q_strideB + (ni / group_size) * q_strideH;
-        int64_t k_offset = si * k_strideS + bi * k_strideB + (ni / group_size) * k_strideH;
-        int64_t v_offset = si * v_strideS + bi * v_strideB + ni * v_strideH;
+        int64_t q_offset = bi * qkv_strideB + (ni / group_size) * head_dim;
+        int64_t k_offset = q_offset + k_dim;
+        int64_t v_offset = bi * qkv_strideB + k_dim * 2 + ni * v_head_dim;
         int64_t o_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
         int64_t dt_kv_mem_offset = ((bi * seq_len + si) * v_num_heads + ni) * v_head_dim;
         float beta_val = 1 / (1 + std::exp(-b_ptr[ni]));
@@ -463,7 +528,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         int64_t dvi = 0;
         for (; dvi <= v_head_dim - fVecSize; dvi += fVecSize) {
           for (int di = 0; di < head_dim; ++di) {
-            fVec k_val_vec = fVec(k_ptr[k_offset + di]);
+            fVec k_val_vec = fVec(qkv_ptr[k_offset + di]);
             fVec state_vec = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
             fVec kv_mem_vec = fVec::loadu(kv_mem_ptr + dt_kv_mem_offset + dvi);
             state_vec = state_vec * g_val_exp_vec;
@@ -474,13 +539,13 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
         }
         for(; dvi < v_head_dim; ++dvi) {
           for (int di = 0; di < head_dim; ++di) {
-            float k_val = k_ptr[k_offset + di];
+            float k_val = qkv_ptr[k_offset + di];
             state_ptr[state_offset + di * v_head_dim + dvi] *= g_val_exp;
             kv_mem_ptr[dt_kv_mem_offset + dvi] += state_ptr[state_offset + di * v_head_dim + dvi] * k_val;
           }
         }
         for (dvi = 0; dvi <= v_head_dim - VecSize; dvi += VecSize) {
-          bVec v_bvec = bVec::loadu(v_ptr + v_offset + dvi);
+          bVec v_bvec = bVec::loadu(qkv_ptr + v_offset + dvi);
           fVec v_vec0, v_vec1;
           std::tie(v_vec0, v_vec1) = at::vec::convert_to_float(v_bvec);
           fVec kv_mem_vec0 = fVec::loadu(kv_mem_ptr + dt_kv_mem_offset + dvi);
@@ -491,8 +556,8 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
           fVec o_vec0, o_vec1;
           std::tie(o_vec0, o_vec1) = at::vec::convert_to_float(o_vec);
           for (int di = 0; di < head_dim; ++di) {
-            fVec q_vec = fVec(q_ptr[q_offset + di]);
-            fVec k_vec = fVec(k_ptr[k_offset + di]);
+            fVec q_vec = fVec(qkv_ptr[q_offset + di]);
+            fVec k_vec = fVec(qkv_ptr[k_offset + di]);
             fVec state_vec0 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi);
             fVec state_vec1 = fVec::loadu(state_ptr + state_offset + di * v_head_dim + dvi + fVecSize);
             state_vec0 = state_vec0 + k_vec * dt_vec0;
@@ -506,12 +571,12 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
           o_vec.store(o_ptr + o_offset + dvi);
         }
         for (; dvi < v_head_dim; ++dvi) {
-          float v_val = v_ptr[v_offset + dvi];
+          float v_val = qkv_ptr[v_offset + dvi];
           float dt_val = (v_val - kv_mem_ptr[dt_kv_mem_offset + dvi]) * beta_val;
           float o_val = o_ptr[o_offset + dvi];
           for (int di = 0; di < head_dim; ++di) {
-            float q_val = q_ptr[q_offset + di];
-            float k_val = k_ptr[k_offset + di];
+            float q_val = qkv_ptr[q_offset + di];
+            float k_val = qkv_ptr[k_offset + di];
             state_ptr[state_offset + di * v_head_dim + dvi] += k_val * dt_val;
             o_val += state_ptr[state_offset + di * v_head_dim + dvi] * q_val * scale;
           }
@@ -1463,7 +1528,7 @@ at::Tensor fused_recurrent_gated_delta_rule_cpu(
 // cache_indices: [batch_size]
 // initial_state:[num_tokens, v_num_heads, head_dim, v_head_dim]
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
-  const at::Tensor& mixed_qkv,
+  at::Tensor& mixed_qkv,
   const at::Tensor& A_log,
   const at::Tensor& a,
   const at::Tensor& dt_bias,
@@ -1504,31 +1569,11 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
 
   at::Tensor core_attn_out = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kBFloat16);
   at::Tensor kv_mem = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kFloat);
-  auto qkv = at::split(mixed_qkv, {k_dim, k_dim, v_dim}, -1);
-  at::Tensor query = qkv[0].view({1, batch_size, num_heads, head_dim});
-  at::Tensor key = qkv[1].view({1, batch_size, num_heads, head_dim});
-  at::Tensor value = qkv[2].view({1, batch_size, v_num_heads, v_head_dim});
-  at::Tensor query_ = query;
-  at::Tensor key_ = key;
-  if (use_qk_l2norm_in_kernel) {
-    query_ = qwen3_next_l2norm_cpu(query_, 1e-6);
-    key_ = qwen3_next_l2norm_cpu(key_, 1e-6);
-  }
   at::Tensor g = fused_gdn_gating_cpu(A_log, a, dt_bias);
-  int64_t q_strideB = query_.stride(1);
-  int64_t q_strideS = query_.stride(0);
-  int64_t q_strideH = query_.stride(2);
-  int64_t k_strideB = key_.stride(1);
-  int64_t k_strideS = key_.stride(0);
-  int64_t k_strideH = key_.stride(2);
-  int64_t v_strideB = value.stride(1);
-  int64_t v_strideS = value.stride(0);
-  int64_t v_strideH = value.stride(2);
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(query.scalar_type(), "fused_sigmoid_gating_delta_rule_update_kernel_impl", [&] {
+  int64_t qkv_strideB = mixed_qkv.stride(0);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(mixed_qkv.scalar_type(), "fused_sigmoid_gating_delta_rule_update_kernel_impl", [&] {
     fused_sigmoid_gating_delta_rule_update_kernel_impl<scalar_t>(
-        query_.data_ptr<scalar_t>(),
-        key_.data_ptr<scalar_t>(),
-        value.data_ptr<scalar_t>(),
+        mixed_qkv.data_ptr<scalar_t>(),
         g.data_ptr<float>(),
         b.data_ptr<scalar_t>(),
         cache_indices.data_ptr<int32_t>(),
@@ -1541,15 +1586,10 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
         head_dim,
         v_num_heads,
         v_head_dim,
-        q_strideB,
-        q_strideS,
-        q_strideH,
-        k_strideB,
-        k_strideS,
-        k_strideH,
-        v_strideB,
-        v_strideS,
-        v_strideH);
+        k_dim,
+        v_dim,
+        qkv_strideB,
+        use_qk_l2norm_in_kernel);
   });
   return core_attn_out;
 }
