@@ -413,7 +413,9 @@ void fused_recurrent_gated_delta_rule_kernel_impl(
 template <typename scalar_t>
 void fused_sigmoid_gating_delta_rule_update_kernel_impl(
     scalar_t* __restrict__ qkv_ptr,
-    const float* __restrict__ g_ptr,
+    const float* __restrict__ A_log_ptr,
+    const scalar_t* __restrict__ a_ptr,
+    const scalar_t* __restrict__ dt_bias_ptr,
     const scalar_t* __restrict__ b_ptr,
     const int32_t* __restrict__ indices_ptr,
     float* __restrict__ state_ptr,
@@ -515,7 +517,7 @@ void fused_sigmoid_gating_delta_rule_update_kernel_impl(
     for (int64_t i = begin; i < end; ++i) {
         int64_t cache_index = indices_ptr[bi];
         int64_t state_offset = (cache_index * v_num_heads + ni) * head_dim * v_head_dim;
-        float g_val = g_ptr[ni];
+        float g_val = -std::exp(A_log_ptr[ni]) * softplus(float(a_ptr[bi * v_num_heads + ni]) + float(dt_bias_ptr[ni]));
         float g_val_exp = std::exp(g_val);
         fVec g_val_exp_vec = fVec(g_val_exp);
         int64_t q_offset = bi * qkv_strideB + (ni / group_size) * head_dim;
@@ -1569,12 +1571,13 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
 
   at::Tensor core_attn_out = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kBFloat16);
   at::Tensor kv_mem = at::zeros({batch_size, seq_len, v_num_heads, v_head_dim}, at::kFloat);
-  at::Tensor g = fused_gdn_gating_cpu(A_log, a, dt_bias);
   int64_t qkv_strideB = mixed_qkv.stride(0);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(mixed_qkv.scalar_type(), "fused_sigmoid_gating_delta_rule_update_kernel_impl", [&] {
     fused_sigmoid_gating_delta_rule_update_kernel_impl<scalar_t>(
         mixed_qkv.data_ptr<scalar_t>(),
-        g.data_ptr<float>(),
+        A_log.data_ptr<float>(),
+        a.data_ptr<scalar_t>(),
+        dt_bias.data_ptr<scalar_t>(),
         b.data_ptr<scalar_t>(),
         cache_indices.data_ptr<int32_t>(),
         initial_state.data_ptr<float>(),
