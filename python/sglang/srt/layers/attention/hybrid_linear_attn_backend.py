@@ -64,7 +64,7 @@ elif is_cpu() and cpu_has_amx_support():
     fused_sigmoid_gating_delta_rule_update = (
         torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
     )
-    fused_gdn_gating = gdn_gating
+    fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
 elif is_cpu():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn_cpu,
