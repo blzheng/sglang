@@ -44,6 +44,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    cpu_has_amx_support,
     is_cpu,
     is_cuda,
     is_npu,
@@ -55,6 +56,9 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_amx_available = cpu_has_amx_support()
+if _is_cpu and _is_amx_available:
+    import sgl_kernel
 
 import triton
 import triton.language as tl
@@ -441,6 +445,15 @@ class Qwen3GatedDeltaNet(nn.Module):
                 projected_states_ba,
                 triton.cdiv(self.num_k_heads, self.attn_tp_size),
                 triton.cdiv(self.num_v_heads, self.attn_tp_size),
+                self.head_k_dim,
+                self.head_v_dim,
+            )
+        elif _is_cpu and _is_amx_available:
+            mixed_qkv, z, b, a = torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+                projected_states_qkvz,
+                projected_states_ba,
+                self.num_k_heads // self.attn_tp_size,
+                self.num_v_heads // self.attn_tp_size,
                 self.head_k_dim,
                 self.head_v_dim,
             )
