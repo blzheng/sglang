@@ -27,7 +27,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.qwen3_next import fused_gdn_gating, gdn_gating
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
-from sglang.srt.utils import is_cpu, is_cuda, is_npu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, cpu_has_amx_support
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -49,6 +49,21 @@ elif is_npu():
     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
     causal_conv1d_fn = causal_conv1d_fn_npu
     causal_conv1d_update = causal_conv1d_update_npu
+elif is_cpu() and cpu_has_amx_support():
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_fn_cpu,
+        causal_conv1d_update_cpu,
+    )
+    from sglang.srt.layers.attention.mamba.mamba import (
+        chunk_gated_delta_rule_cpu,
+    )
+    import sgl_kernel
+
+    causal_conv1d_fn = causal_conv1d_fn_cpu
+    causal_conv1d_update = causal_conv1d_update_cpu
+    chunk_gated_delta_rule = chunk_gated_delta_rule_cpu
+    fused_sigmoid_gating_delta_rule_update = torch.ops.sgl_kernel.fused_sigmoid_gating_delta_rule_update_cpu
+    fused_gdn_gating = gdn_gating
 elif is_cpu():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn_cpu,
