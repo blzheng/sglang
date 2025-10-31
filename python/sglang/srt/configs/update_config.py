@@ -152,10 +152,12 @@ def adjust_config_with_unaligned_cpu_tp(
             "intermediate_size",
             intermediate_padding_size,
         )
-    if (
-        hasattr(model_config.hf_config, "vision_config")
-        and model_config.hf_config.vision_config.model_type == "qwen3_vl_moe"
-    ):
+    if hasattr(
+        model_config.hf_config, "vision_config"
+    ) and model_config.hf_config.vision_config.model_type in [
+        "qwen3_vl_moe",
+        "qwen3_vl",
+    ]:
         model_config.hf_config.vision_config.original_num_heads = (
             model_config.hf_config.vision_config.num_heads
         )
