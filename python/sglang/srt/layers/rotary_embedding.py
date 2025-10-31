@@ -37,7 +37,7 @@ else:
     FusedSetKVBufferArg = None
 
 if _is_cpu and _is_cpu_amx_available:
-    import sgl_kernel
+    import sgl_kernel  # noqa: F401
 
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
@@ -1383,11 +1383,9 @@ class MRotaryEmbedding(RotaryEmbedding):
                 self.cos_sin_cache,
                 self.mrope_section if self.mrope_section else None,
                 self.mrope_interleaved,
-                self.is_neox_style
+                self.is_neox_style,
             )
-        return self._forward_native(
-            positions, query, key, fused_set_kv_buffer_arg
-        )
+        return self._forward_native(positions, query, key, fused_set_kv_buffer_arg)
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_native(
