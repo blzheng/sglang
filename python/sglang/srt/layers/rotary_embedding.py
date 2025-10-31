@@ -36,6 +36,9 @@ if _is_cuda:
 else:
     FusedSetKVBufferArg = None
 
+if _is_cpu and _is_cpu_amx_available:
+    import sgl_kernel
+
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
 
@@ -1371,52 +1374,20 @@ class MRotaryEmbedding(RotaryEmbedding):
         key: torch.Tensor,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """PyTorch-native implementation equivalent to forward().
-
-        Args:
-            positions:
-                [num_tokens,] (text only) or
-                [3, num_tokens] (T/H/W positions with multimodal inputs)
-            query: [num_tokens, num_heads * head_size]
-            key: [num_tokens, num_kv_heads * head_size]
-        """
-        assert (
-            fused_set_kv_buffer_arg is None
-        ), "save kv cache is not supported for MRotaryEmbedding."
-        assert positions.ndim == 1 or positions.ndim == 2
-
-        num_tokens = positions.shape[-1]
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if positions.ndim == 2:
-            assert self.mrope_section
-            if self.mrope_interleaved:
-                cos = apply_interleaved_rope(cos, self.mrope_section)
-                sin = apply_interleaved_rope(sin, self.mrope_section)
-            else:
-                cos = torch.cat(
-                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
-                    dim=-1,
-                )
-                sin = torch.cat(
-                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
-                    dim=-1,
-                )
-
-        query_shape = query.shape
-        query = query.view(num_tokens, -1, self.head_size)
-        query_rot = query[..., : self.rotary_dim]
-        query_pass = query[..., self.rotary_dim :]
-        query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
-        query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
-
-        key_shape = key.shape
-        key = key.view(num_tokens, -1, self.head_size)
-        key_rot = key[..., : self.rotary_dim]
-        key_pass = key[..., self.rotary_dim :]
-        key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
-        key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
-        return query, key
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.multimodal_rotary_embedding_cpu(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.cos_sin_cache,
+                self.mrope_section if self.mrope_section else None,
+                self.mrope_interleaved,
+                self.is_neox_style
+            )
+        return self._forward_native(
+            positions, query, key, fused_set_kv_buffer_arg
+        )
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
     def _forward_native(
