@@ -406,6 +406,25 @@ void _float8_linear_impl(
 
 }  // anonymous namespace
 
+
+template <bool cpublas_can_pack, int64_t N, int act_quant_mode, int wei_quant_mode>
+void tinygemm_kernel2(
+    float* C,
+    const at::Float8_e4m3fn* A,
+    const float* scales_a,
+    const at::Float8_e4m3fn* B,
+    const float* scales_b,
+    int64_t M,
+    int64_t K,
+    int64_t lda,
+    int64_t ldc,
+    int64_t ldsa,
+    float* ukernel_buf,
+    at::BFloat16* dqA_buf,
+    at::BFloat16* dqB_buf) {
+
+    return _micro_gemm<cpublas_can_pack, N, act_quant_mode, wei_quant_mode>(C, A, scales_a, B, scales_b, M, K, lda, ldc, ldsa, ukernel_buf,dqA_buf, dqB_buf );
+    }
 /*
 return: packed_weight, packed_scales
 */

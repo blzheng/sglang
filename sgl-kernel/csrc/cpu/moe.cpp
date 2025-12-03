@@ -951,6 +951,7 @@ at::Tensor fused_experts_cpu(
     bool inplace,
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
+    bool use_fp8_w8a8,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size,
@@ -1065,7 +1066,7 @@ at::Tensor fused_experts_cpu(
   if (use_int8_w8a8) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
-  if (use_fp8_w8a16) {
+  if (use_fp8_w8a16 || use_fp8_w8a8 ) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
   }
 
@@ -1128,6 +1129,40 @@ at::Tensor fused_experts_cpu(
           hidden_states.data_ptr<scalar_t>(),
           packed_w1.data_ptr<at::Float8_e4m3fn>(),
           packed_w2.data_ptr<at::Float8_e4m3fn>(),
+          w1s.data_ptr<float>(),
+          w2s.data_ptr<float>(),
+          block_size_N,
+          block_size_K,
+          topk_weights_.data_ptr<float>(),
+          sorted_ids,
+          expert_ids,
+          offsets,
+          M,
+          N,
+          K,
+          E,
+          topk,
+          num_tokens_post_pad);
+    } else if (use_fp8_w8a8) {
+      // here we just ignore C_tmp as it is not used
+      at::Float8_e4m3fn* __restrict__ A_tmp = (at::Float8_e4m3fn*)((void*)(intermediate_cache2 + M * topk * K));
+      float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
+      scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
+      scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
+      auto a1s = a1_scale.value();
+      CHECK_MOE_SCALES_FP8(1, 2);
+      fused_experts_fp8_a8_kernel_impl(
+          out_hidden_states.data_ptr<scalar_t>(),
+          intermediate_cache0,
+          intermediate_cache1,
+          intermediate_cache2,
+          A_tmp,
+          B_tmp,
+          C_tmp,
+          hidden_states.data_ptr<at::Float8_e4m3fn>(),
+          packed_w1.data_ptr<at::Float8_e4m3fn>(),
+          packed_w2.data_ptr<at::Float8_e4m3fn>(),
+          a1s.data_ptr<float>(),
           w1s.data_ptr<float>(),
           w2s.data_ptr<float>(),
           block_size_N,
