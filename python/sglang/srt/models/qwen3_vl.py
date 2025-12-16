@@ -274,11 +274,13 @@ class Qwen3VLMoeVisionModel(nn.Module):
         self.deepstack_visual_indexes = vision_config.deepstack_visual_indexes
         self.patch_embed = Qwen3VLVisionPatchEmbed(config=vision_config)
         self.pos_embed = nn.Embedding(self.num_position_embeddings, self.hidden_size)
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         if _is_cpu and hasattr(vision_config, "original_num_heads"):
             head_dim = self.hidden_size // vision_config.original_num_heads
+            from sglang.srt.layers.layernorm import LayerNorm
+            norm_layer = partial(LayerNorm, eps=norm_eps, dtype=self.dtype)
         else:
             head_dim = self.hidden_size // self.num_heads
+            norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
 
         self.blocks = nn.ModuleList(
