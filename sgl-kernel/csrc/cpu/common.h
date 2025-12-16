@@ -104,6 +104,8 @@ namespace {
 #define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
+#define CHECK_GT(a, b) TORCH_CHECK((a) > (b), "CHECK_GT(" #a ", " #b ") failed. ", a, " vs ", b)
+#define CHECK_GE(a, b) TORCH_CHECK((a) >= (b), "CHECK_GE(" #a ", " #b ") failed. ", a, " vs ", b)
 
 // [NB] Parallel Routines
 //
