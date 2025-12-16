@@ -2,6 +2,7 @@ import asyncio
 import math
 import os
 import re
+import time
 from typing import List, Union
 
 import torch
@@ -20,6 +21,7 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
@@ -42,6 +44,65 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
+
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+if _is_cpu and _is_cpu_amx_available:
+    try:
+        import transformers
+        from transformers.image_processing_base import BatchFeature
+
+        image_preprocess_cpu = torch.ops.sgl_kernel.image_preprocess_cpu
+
+        def hacked_preprocess(
+            self,
+            images: list["torch.Tensor"],
+            do_resize: bool,
+            size,
+            interpolation,
+            do_rescale: bool,
+            rescale_factor: float,
+            do_normalize: bool,
+            image_mean,
+            image_std,
+            patch_size: int,
+            temporal_patch_size: int,
+            merge_size: int,
+            disable_grouping,
+            return_tensors,
+            **kwargs,
+        ):
+            pixel_values, image_grid_thw = image_preprocess_cpu(
+                images,
+                True,
+                do_resize,
+                size["shortest_edge"],
+                size["longest_edge"],
+                "bicubic",
+                do_rescale,
+                rescale_factor,
+                do_normalize,
+                image_mean,
+                image_std,
+                patch_size,
+                temporal_patch_size,
+                merge_size,
+                True,
+                torch.bfloat16,
+            )
+            return BatchFeature(
+                data={"pixel_values": pixel_values, "image_grid_thw": image_grid_thw},
+                tensor_type=return_tensors,
+            )
+
+        transformers.models.qwen2_vl.image_processing_qwen2_vl_fast.Qwen2VLImageProcessorFast._preprocess = (
+            hacked_preprocess
+        )
+    except Exception as e:
+        logger.warning(
+            f"Failed to hack Qwen2VLImageProcessorFast with AMX optimization: {e}"
+        )
 
 
 def smart_resize(
@@ -273,6 +334,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         *args,
         **kwargs,
     ):
+        entry_time = time.perf_counter()
         base_output = self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
@@ -280,7 +342,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
         )
-
+        load_time = time.perf_counter()
+        rid = getattr(request_obj, "rid", "anonymous_rid")
         # Qwen-specific: resize images if they are raw Image objects
         if base_output.images and isinstance(base_output.images[0], Image.Image):
             resize_tasks = [resize_image_async(image) for image in base_output.images]
@@ -292,7 +355,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 *[preprocess_video(video) for video in base_output.videos]
             )
             base_output.videos, video_metadata = map(list, zip(*video_results))
-
+        preprocess_time = time.perf_counter()
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
             mm_items, input_ids, ret = self.process_and_combine_mm_data(
@@ -318,7 +381,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
             ret, "video_second_per_grid", None
         )
-
+        process_time = time.perf_counter()
         input_ids = input_ids.flatten()
 
         mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
@@ -343,6 +406,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             ),
         )
         mrope_positions = mrope_positions.squeeze(1)
+        get_rope_index_time = time.perf_counter()
+        logger.info(
+            f"[QwenVLProcessor Perf] {rid=}, "
+            f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
+            f"preprocess_time: {(preprocess_time - load_time) * 1000:.2f} ms, "
+            f"process_time: {(process_time - preprocess_time) * 1000:.2f} ms, "
+            f"get_rope_index_time: {(get_rope_index_time - process_time) * 1000:.2f} ms, "
+            f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
+        )
 
         return {
             "input_ids": input_ids.tolist(),
