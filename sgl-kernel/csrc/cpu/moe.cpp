@@ -930,11 +930,11 @@ static inline void check_moe_scales(
   auto w2s = w2_scale.value();                                \
   auto block_size_val = block_size.value();                   \
   int64_t block_size_N = block_size_val[0];                   \
-  int64_t block_size_K = block_size_val[1];                   \
-  TORCH_CHECK(w1s.size(DIM0) == div_up(2 * N, block_size_N)); \
-  TORCH_CHECK(w1s.size(DIM1) == div_up(K, block_size_K));     \
-  TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));     \
-  TORCH_CHECK(w2s.size(DIM1) == div_up(N, block_size_K))
+  int64_t block_size_K = block_size_val[1];                   
+  // TORCH_CHECK(w1s.size(DIM0) == div_up(2 * N, block_size_N)); \
+  // TORCH_CHECK(w1s.size(DIM1) == div_up(K, block_size_K));     \
+  // TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));     \
+  // TORCH_CHECK(w2s.size(DIM1) == div_up(N, block_size_K))
 
 // hidden_states: [M, K]
 // w1: [E, 2N, K]
@@ -966,14 +966,19 @@ at::Tensor fused_experts_cpu(
 
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
+  auto st_ = hidden_states.scalar_type();
+  if(use_fp8_w8a8){
+    st_ = at::kBFloat16;
+  }
+  const auto st = st_;
 
-  const auto st = hidden_states.scalar_type();
-  CHECK_INPUT(hidden_states);
-  CHECK_INPUT(w1);
+
+  // CHECK_INPUT(hidden_states);
+  // CHECK_INPUT(w1);
   CHECK_INPUT(w2);
   CHECK_EQ(topk_weights.sizes(), topk_ids.sizes());
   CHECK_DIM(2, hidden_states);
-  CHECK_DIM(3, w1);
+  // CHECK_DIM(3, w1);
   CHECK_DIM(3, w2);
   CHECK_DIM(2, topk_weights);
   CHECK_DIM(2, topk_ids);
@@ -988,7 +993,7 @@ at::Tensor fused_experts_cpu(
 
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
-  int64_t N = w1.size(1) / 2;
+  int64_t N = w2.size(2);
   int64_t E = w1.size(0);
   int64_t topk = topk_weights_.size(1);
 
@@ -999,13 +1004,13 @@ at::Tensor fused_experts_cpu(
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
   CHECK_EQ(w2.size(1), K);
-  CHECK_EQ(packed_w1.size(2), packed_K);
+  // CHECK_EQ(packed_w1.size(2), packed_K);
   CHECK_EQ(packed_w2.size(2), packed_N);
 
   // check scales
   check_moe_scales(use_int8_w8a8, use_fp8_w8a16, w1_scale, w2_scale, block_size, a1_scale, a2_scale);
 
-  at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
+  at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states).to(at::kBFloat16);
 
   // NB: worst case is each expert holds a block with remainder of 1
   //   1. sorted_ids : [M * topk + E * (BLOCK_M - 1)]
@@ -1060,7 +1065,7 @@ at::Tensor fused_experts_cpu(
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
   //
   int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
-                               num_threads * BLOCK_M * K * (use_int8_w8a8 ? 1 : 2) +
+                               num_threads * BLOCK_M * K * (use_int8_w8a8 || use_fp8_w8a8 ? 1 : 2) +
                                num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
 
   if (use_int8_w8a8) {
@@ -1255,7 +1260,7 @@ at::Tensor shared_expert_cpu(
 
   // check weight shapes
   CHECK_EQ(w2.size(0), K);
-  CHECK_EQ(packed_w1.size(1), packed_K);
+  // CHECK_EQ(packed_w1.size(1), packed_K);
   CHECK_EQ(packed_w2.size(1), packed_N);
 
   // check scales

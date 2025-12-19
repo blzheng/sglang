@@ -15,6 +15,15 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ i
   }
 }
 
+inline void copy_stub2(at::Float8_e4m3fn* __restrict__ out, const at::Float8_e4m3fn* __restrict__ input, int64_t size) {
+// no remainder
+// #pragma GCC unroll 4
+  for (int64_t d = 0; d < size; d ++) {
+    out[d] = input[d];
+  }
+}
+
+
 template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, float weight, int64_t size) {
   using bVec = at::vec::Vectorized<scalar_t>;
@@ -243,7 +252,6 @@ void fused_experts_fp8_a8_kernel_impl(
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
 
-
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
@@ -259,29 +267,30 @@ void fused_experts_fp8_a8_kernel_impl(
   const int64_t stride_e = 2 * N * K;
   const int64_t stride_n = K;
   const bool use_brgemm = true;
-
   int64_t block_size = BLOCK_M * BLOCK_N;
   int64_t num_thread = at::get_num_threads();
-  at::Tensor y_buffer = at::empty({num_thread, block_size});
   // buffer for brgemm output in float32
   int64_t buffer_size = block_size * 2;  // float32 = bfloat16 * 2
   at::Tensor micro_gemm_buffer = at::empty({num_thread, buffer_size}).to(at::kBFloat16);
   at::Tensor micro_gemm_buffer2 = at::empty({num_thread, buffer_size}).to(at::kBFloat16);
+  at::Tensor C0_ = at::empty({num_thread,BLOCK_M*BLOCK_N});
+  at::Tensor C1_ = at::empty({num_thread,BLOCK_M*BLOCK_N});
   // weight shape = [E, (2) Nc, Kc, block_k, block_n]
   // scales shape = [E, Nc, G, block_n]
   at::parallel_for(0, MB * NB, 1, [&](int64_t begin, int64_t end) {
     // get local pointers
     int tid = get_thread_num();
     at::Float8_e4m3fn* __restrict__ A = A_tmp + tid * BLOCK_M * K;
-    float*  __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
-    float*  __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
+    float*  __restrict__ C0 = C0_.data_ptr<float>() + tid * BLOCK_M * BLOCK_N;
+    float*  __restrict__ C1 = C1_.data_ptr<float>() + tid * BLOCK_M * BLOCK_N;
+    // float*  __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+    // float*  __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
     alignas(64) float As_[BLOCK_M];
-    at::BFloat16* micro_gemm_buf = micro_gemm_buffer.data_ptr<at::BFloat16>() + at::get_thread_num() * buffer_size;
+    at::BFloat16* micro_gemm_buf = micro_gemm_buffer.data_ptr<at::BFloat16>() + tid * buffer_size;
+    at::BFloat16* micro_gemm_buf2 = micro_gemm_buffer2.data_ptr<at::BFloat16>() + tid * buffer_size;
     float* ukernel_buf = reinterpret_cast<float*>(micro_gemm_buf);
-
-    at::BFloat16* micro_gemm_buf2 = micro_gemm_buffer2.data_ptr<at::BFloat16>() + at::get_thread_num() * buffer_size;
     float* ukernel_buf2 = reinterpret_cast<float*>(micro_gemm_buf2);
-    auto ldsa = num_groups; // act per group quant
+    auto ldsa = 1;//num_groups; // act per PER_ROW quant
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB;
       int64_t nb = i % NB;
@@ -298,18 +307,19 @@ void fused_experts_fp8_a8_kernel_impl(
 
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m] / topk;
-        copy_stub(A + m * K, input + index * K, K);
+        copy_stub2(A + m * K, input + index * K, K);
         As_[m] = As[index];
       }
-
+      // A shape [m_size, K]
       const int64_t offset = offsets[mb];
-
+      // ic0 + offset * 2 * N + nb * BLOCK_N,
+      zero_buffer(C0, BLOCK_M * BLOCK_N);
       for (int kci = 0; kci < KB; ++kci) {
         // auto scales_a = As + kci / block_per_group;
-        tinygemm_kernel2<true, BLOCK_N, 2, 3>(
+        tinygemm_kernel2(//<true, BLOCK_N, 2, 3>(
           /* C */ C0,
           /* A */ A + kci * BLOCK_K,
-          /* scales_a */ As_,
+          /* scales_a */ As_ + kci / blocks_k_per_group,
           /* B */ B + (nb * KB + kci) * BLOCK_K * BLOCK_N,
           /* scales_b */ Bs + nb * BLOCK_N * num_groups + kci / blocks_k_per_group * BLOCK_N /*scales_b*/,
           /* M */ m_size,
@@ -322,14 +332,14 @@ void fused_experts_fp8_a8_kernel_impl(
           /* dqB_buf */ nullptr);
       }
       store_out<scalar_t, BLOCK_N, 2, 3>(
-        C0, ic0 + mb * BLOCK_M * N + nb * BLOCK_N, m_size, N /*lda*/, As_, Bs + nb * BLOCK_N, nullptr /*bias data*/);
-
+        C0, ic0 + offset * 2 * N + nb * BLOCK_N, m_size, 2*N /*lda*/, As_, nullptr, nullptr /*bias data*/);
+      zero_buffer(C1, BLOCK_M * BLOCK_N);
       for (int kci = 0; kci < KB; ++kci) {
         // auto scales_a = As + kci / block_per_group;
-        tinygemm_kernel2<true, BLOCK_N, 2, 3>(
+        tinygemm_kernel2(//<true, BLOCK_N, 2, 3>(
           /* C */ C1,
           /* A */ A + kci * BLOCK_K,
-          /* scales_a */ As_,
+          /* scales_a */ As_ + kci / blocks_k_per_group,
           /* B */ B + (nb1 * KB + kci) * BLOCK_K * BLOCK_N,
           /* scales_b */ Bs + nb1 * BLOCK_N * num_groups + kci / blocks_k_per_group * BLOCK_N /*scales_b*/,
           /* M */ m_size,
@@ -342,8 +352,7 @@ void fused_experts_fp8_a8_kernel_impl(
           /* dqB_buf */ nullptr);
       }
       store_out<scalar_t, BLOCK_N, 2, 3>(
-        C1, ic0 + mb * BLOCK_M * N + nb1 * BLOCK_N, m_size, N /*lda*/, As_, Bs + nb1 * BLOCK_N, nullptr /*bias data*/);
-
+        C1, ic0 + offset * 2 * N + nb1 * BLOCK_N, m_size, 2*N /*lda*/, As_, nullptr, nullptr /*bias data*/);
     }
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();

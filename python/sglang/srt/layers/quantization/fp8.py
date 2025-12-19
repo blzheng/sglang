@@ -117,7 +117,10 @@ import os
 
 SGLANG_DEEPSEEK_FP8A8 = os.getenv("SGLANG_DEEPSEEK_FP8A8", "0") == "1"
 SGLANG_LLAMA_BRGEMM_FP8A8 = os.getenv("SGLANG_LLAMA_BRGEMM_FP8A8", "0") == "1"
-
+SGLANG_BRGEMM_FUSED_FP8A8 = os.getenv("SGLANG_BRGEMM_FUSED_FP8A8", "0") == "1"
+if SGLANG_BRGEMM_FUSED_FP8A8:
+    SGLANG_LLAMA_BRGEMM_FP8A8 = True
+    SGLANG_DEEPSEEK_FP8A8  = True
 
 def _quantize_fp8e4m3(
     t: torch.Tensor, channelwise: bool, scale: Optional[torch.Tensor] = None
@@ -637,6 +640,16 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             if use_intel_amx_backend(layer):
                 if SGLANG_DEEPSEEK_FP8A8 and layer.use_f8f8:
+                    if SGLANG_BRGEMM_FUSED_FP8A8:
+                        return torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+                            x,
+                            None,
+                            True,
+                            layer.weight,
+                            layer.weight_scale_inv,
+                            bias,
+                            x.dtype,
+                        )
                     x_q, x_s = _quantize_fp8e4m3(x, True)
                     # x_zp = torch.zeros_like(x_s).to(torch.int)
                     return torch.ops.sgl_kernel.float8_linear_cpu(
@@ -645,7 +658,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.weight,
                         layer.weight_scale_inv,
                         bias,
-                        torch.bfloat16,
+                        x.dtype,
                     )
                 else:
                     return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
@@ -667,7 +680,18 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         if self.quant_config.activation_scheme == "static":
-            q_input, scale = _quantize_fp8e4m3(x, False, layer.input_scale)
+            if not SGLANG_BRGEMM_FUSED_FP8A8:
+                q_input, scale = _quantize_fp8e4m3(x, False, layer.input_scale)
+            else:
+                return torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+                    x,
+                    layer.input_scale,
+                    False,
+                    layer.weight,
+                    layer.weight_scale,
+                    bias,
+                    x.dtype,
+                )
 
             if SGLANG_LLAMA_BRGEMM_FP8A8:
                 return torch.ops.sgl_kernel.float8_linear_cpu(
@@ -954,7 +978,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
-                _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+                if not SGLANG_BRGEMM_FUSED_FP8A8:
+                    _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
+                else:
+                    _amx_process_weight_after_loading(layer, ["w2_weight"])
+                    a8_w13_weight = []
+                    a8_w13_weight_scale = []
+                    w1 = layer.w13_weight
+                    w1s = layer.w13_weight_scale_inv 
+                    for i in range(layer.w13_weight.size(0)):
+                        new_w1s = torch.repeat_interleave(w1s[i], w1[i].size(0)//w1s[i].size(0), 0)
+                        new_w1s = new_w1s[: w1[i].size(0), :].contiguous()
+                        w1_a8, w1_a8_scale = torch.ops.sgl_kernel.float8_linear_prepack_cpu(
+                            w1[i], new_w1s
+                        )
+                        
+                        a8_w13_weight.append(w1_a8)
+                        a8_w13_weight_scale.append(w1_a8_scale)
+                    layer.w13_weight = torch.nn.Parameter(torch.stack(a8_w13_weight).detach(), requires_grad=False)
+                    layer.w13_weight_scale_inv = torch.nn.Parameter(torch.stack(a8_w13_weight_scale).detach(), requires_grad=False)
 
             return
 
@@ -1192,23 +1234,43 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             x, topk_weights = apply_topk_weights_cpu(
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
-
-            output = torch.ops.sgl_kernel.fused_experts_cpu(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                False,  # inplace See [Note] inplace should be False in fused_experts.
-                False,  # use_int8_w8a8
-                True,  # use_fp8_w8a16
-                layer.w13_weight_scale_inv,  # w1_scale
-                layer.w2_weight_scale_inv,  # w2_scale
-                self.quant_config.weight_block_size,  # block_size
-                None,  # a1_scale
-                None,  # a2_scale
-                True,  # is_vnni
-            )
+            if not SGLANG_BRGEMM_FUSED_FP8A8:
+                output = torch.ops.sgl_kernel.fused_experts_cpu(
+                    x,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    False,  # inplace See [Note] inplace should be False in fused_experts.
+                    False,  # use_int8_w8a8
+                    True,  # use_fp8_w8a16
+                    False,
+                    layer.w13_weight_scale_inv,  # w1_scale
+                    layer.w2_weight_scale_inv,  # w2_scale
+                    self.quant_config.weight_block_size,  # block_size
+                    None,  # a1_scale
+                    None,  # a2_scale
+                    True,  # is_vnni
+                )
+            else:
+                x_q, x_s = torch.ops.sgl_kernel.quantize_fp8e4m3(x, True, None)
+                output = torch.ops.sgl_kernel.fused_experts_cpu(
+                    x_q,
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    topk_weights,
+                    topk_ids,
+                    False,  # inplace See [Note] inplace should be False in fused_experts.
+                    False,  # use_int8_w8a8
+                    False,  # use_fp8_w8a16
+                    True,  # use_fp8_w8a8
+                    layer.w13_weight_scale_inv,  # w1_scale
+                    layer.w2_weight_scale_inv,  # w2_scale
+                    self.quant_config.weight_block_size,  # block_size
+                    x_s,  # a1_scale
+                    None,  # a2_scale
+                    True,  # is_vnni
+                )
             return StandardCombineInput(hidden_states=output)
 
         if _is_hip:

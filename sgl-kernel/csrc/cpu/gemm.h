@@ -229,7 +229,7 @@ void tinygemm_kernel(
     int64_t block_size_K,
     bool do_unpack = true);
 
-template <bool cpublas_can_pack, int64_t N, int act_quant_mode, int wei_quant_mode>
+// template <bool cpublas_can_pack, int64_t N, int act_quant_mode, int wei_quant_mode>
 void tinygemm_kernel2(
     float* C,
     const at::Float8_e4m3fn* A,
