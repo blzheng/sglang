@@ -925,16 +925,16 @@ static inline void check_moe_scales(
   }
 }
 
-#define CHECK_MOE_SCALES_FP8(DIM0, DIM1)                      \
-  auto w1s = w1_scale.value();                                \
-  auto w2s = w2_scale.value();                                \
-  auto block_size_val = block_size.value();                   \
-  int64_t block_size_N = block_size_val[0];                   \
-  int64_t block_size_K = block_size_val[1];                   
-  // TORCH_CHECK(w1s.size(DIM0) == div_up(2 * N, block_size_N)); \
-  // TORCH_CHECK(w1s.size(DIM1) == div_up(K, block_size_K));     \
-  // TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));     \
-  // TORCH_CHECK(w2s.size(DIM1) == div_up(N, block_size_K))
+#define CHECK_MOE_SCALES_FP8(DIM0, DIM1)    \
+  auto w1s = w1_scale.value();              \
+  auto w2s = w2_scale.value();              \
+  auto block_size_val = block_size.value(); \
+  int64_t block_size_N = block_size_val[0]; \
+  int64_t block_size_K = block_size_val[1];
+// TORCH_CHECK(w1s.size(DIM0) == div_up(2 * N, block_size_N)); \
+// TORCH_CHECK(w1s.size(DIM1) == div_up(K, block_size_K));     \
+// TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));     \
+// TORCH_CHECK(w2s.size(DIM1) == div_up(N, block_size_K))
 
 // hidden_states: [M, K]
 // w1: [E, 2N, K]
@@ -967,11 +967,10 @@ at::Tensor fused_experts_cpu(
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   auto st_ = hidden_states.scalar_type();
-  if(use_fp8_w8a8){
+  if (use_fp8_w8a8) {
     st_ = at::kBFloat16;
   }
   const auto st = st_;
-
 
   // CHECK_INPUT(hidden_states);
   // CHECK_INPUT(w1);
@@ -1060,10 +1059,11 @@ at::Tensor fused_experts_cpu(
   //   5. Aq_tmp : [M, K] or [M * topk, N]
   //   6. As_tmp : [M * topk]
   //
-  // for fp8 w8a16:
+  // for fp8 w8a16 / fp8 w8a8:
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
-  //
+  // for fp8 w8a8:
+  //   9. ukernel buffer: [T, 2 * BLOCK_M * BLOCK_N]
   int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
                                num_threads * BLOCK_M * K * (use_int8_w8a8 || use_fp8_w8a8 ? 1 : 2) +
                                num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
@@ -1071,8 +1071,11 @@ at::Tensor fused_experts_cpu(
   if (use_int8_w8a8) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
-  if (use_fp8_w8a16 || use_fp8_w8a8 ) {
+  if (use_fp8_w8a16 || use_fp8_w8a8) {
     buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N) * 2;
+  }
+  if (use_fp8_w8a8) {
+    buffer_size_nbytes += num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
   }
 
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
@@ -1154,6 +1157,8 @@ at::Tensor fused_experts_cpu(
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
+      float* __restrict__ Ukernel_tmp =
+          (float*)((void*)(B_tmp + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N)));
       auto a1s = a1_scale.value();
       CHECK_MOE_SCALES_FP8(1, 2);
       fused_experts_fp8_a8_kernel_impl(
@@ -1164,6 +1169,7 @@ at::Tensor fused_experts_cpu(
           A_tmp,
           B_tmp,
           C_tmp,
+          Ukernel_tmp,
           hidden_states.data_ptr<at::Float8_e4m3fn>(),
           packed_w1.data_ptr<at::Float8_e4m3fn>(),
           packed_w2.data_ptr<at::Float8_e4m3fn>(),

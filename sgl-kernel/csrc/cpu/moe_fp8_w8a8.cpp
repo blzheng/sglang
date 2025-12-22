@@ -1,7 +1,8 @@
+#include <c10/util/Unroll.h>
+
 #include "common.h"
 #include "gemm.h"
 #include "vec.h"
-#include <c10/util/Unroll.h>
 namespace {
 
 template <typename scalar_t>
@@ -16,13 +17,12 @@ inline void copy_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ i
 }
 
 inline void copy_stub2(at::Float8_e4m3fn* __restrict__ out, const at::Float8_e4m3fn* __restrict__ input, int64_t size) {
-// no remainder
-// #pragma GCC unroll 4
-  for (int64_t d = 0; d < size; d ++) {
+  // no remainder
+  // #pragma GCC unroll 4
+  for (int64_t d = 0; d < size; d++) {
     out[d] = input[d];
   }
 }
-
 
 template <typename scalar_t>
 inline void copy_mul_stub(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, float weight, int64_t size) {
@@ -213,8 +213,6 @@ inline void store_out(
 
 }  // anonymous namespace
 
-
-
 // act : per channel quant
 // weight: per block_N x block_K quant
 template <typename scalar_t>
@@ -226,6 +224,7 @@ void fused_experts_fp8_a8_kernel_impl(
     at::Float8_e4m3fn* __restrict__ A_tmp,
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
+    float* __restrict__ Ukernel_tmp,
     const at::Float8_e4m3fn* __restrict__ input,
     const at::Float8_e4m3fn* __restrict__ packed_w1,
     const at::Float8_e4m3fn* __restrict__ packed_w2,
@@ -244,13 +243,13 @@ void fused_experts_fp8_a8_kernel_impl(
     int64_t E,
     int64_t topk,
     int64_t num_tokens_post_pad) {
-
   //   1. intermediate_cache1 : [M * topk, N]
   //   2. intermediate_cache2 : [M * topk, K]
   //   3. A_tmp : [T, BLOCK_M * K]
   //   4. C_tmp : [T, 2 * BLOCK_M * BLOCK_N]
   //   7. intermediate_cache0 : [M * topk, 2N]
   //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(K, N)]
+  //   9. ukernel buffer: [T, 2 * BLOCK_M * BLOCK_N]
 
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
@@ -258,39 +257,27 @@ void fused_experts_fp8_a8_kernel_impl(
   // stage 1: intermediate_cache0 = hidden_states @ w1
   const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
-  const int64_t KB = K/BLOCK_K; // use div_up
+  const int64_t KB = K / BLOCK_K;  // use div_up
   int64_t scale_size_N = div_up(2 * N, block_size_N);
   int64_t scale_size_K = div_up(K, block_size_K);
-  int64_t blocks_n_per_group = block_size_N / BLOCK_N; // use div_up
-  int64_t num_groups = div_up(K, block_size_K);  // G, block_size_K is group size
-  int64_t blocks_k_per_group = block_size_K / BLOCK_K; // use div_up
+  int64_t blocks_n_per_group = block_size_N / BLOCK_N;  // use div_up
+  int64_t num_groups = div_up(K, block_size_K);         // G, block_size_K is group size
+  int64_t blocks_k_per_group = block_size_K / BLOCK_K;  // use div_up
   const int64_t stride_e = 2 * N * K;
   const int64_t stride_n = K;
-  const bool use_brgemm = true;
+  bool use_brgemm = true;
   int64_t block_size = BLOCK_M * BLOCK_N;
   int64_t num_thread = at::get_num_threads();
-  // buffer for brgemm output in float32
-  int64_t buffer_size = block_size * 2;  // float32 = bfloat16 * 2
-  at::Tensor micro_gemm_buffer = at::empty({num_thread, buffer_size}).to(at::kBFloat16);
-  at::Tensor micro_gemm_buffer2 = at::empty({num_thread, buffer_size}).to(at::kBFloat16);
-  at::Tensor C0_ = at::empty({num_thread,BLOCK_M*BLOCK_N});
-  at::Tensor C1_ = at::empty({num_thread,BLOCK_M*BLOCK_N});
-  // weight shape = [E, (2) Nc, Kc, block_k, block_n]
-  // scales shape = [E, Nc, G, block_n]
   at::parallel_for(0, MB * NB, 1, [&](int64_t begin, int64_t end) {
     // get local pointers
     int tid = get_thread_num();
     at::Float8_e4m3fn* __restrict__ A = A_tmp + tid * BLOCK_M * K;
-    float*  __restrict__ C0 = C0_.data_ptr<float>() + tid * BLOCK_M * BLOCK_N;
-    float*  __restrict__ C1 = C1_.data_ptr<float>() + tid * BLOCK_M * BLOCK_N;
-    // float*  __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
-    // float*  __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
+    float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+    float* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
     alignas(64) float As_[BLOCK_M];
-    at::BFloat16* micro_gemm_buf = micro_gemm_buffer.data_ptr<at::BFloat16>() + tid * buffer_size;
-    at::BFloat16* micro_gemm_buf2 = micro_gemm_buffer2.data_ptr<at::BFloat16>() + tid * buffer_size;
-    float* ukernel_buf = reinterpret_cast<float*>(micro_gemm_buf);
-    float* ukernel_buf2 = reinterpret_cast<float*>(micro_gemm_buf2);
-    auto ldsa = 1;//num_groups; // act per PER_ROW quant
+    float* __restrict__ ukernel_buf_1 = Ukernel_tmp + +tid * 2 * BLOCK_M * BLOCK_N;
+    float* __restrict__ ukernel_buf_2 = ukernel_buf_1 + BLOCK_M * BLOCK_N;
+    auto ldsa = 1;  // act per PER_ROW quant
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB;
       int64_t nb = i % NB;
@@ -315,44 +302,44 @@ void fused_experts_fp8_a8_kernel_impl(
       // ic0 + offset * 2 * N + nb * BLOCK_N,
       zero_buffer(C0, BLOCK_M * BLOCK_N);
       for (int kci = 0; kci < KB; ++kci) {
-        // auto scales_a = As + kci / block_per_group;
-        tinygemm_kernel2(//<true, BLOCK_N, 2, 3>(
-          /* C */ C0,
-          /* A */ A + kci * BLOCK_K,
-          /* scales_a */ As_ + kci / blocks_k_per_group,
-          /* B */ B + (nb * KB + kci) * BLOCK_K * BLOCK_N,
-          /* scales_b */ Bs + nb * BLOCK_N * num_groups + kci / blocks_k_per_group * BLOCK_N /*scales_b*/,
-          /* M */ m_size,
-          /* K */ BLOCK_K,
-          /* lda */ K,
-          /* ldc */ BLOCK_N,
-          /* ldsa */ ldsa,
-          /* ukernel_buf */ ukernel_buf,
-          /* dqA_buf */ nullptr,
-          /* dqB_buf */ nullptr);
+        // cpublas_can_pack = True, act_quant_mode = per row (2), wei_quant_mode = per group (3)
+        tinygemm_kernel(
+            /* C */ C0,
+            /* A */ A + kci * BLOCK_K,
+            /* scales_a */ As_ + kci / blocks_k_per_group,
+            /* B */ B + (nb * KB + kci) * BLOCK_K * BLOCK_N,
+            /* scales_b */ Bs + nb * BLOCK_N * num_groups + kci / blocks_k_per_group * BLOCK_N /*scales_b*/,
+            /* M */ m_size,
+            /* K */ BLOCK_K,
+            /* lda */ K,
+            /* ldc */ BLOCK_N,
+            /* ldsa */ ldsa,
+            /* ukernel_buf */ ukernel_buf_1,
+            /* dqA_buf */ nullptr,
+            /* dqB_buf */ nullptr);
       }
       store_out<scalar_t, BLOCK_N, 2, 3>(
-        C0, ic0 + offset * 2 * N + nb * BLOCK_N, m_size, 2*N /*lda*/, As_, nullptr, nullptr /*bias data*/);
+          C0, ic0 + offset * 2 * N + nb * BLOCK_N, m_size, 2 * N /*lda*/, As_, nullptr, nullptr /*bias data*/);
       zero_buffer(C1, BLOCK_M * BLOCK_N);
       for (int kci = 0; kci < KB; ++kci) {
-        // auto scales_a = As + kci / block_per_group;
-        tinygemm_kernel2(//<true, BLOCK_N, 2, 3>(
-          /* C */ C1,
-          /* A */ A + kci * BLOCK_K,
-          /* scales_a */ As_ + kci / blocks_k_per_group,
-          /* B */ B + (nb1 * KB + kci) * BLOCK_K * BLOCK_N,
-          /* scales_b */ Bs + nb1 * BLOCK_N * num_groups + kci / blocks_k_per_group * BLOCK_N /*scales_b*/,
-          /* M */ m_size,
-          /* K */ BLOCK_K,
-          /* lda */ K,
-          /* ldc */ BLOCK_N,
-          /* ldsa */ ldsa,
-          /* ukernel_buf */ ukernel_buf2,
-          /* dqA_buf */ nullptr,
-          /* dqB_buf */ nullptr);
+        // cpublas_can_pack = True, act_quant_mode = per row (2), wei_quant_mode = per group (3)
+        tinygemm_kernel(
+            /* C */ C1,
+            /* A */ A + kci * BLOCK_K,
+            /* scales_a */ As_ + kci / blocks_k_per_group,
+            /* B */ B + (nb1 * KB + kci) * BLOCK_K * BLOCK_N,
+            /* scales_b */ Bs + nb1 * BLOCK_N * num_groups + kci / blocks_k_per_group * BLOCK_N /*scales_b*/,
+            /* M */ m_size,
+            /* K */ BLOCK_K,
+            /* lda */ K,
+            /* ldc */ BLOCK_N,
+            /* ldsa */ ldsa,
+            /* ukernel_buf */ ukernel_buf_2,
+            /* dqA_buf */ nullptr,
+            /* dqB_buf */ nullptr);
       }
       store_out<scalar_t, BLOCK_N, 2, 3>(
-        C1, ic0 + offset * 2 * N + nb1 * BLOCK_N, m_size, 2*N /*lda*/, As_, nullptr, nullptr /*bias data*/);
+          C1, ic0 + offset * 2 * N + nb1 * BLOCK_N, m_size, 2 * N /*lda*/, As_, nullptr, nullptr /*bias data*/);
     }
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
@@ -376,6 +363,8 @@ void fused_experts_fp8_a8_kernel_impl(
   scale_size_K = div_up(N, block_size_K);
   const int64_t stride_e2 = OC * IC;
   const int64_t stride_oc = IC;
+  int64_t avg_M = std::max(int64_t(1), M * topk / E);
+  use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(avg_M);
 
   // parallel on [MB2, NB2]
   parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
@@ -441,36 +430,34 @@ void fused_experts_fp8_a8_kernel_impl(
   });
 }
 
-#define INSTANTIATE_MOE_FP8_A8_TEMPLATE(TYPE)             \
-  template void fused_experts_fp8_a8_kernel_impl<TYPE>(   \
-      TYPE* __restrict__ output,                       \
-      TYPE* __restrict__ ic0,                          \
-      TYPE* __restrict__ ic1,                          \
-      TYPE* __restrict__ ic2,                          \
-      at::Float8_e4m3fn* __restrict__ A_tmp,                        \
-      TYPE* __restrict__ B_tmp,                        \
-      float* __restrict__ C_tmp,                       \
-      const at::Float8_e4m3fn* __restrict__ input,                  \
-      const at::Float8_e4m3fn* __restrict__ packed_w1, \
-      const at::Float8_e4m3fn* __restrict__ packed_w2, \
-      const float* __restrict__ As,                   \
-      const float* __restrict__ w1s,                   \
-      const float* __restrict__ w2s,                   \
-      int64_t block_size_N,                            \
-      int64_t block_size_K,                            \
-      const float* __restrict__ topk_weights,          \
-      const int32_t* __restrict__ sorted_ids,          \
-      const int32_t* __restrict__ expert_ids,          \
-      const int32_t* __restrict__ offsets,             \
-      int64_t M,                                       \
-      int64_t N,                                       \
-      int64_t K,                                       \
-      int64_t E,                                       \
-      int64_t topk,                                    \
+#define INSTANTIATE_MOE_FP8_A8_TEMPLATE(TYPE)           \
+  template void fused_experts_fp8_a8_kernel_impl<TYPE>( \
+      TYPE* __restrict__ output,                        \
+      TYPE* __restrict__ ic0,                           \
+      TYPE* __restrict__ ic1,                           \
+      TYPE* __restrict__ ic2,                           \
+      at::Float8_e4m3fn* __restrict__ A_tmp,            \
+      TYPE* __restrict__ B_tmp,                         \
+      float* __restrict__ C_tmp,                        \
+      float* __restrict__ Ukernel_tmp,                  \
+      const at::Float8_e4m3fn* __restrict__ input,      \
+      const at::Float8_e4m3fn* __restrict__ packed_w1,  \
+      const at::Float8_e4m3fn* __restrict__ packed_w2,  \
+      const float* __restrict__ As,                     \
+      const float* __restrict__ w1s,                    \
+      const float* __restrict__ w2s,                    \
+      int64_t block_size_N,                             \
+      int64_t block_size_K,                             \
+      const float* __restrict__ topk_weights,           \
+      const int32_t* __restrict__ sorted_ids,           \
+      const int32_t* __restrict__ expert_ids,           \
+      const int32_t* __restrict__ offsets,              \
+      int64_t M,                                        \
+      int64_t N,                                        \
+      int64_t K,                                        \
+      int64_t E,                                        \
+      int64_t topk,                                     \
       int64_t num_tokens_post_pad)
-
-
 
 INSTANTIATE_MOE_FP8_A8_TEMPLATE(at::BFloat16);
 INSTANTIATE_MOE_FP8_A8_TEMPLATE(at::Half);
-

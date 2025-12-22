@@ -406,9 +406,7 @@ void _float8_linear_impl(
 
 }  // anonymous namespace
 
-
-// template <bool cpublas_can_pack, int64_t N, int act_quant_mode, int wei_quant_mode>
-void tinygemm_kernel2(
+void tinygemm_kernel(
     float* C,
     const at::Float8_e4m3fn* A,
     const float* scales_a,
@@ -422,25 +420,25 @@ void tinygemm_kernel2(
     float* ukernel_buf,
     at::BFloat16* dqA_buf,
     at::BFloat16* dqB_buf) {
-    // const N = block_n
-     _micro_gemm<true, BLOCK_N, 2, 3>(C, A, scales_a, B, scales_b, M, K, lda, ldc, ldsa, ukernel_buf,dqA_buf, dqB_buf );
-    }
+  // cpublas_can_pack = True, act_quant_mode = per row (2), wei_quant_mode = per group (3)
+  _micro_gemm<true, BLOCK_N, 2, 3>(C, A, scales_a, B, scales_b, M, K, lda, ldc, ldsa, ukernel_buf, dqA_buf, dqB_buf);
+}
 
-#define INSTANTIATE_TINYGEMM_TEMPLATE()    \
- void tinygemm_kernel2(         \
-    float* C, \
-    const at::Float8_e4m3fn* A,\
-    const float* scales_a,\
-    const at::Float8_e4m3fn* B,\
-    const float* scales_b,\
-    int64_t M,\
-    int64_t K,\
-    int64_t lda,\
-    int64_t ldc,\
-    int64_t ldsa,\
-    float* ukernel_buf,\
-    at::BFloat16* dqA_buf,\
-    at::BFloat16* dqB_buf)
+#define INSTANTIATE_TINYGEMM_TEMPLATE() \
+  void tinygemm_kernel(                 \
+      float* C,                         \
+      const at::Float8_e4m3fn* A,       \
+      const float* scales_a,            \
+      const at::Float8_e4m3fn* B,       \
+      const float* scales_b,            \
+      int64_t M,                        \
+      int64_t K,                        \
+      int64_t lda,                      \
+      int64_t ldc,                      \
+      int64_t ldsa,                     \
+      float* ukernel_buf,               \
+      at::BFloat16* dqA_buf,            \
+      at::BFloat16* dqB_buf)
 
 INSTANTIATE_TINYGEMM_TEMPLATE();
 /*
@@ -521,335 +519,195 @@ std::tuple<at::Tensor, at::Tensor> float8_linear_prepack_impl(const at::Tensor& 
   return std::make_tuple(std::move(blocked_weight), std::move(blocked_scales));
 }
 
-// Helper function for AVX512 scaling and clamping (FP32 -> FP32, then ATen converts to FP8)
-inline void scale_clamp_block_avx512(
-  const float* src, float* dst, int64_t size, float scale_reciprocal, float quant_max, float neg_quant_max) {
-  if (size <= 0) return;
-  
-  const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
-  const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
-  const __m512 neg_quant_max_vec = _mm512_set1_ps(neg_quant_max);
-  
-  int64_t i = 0;
-  // Process 16 elements at a time (AVX512 width)
-  for (; i <= size - 16; i += 16) {
-      __m512 src_vec = _mm512_loadu_ps(&src[i]);
-      __m512 scaled_vec = _mm512_mul_ps(src_vec, scale_recip_vec);
-      __m512 clamped_vec = _mm512_min_ps(_mm512_max_ps(scaled_vec, neg_quant_max_vec), quant_max_vec);
-      _mm512_storeu_ps(&dst[i], clamped_vec);
-  }
-  
-  // Handle remaining elements
-  for (; i < size; ++i) {
-      float scaled = src[i] * scale_reciprocal;
-      dst[i] = std::clamp(scaled, neg_quant_max, quant_max);
-  }
-}
-
-std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_(
-  const at::Tensor& t,
-  bool channelwise,
-  c10::optional<at::Tensor> scale_opt = c10::nullopt
-) {
-  constexpr float quant_max = 448.0f; // torch.finfo(torch.float8_e4m3fn).max
-  constexpr float eps = std::numeric_limits<float>::epsilon();
-  
-  // Ensure input is contiguous and in float32 for processing
-  auto t_float = t.to(at::ScalarType::Float).contiguous();
-  at::Tensor qt;
-  at::Tensor scale_tensor;
-  
-  if (channelwise) {
-      if (!scale_opt.has_value()) {
-          // Compute scale per channel using parallel processing
-          int64_t num_channels = t_float.size(0);
-          scale_tensor = at::empty({num_channels}, t_float.options());
-          
-          at::parallel_for(0, num_channels, 1, [&](int64_t start, int64_t end) {
-              for (int64_t c = start; c < end; ++c) {
-                  auto channel_view = t_float.select(0, c);
-                  float channel_max = channel_view.abs().max().item<float>();
-                  scale_tensor[c] = std::max(channel_max / quant_max, eps);
-              }
-          });
-      } else {
-          scale_tensor = scale_opt.value().to(at::ScalarType::Float);
-          auto eps_tensor = at::full_like(scale_tensor, eps);
-          scale_tensor = at::where(scale_tensor > eps_tensor, scale_tensor, eps_tensor);
-      }
-      
-      // Reshape scale for broadcasting
-      std::vector<int64_t> scale_shape(t_float.dim(), 1);
-      scale_shape[0] = scale_tensor.size(0);
-      auto scale_reshaped = scale_tensor.reshape(scale_shape);
-      
-      // Quantize using vectorized division
-      qt = t_float / scale_reshaped;
-  } else {
-      if (!scale_opt.has_value()) {
-          // Compute global scale using vectorized max
-          float abs_max = t_float.abs().max().item<float>();
-          scale_tensor = at::tensor({std::max(abs_max / quant_max, eps)}, 
-                                   t_float.options().device(t_float.device()));
-          
-          // Vectorized quantization
-          qt = t_float / scale_tensor.item<float>();
-      } else {
-          scale_tensor = scale_opt.value().to(at::ScalarType::Float);
-          float scale_val;
-          
-          if (scale_tensor.numel() == 1) {
-              // Handle scalar tensor case
-              if (scale_tensor.scalar_type() == at::ScalarType::Float) {
-                  scale_val = std::max(scale_tensor.item<float>(), eps);
-              } else if (scale_tensor.scalar_type() == at::ScalarType::Double) {
-                  scale_val = std::max(scale_tensor.item<double>(), static_cast<double>(eps));
-              } else {
-                  scale_val = std::max(scale_tensor.item<float>(), eps);
-              }
-          } else {
-              // Handle tensor case - take max of all elements
-              float tensor_max = scale_tensor.max().item<float>();
-              scale_val = std::max(tensor_max, eps);
-          }
-          
-          scale_tensor = at::tensor({scale_val}, scale_tensor.options());
-          float scale_reciprocal = 1.0f / scale_val;
-          
-          // Create output tensor for quantized values
-          qt = at::empty_like(t_float);
-          
-          if (t_float.is_contiguous() && t_float.numel() >= 64 ) {
-              // AVX512 optimized path for scaling and clamping
-              at::parallel_for(0, t_float.numel(), 4096, [&](int64_t start, int64_t end) {
-                  int64_t block_size = end - start;
-                  scale_clamp_block_avx512(
-                      t_float.data_ptr<float>() + start,
-                      qt.data_ptr<float>() + start,
-                      block_size,
-                      scale_reciprocal,
-                      quant_max,
-                      -quant_max
-                  );
-              });
-          } else {
-              // Scale the tensor
-              qt = at::div(t_float, scale_val);
-              // Clamp to FP8 range
-              qt = at::clamp(qt, -quant_max, quant_max);
-          }
-      }
-  }
-  
-  // Final conversion to FP8 E4M3FN using ATen's native conversion
-  qt = at::_to_copy(qt, at::ScalarType::Float8_e4m3fn);
-  return std::make_tuple(qt, scale_tensor);
-}
-
-
 // AVX512 optimized channel-wise max computation
-inline void compute_channel_max_avx512(
-  const float* data, float* max_vals, int64_t num_channels, int64_t elements_per_channel) {
+inline void
+compute_channel_max_avx512(const float* data, float* max_vals, int64_t num_channels, int64_t elements_per_channel) {
   at::parallel_for(0, num_channels, 1, [&](int64_t start, int64_t end) {
-      for (int64_t c = start; c < end; ++c) {
-          const float* channel_data = data + c * elements_per_channel;
-          float max_val = 0.0f;
-          
-          int64_t i = 0;
-          // Process 16 elements at a time
-          __m512 max_vec = _mm512_setzero_ps();
-          
-          for (; i <= elements_per_channel - 16; i += 16) {
-              __m512 data_vec = _mm512_loadu_ps(&channel_data[i]);
-              __m512 abs_vec = _mm512_abs_ps(data_vec);
-              max_vec = _mm512_max_ps(max_vec, abs_vec);
-          }
-          
-          // Horizontal max of the vector
-          float hmax = _mm512_reduce_max_ps(max_vec);
-          max_val = std::max(max_val, hmax);
-          
-          // Handle remaining elements
-          for (; i < elements_per_channel; ++i) {
-              max_val = std::max(max_val, std::abs(channel_data[i]));
-          }
-          
-          max_vals[c] = max_val;
+    for (int64_t c = start; c < end; ++c) {
+      const float* channel_data = data + c * elements_per_channel;
+      float max_val = 0.0f;
+
+      int64_t i = 0;
+      // Process 16 elements at a time
+      __m512 max_vec = _mm512_setzero_ps();
+
+      for (; i <= elements_per_channel - 16; i += 16) {
+        __m512 data_vec = _mm512_loadu_ps(&channel_data[i]);
+        __m512 abs_vec = _mm512_abs_ps(data_vec);
+        max_vec = _mm512_max_ps(max_vec, abs_vec);
       }
+
+      // Horizontal max of the vector
+      float hmax = _mm512_reduce_max_ps(max_vec);
+      max_val = std::max(max_val, hmax);
+
+      // Handle remaining elements
+      for (; i < elements_per_channel; ++i) {
+        max_val = std::max(max_val, std::abs(channel_data[i]));
+      }
+
+      max_vals[c] = max_val;
+    }
   });
 }
 
 // AVX512 optimized scaling and clamping for channel-wise quantization
 inline void scale_clamp_channelwise_avx512(
-  const float* src, float* dst, const float* scales, 
-  int64_t num_channels, int64_t elements_per_channel, 
-  float quant_max, float neg_quant_max) {
-  
+    const float* src,
+    float* dst,
+    const float* scales,
+    int64_t num_channels,
+    int64_t elements_per_channel,
+    float quant_max,
+    float neg_quant_max) {
   at::parallel_for(0, num_channels, 1, [&](int64_t start, int64_t end) {
-      for (int64_t c = start; c < end; ++c) {
-          float scale_val = scales[c];
-          float scale_reciprocal = 1.0f / scale_val;
-          
-          const float* channel_src = src + c * elements_per_channel;
-          float* channel_dst = dst + c * elements_per_channel;
-          
-          int64_t i = 0;
-          const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
-          const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
-          const __m512 neg_quant_max_vec = _mm512_set1_ps(neg_quant_max);
-          
-          for (; i <= elements_per_channel - 16; i += 16) {
-              __m512 src_vec = _mm512_loadu_ps(&channel_src[i]);
-              __m512 scaled_vec = _mm512_mul_ps(src_vec, scale_recip_vec);
-              __m512 clamped_vec = _mm512_min_ps(_mm512_max_ps(scaled_vec, neg_quant_max_vec), quant_max_vec);
-              _mm512_storeu_ps(&channel_dst[i], clamped_vec);
-          }
-          
-          // Handle remaining elements
-          for (; i < elements_per_channel; ++i) {
-              float scaled = channel_src[i] * scale_reciprocal;
-              channel_dst[i] = std::clamp(scaled, neg_quant_max, quant_max);
-          }
+    for (int64_t c = start; c < end; ++c) {
+      float scale_val = scales[c];
+      float scale_reciprocal = 1.0f / scale_val;
+
+      const float* channel_src = src + c * elements_per_channel;
+      float* channel_dst = dst + c * elements_per_channel;
+
+      int64_t i = 0;
+      const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
+      const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+      const __m512 neg_quant_max_vec = _mm512_set1_ps(neg_quant_max);
+
+      for (; i <= elements_per_channel - 16; i += 16) {
+        __m512 src_vec = _mm512_loadu_ps(&channel_src[i]);
+        __m512 scaled_vec = _mm512_mul_ps(src_vec, scale_recip_vec);
+        __m512 clamped_vec = _mm512_min_ps(_mm512_max_ps(scaled_vec, neg_quant_max_vec), quant_max_vec);
+        _mm512_storeu_ps(&channel_dst[i], clamped_vec);
       }
+
+      // Handle remaining elements
+      for (; i < elements_per_channel; ++i) {
+        float scaled = channel_src[i] * scale_reciprocal;
+        channel_dst[i] = std::clamp(scaled, neg_quant_max, quant_max);
+      }
+    }
   });
 }
 
 // AVX512 optimized scaling and clamping for global quantization
 inline void scale_clamp_global_avx512(
-  const float* src, float* dst, int64_t size, 
-  float scale_reciprocal, float quant_max, float neg_quant_max) {
-  
+    const float* src, float* dst, int64_t size, float scale_reciprocal, float quant_max, float neg_quant_max) {
   if (size <= 0) return;
-  
+
   const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
   const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
   const __m512 neg_quant_max_vec = _mm512_set1_ps(neg_quant_max);
-  
+
   at::parallel_for(0, size, 4096, [&](int64_t start, int64_t end) {
-      int64_t block_size = end - start;
-      const float* block_src = src + start;
-      float* block_dst = dst + start;
-      
-      int64_t i = 0;
-      for (; i <= block_size - 16; i += 16) {
-          __m512 src_vec = _mm512_loadu_ps(&block_src[i]);
-          __m512 scaled_vec = _mm512_mul_ps(src_vec, scale_recip_vec);
-          __m512 clamped_vec = _mm512_min_ps(_mm512_max_ps(scaled_vec, neg_quant_max_vec), quant_max_vec);
-          _mm512_storeu_ps(&block_dst[i], clamped_vec);
-      }
-      
-      // Handle remaining elements in block
-      for (; i < block_size; ++i) {
-          float scaled = block_src[i] * scale_reciprocal;
-          block_dst[i] = std::clamp(scaled, neg_quant_max, quant_max);
-      }
+    int64_t block_size = end - start;
+    const float* block_src = src + start;
+    float* block_dst = dst + start;
+
+    int64_t i = 0;
+    for (; i <= block_size - 16; i += 16) {
+      __m512 src_vec = _mm512_loadu_ps(&block_src[i]);
+      __m512 scaled_vec = _mm512_mul_ps(src_vec, scale_recip_vec);
+      __m512 clamped_vec = _mm512_min_ps(_mm512_max_ps(scaled_vec, neg_quant_max_vec), quant_max_vec);
+      _mm512_storeu_ps(&block_dst[i], clamped_vec);
+    }
+
+    // Handle remaining elements in block
+    for (; i < block_size; ++i) {
+      float scaled = block_src[i] * scale_reciprocal;
+      block_dst[i] = std::clamp(scaled, neg_quant_max, quant_max);
+    }
   });
 }
 
-std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3(
-  const at::Tensor& t,
-  bool channelwise,
-  c10::optional<at::Tensor> scale_opt = c10::nullopt
-) {
-  constexpr float quant_max = 448.0f; // torch.finfo(torch.float8_e4m3fn).max
+std::tuple<at::Tensor, at::Tensor>
+_quantize_fp8e4m3(const at::Tensor& t, bool channelwise, c10::optional<at::Tensor> scale_opt = c10::nullopt) {
+  constexpr float quant_max = 448.0f;  // torch.finfo(torch.float8_e4m3fn).max
   constexpr float eps = std::numeric_limits<float>::epsilon();
-  
+
   // Ensure input is contiguous and in float32
   auto t_float = t.to(at::ScalarType::Float).contiguous();
   at::Tensor qt;
   at::Tensor scale_tensor;
-  
+
   if (channelwise) {
-      // Channel-wise quantization with AVX512 optimization
-      int64_t num_channels = t_float.size(0);
-      int64_t elements_per_channel = t_float.numel() / num_channels;
-      
-      if (elements_per_channel * num_channels != t_float.numel()) {
-          throw std::runtime_error("Tensor must be divisible by number of channels for channel-wise quantization");
+    // Channel-wise quantization with AVX512 optimization
+    int64_t num_channels = t_float.size(0);
+    int64_t elements_per_channel = t_float.numel() / num_channels;
+
+    if (elements_per_channel * num_channels != t_float.numel()) {
+      throw std::runtime_error("Tensor must be divisible by number of channels for channel-wise quantization");
+    }
+
+    // Allocate scale tensor
+    scale_tensor = at::empty({num_channels}, t_float.options());
+    float* scale_data = scale_tensor.data_ptr<float>();
+
+    // Compute channel-wise max using AVX512
+    compute_channel_max_avx512(t_float.data_ptr<float>(), scale_data, num_channels, elements_per_channel);
+
+    // Apply quant_max and EPS
+    at::parallel_for(0, num_channels, 1, [&](int64_t start, int64_t end) {
+      for (int64_t c = start; c < end; ++c) {
+        scale_data[c] = std::max(scale_data[c] / quant_max, eps);
       }
-      
-      // Allocate scale tensor
-      scale_tensor = at::empty({num_channels}, t_float.options());
-      float* scale_data = scale_tensor.data_ptr<float>();
-      
-      // Compute channel-wise max using AVX512
-      compute_channel_max_avx512(
-          t_float.data_ptr<float>(),
-          scale_data,
-          num_channels,
-          elements_per_channel
-      );
-      
-      // Apply quant_max and EPS
-      at::parallel_for(0, num_channels, 1, [&](int64_t start, int64_t end) {
-          for (int64_t c = start; c < end; ++c) {
-              scale_data[c] = std::max(scale_data[c] / quant_max, eps);
-          }
-      });
-      
-      // Create output tensor for quantized values
-      qt = at::empty_like(t_float);
-      
-      // Scale and clamp using AVX512
-      scale_clamp_channelwise_avx512(
-          t_float.data_ptr<float>(),
-          qt.data_ptr<float>(),
-          scale_data,
-          num_channels,
-          elements_per_channel,
-          quant_max,
-          -quant_max
-      );
+    });
+
+    // Create output tensor for quantized values
+    qt = at::empty_like(t_float);
+
+    // Scale and clamp using AVX512
+    scale_clamp_channelwise_avx512(
+        t_float.data_ptr<float>(),
+        qt.data_ptr<float>(),
+        scale_data,
+        num_channels,
+        elements_per_channel,
+        quant_max,
+        -quant_max);
   } else {
-      // Global quantization with AVX512 optimization
-      if (!scale_opt.has_value()) {
-          throw std::runtime_error("Scale must be provided for non-channelwise quantization in AVX512 version");
+    // Global quantization with AVX512 optimization
+    if (!scale_opt.has_value()) {
+      throw std::runtime_error("Scale must be provided for non-channelwise quantization in AVX512 version");
+    }
+
+    scale_tensor = scale_opt.value().to(at::ScalarType::Float).contiguous();
+
+    // Handle scalar scale case
+    float scale_val;
+    if (scale_tensor.numel() == 1) {
+      scale_val = std::max(scale_tensor.item<float>(), eps);
+    } else {
+      // Compute max of scale tensor if it's not scalar
+      float* scale_data = scale_tensor.data_ptr<float>();
+      __m512 max_vec = _mm512_set1_ps(eps);
+
+      int64_t i = 0;
+      for (; i <= scale_tensor.numel() - 16; i += 16) {
+        __m512 scale_vec = _mm512_loadu_ps(&scale_data[i]);
+        max_vec = _mm512_max_ps(max_vec, scale_vec);
       }
-      
-      scale_tensor = scale_opt.value().to(at::ScalarType::Float).contiguous();
-      
-      // Handle scalar scale case
-      float scale_val;
-      if (scale_tensor.numel() == 1) {
-          scale_val = std::max(scale_tensor.item<float>(), eps);
-      } else {
-          // Compute max of scale tensor if it's not scalar
-          float* scale_data = scale_tensor.data_ptr<float>();
-          __m512 max_vec = _mm512_set1_ps(eps);
-          
-          int64_t i = 0;
-          for (; i <= scale_tensor.numel() - 16; i += 16) {
-              __m512 scale_vec = _mm512_loadu_ps(&scale_data[i]);
-              max_vec = _mm512_max_ps(max_vec, scale_vec);
-          }
-          
-          float hmax = _mm512_reduce_max_ps(max_vec);
-          for (; i < scale_tensor.numel(); ++i) {
-              hmax = std::max(hmax, scale_data[i]);
-          }
-          scale_val = std::max(hmax, eps);
+
+      float hmax = _mm512_reduce_max_ps(max_vec);
+      for (; i < scale_tensor.numel(); ++i) {
+        hmax = std::max(hmax, scale_data[i]);
       }
-      
-      scale_tensor = at::tensor({scale_val}, scale_tensor.options());
-      float scale_reciprocal = 1.0f / scale_val;
-      
-      // Create output tensor
-      qt = at::empty_like(t_float);
-      
-      // Scale and clamp using AVX512
-      scale_clamp_global_avx512(
-          t_float.data_ptr<float>(),
-          qt.data_ptr<float>(),
-          t_float.numel(),
-          scale_reciprocal,
-          quant_max,
-          -quant_max
-      );
+      scale_val = std::max(hmax, eps);
+    }
+
+    scale_tensor = at::tensor({scale_val}, scale_tensor.options());
+    float scale_reciprocal = 1.0f / scale_val;
+
+    // Create output tensor
+    qt = at::empty_like(t_float);
+
+    // Scale and clamp using AVX512
+    scale_clamp_global_avx512(
+        t_float.data_ptr<float>(), qt.data_ptr<float>(), t_float.numel(), scale_reciprocal, quant_max, -quant_max);
   }
-  
+
   // Final conversion to FP8 E4M3FN using ATen's native conversion
   qt = at::_to_copy(qt, at::ScalarType::Float8_e4m3fn);
-  
+
   return std::make_tuple(qt, scale_tensor);
 }
 
@@ -906,49 +764,49 @@ at::Tensor fp8_scaled_mm_with_quant(
 }
 
 at::Tensor float8_linear_impl(
-  const at::Tensor& input,
-  const at::Tensor& input_scales,
-  const at::Tensor& weight,
-  const at::Tensor& weight_scales,
-  const std::optional<at::Tensor>& bias,
-  at::ScalarType output_dtype) {
-int64_t N = weight.dim() == 4 ? weight.size(0) * weight.size(-1) : weight.size(0);
-int act_quant_mode = input_scales.numel() == 1                                ? PER_TENSOR
-                     : input_scales.numel() == input.numel() / input.size(-1) ? PER_ROW
-                                                                              : PER_GROUP;
-int wei_quant_mode = weight_scales.numel() == 1 ? PER_TENSOR : weight_scales.numel() == N ? PER_ROW : PER_GROUP;
-// Case to fall back
-if (weight.dim() == 2) {
-  TORCH_CHECK(
-      act_quant_mode != PER_GROUP && wei_quant_mode != PER_GROUP,
-      "FP8 linear: Per-group quantization is not supported in the fallback path");
-  auto y_fp32 = at::linear(input.to(at::kFloat).mul_(input_scales), weight.to(at::kFloat).mul_(weight_scales), bias);
-  return y_fp32.to(output_dtype);
-}
+    const at::Tensor& input,
+    const at::Tensor& input_scales,
+    const at::Tensor& weight,
+    const at::Tensor& weight_scales,
+    const std::optional<at::Tensor>& bias,
+    at::ScalarType output_dtype) {
+  int64_t N = weight.dim() == 4 ? weight.size(0) * weight.size(-1) : weight.size(0);
+  int act_quant_mode = input_scales.numel() == 1                                ? PER_TENSOR
+                       : input_scales.numel() == input.numel() / input.size(-1) ? PER_ROW
+                                                                                : PER_GROUP;
+  int wei_quant_mode = weight_scales.numel() == 1 ? PER_TENSOR : weight_scales.numel() == N ? PER_ROW : PER_GROUP;
+  // Case to fall back
+  if (weight.dim() == 2) {
+    TORCH_CHECK(
+        act_quant_mode != PER_GROUP && wei_quant_mode != PER_GROUP,
+        "FP8 linear: Per-group quantization is not supported in the fallback path");
+    auto y_fp32 = at::linear(input.to(at::kFloat).mul_(input_scales), weight.to(at::kFloat).mul_(weight_scales), bias);
+    return y_fp32.to(output_dtype);
+  }
 
-static bool cpublas_can_pack = cpublas_could_pack();
-auto out_sizes = input.sizes().vec();
-out_sizes.back() = N;
-auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
+  static bool cpublas_can_pack = cpublas_could_pack();
+  auto out_sizes = input.sizes().vec();
+  out_sizes.back() = N;
+  auto output = at::empty(out_sizes, input.options().dtype(output_dtype));
 
 #define AT_DISPATCH_FP8_LINEAR_KERNEL(OUT_DTYPE, CAN_PACK, A_QUANT_MODE, B_QUANT_MODE, ...) \
-AT_DISPATCH_BOOL_NO_RETURN(                                                               \
-    CAN_PACK,                                                                             \
-    "cpublas_can_pack",                                                                   \
-    can_pack,                                                                             \
-    AT_DISPATCH_QUANT_MODE_NO_RETURN(                                                     \
-        A_QUANT_MODE,                                                                     \
-        "act_quant_mode",                                                                 \
-        a_quant_mode,                                                                     \
-        AT_DISPATCH_QUANT_MODE_NO_RETURN(                                                 \
-            B_QUANT_MODE,                                                                 \
-            "wei_quant_mode",                                                             \
-            b_quant_mode,                                                                 \
-            AT_DISPATCH_OUT_TYPES(OUT_DTYPE, "out_dtype", __VA_ARGS__))))
+  AT_DISPATCH_BOOL_NO_RETURN(                                                               \
+      CAN_PACK,                                                                             \
+      "cpublas_can_pack",                                                                   \
+      can_pack,                                                                             \
+      AT_DISPATCH_QUANT_MODE_NO_RETURN(                                                     \
+          A_QUANT_MODE,                                                                     \
+          "act_quant_mode",                                                                 \
+          a_quant_mode,                                                                     \
+          AT_DISPATCH_QUANT_MODE_NO_RETURN(                                                 \
+              B_QUANT_MODE,                                                                 \
+              "wei_quant_mode",                                                             \
+              b_quant_mode,                                                                 \
+              AT_DISPATCH_OUT_TYPES(OUT_DTYPE, "out_dtype", __VA_ARGS__))))
 
-AT_DISPATCH_FP8_LINEAR_KERNEL(output_dtype, cpublas_can_pack, act_quant_mode, wei_quant_mode, [&]() {
-  _float8_linear_impl<out_t, can_pack, a_quant_mode, b_quant_mode>(
-      input, input_scales, weight, weight_scales, bias, output);
-});
-return output;
+  AT_DISPATCH_FP8_LINEAR_KERNEL(output_dtype, cpublas_can_pack, act_quant_mode, wei_quant_mode, [&]() {
+    _float8_linear_impl<out_t, can_pack, a_quant_mode, b_quant_mode>(
+        input, input_scales, weight, weight_scales, bias, output);
+  });
+  return output;
 }

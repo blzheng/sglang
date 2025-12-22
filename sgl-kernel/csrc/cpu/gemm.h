@@ -122,6 +122,7 @@ void fused_experts_fp8_a8_kernel_impl(
     at::Float8_e4m3fn* __restrict__ A_tmp,
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
+    float* __restrict__ Ukernel_tmp,
     const at::Float8_e4m3fn* __restrict__ input,
     const at::Float8_e4m3fn* __restrict__ packed_w1,
     const at::Float8_e4m3fn* __restrict__ packed_w2,
@@ -229,8 +230,7 @@ void tinygemm_kernel(
     int64_t block_size_K,
     bool do_unpack = true);
 
-// template <bool cpublas_can_pack, int64_t N, int act_quant_mode, int wei_quant_mode>
-void tinygemm_kernel2(
+void tinygemm_kernel(
     float* C,
     const at::Float8_e4m3fn* A,
     const float* scales_a,
