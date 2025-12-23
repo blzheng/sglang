@@ -711,6 +711,236 @@ _quantize_fp8e4m3(const at::Tensor& t, bool channelwise, c10::optional<at::Tenso
   return std::make_tuple(qt, scale_tensor);
 }
 
+inline __m128i cvtfp32_fp8e4m3(__m512& src) {
+  // cvt 16x32 from fp32 to fp8 e4m3
+  const __m512i sign_mask = _mm512_set1_epi32(0x80000000);
+  const __m512i fp8_max = _mm512_set1_epi32(UINT32_C(1087) << 20);
+  const __m512i denorm_thresh = _mm512_set1_epi32(UINT32_C(121) << 23);
+  const __m512i denorm_mask = _mm512_set1_epi32(UINT32_C(141) << 23);
+  const __m512i bias_part1 = _mm512_set1_epi32((uint32_t)(7 - 127) << 23);
+  const __m512i rounding_bias = _mm512_set1_epi32(0x7FFFF);
+  __m512i f_bits = _mm512_castps_si512(src);
+  // Extract and save sign
+  __m512i sign = _mm512_and_epi32(f_bits, sign_mask);
+  f_bits = _mm512_xor_epi32(f_bits, sign);
+
+  // Prepare result containers
+  __m512i result = _mm512_setzero_si512();
+
+  // Step 1: Handle case of overflow
+  // (f_bits >= fp8_max): set result = 0x7f
+  __mmask16 overflow_mask = _mm512_cmpge_epu32_mask(f_bits, fp8_max);
+  if (overflow_mask) {
+    result = _mm512_mask_set1_epi32(result, overflow_mask, 0x7f);
+  }
+
+  // Step 2: Handle small numbers (denormals)
+  // Small numbers (f_bits < denorm_thresh)
+  __mmask16 denorm_thresh_mask = _mm512_cmplt_epu32_mask(f_bits, denorm_thresh);
+
+  if (denorm_thresh_mask) {
+    __m512 small_input = _mm512_castsi512_ps(f_bits);
+    __m512 small_denorm = _mm512_add_ps(small_input, _mm512_castsi512_ps(denorm_mask));
+    __m512i small_denorm_bits = _mm512_castps_si512(small_denorm);
+    __m512i small_result = _mm512_sub_epi32(small_denorm_bits, denorm_mask);
+    result = _mm512_mask_mov_epi32(result, denorm_thresh_mask, small_result);
+  }
+
+  // Step 3: Handle normal numbers
+  __mmask16 normal_mask = ~(overflow_mask | denorm_thresh_mask);
+
+  if (normal_mask) {
+    // mant_odd = (f_bits >> 20) & 1
+    __m512i mant_odd = _mm512_and_epi32(_mm512_srli_epi32(f_bits, 20), _mm512_set1_epi32(1));
+    // f_bits += bias_part1 + rounding_bias
+    __m512i rounded = _mm512_add_epi32(f_bits, bias_part1);
+    rounded = _mm512_add_epi32(rounded, rounding_bias);
+    // Add mant_odd
+    rounded = _mm512_add_epi32(rounded, mant_odd);
+    // Shift right by 20 bits
+    __m512i normal_result = _mm512_srli_epi32(rounded, 20);
+    result = _mm512_mask_mov_epi32(result, normal_mask, normal_result);
+  }
+
+  // Merge back the sign
+  __m512i sign_shifted = _mm512_srli_epi32(sign, 24);
+  result = _mm512_or_epi32(result, sign_shifted);
+
+  // Now result is 16 x 32-bit integers, but we only need 8-bit for each
+  __m512i packed = _mm512_and_si512(result, _mm512_set1_epi32(0xFF));
+
+  // Narrow 32-bit integers to 8-bit
+  return _mm512_cvtepi32_epi8(packed);
+}
+
+std::tuple<at::Tensor, at::Tensor> _quantize_fp8e4m3_bf16_per_tensor_no_scale(const at::Tensor& t) {
+  constexpr float quant_max = 448.0f;  // torch.finfo(torch.float8_e4m3fn).max
+  constexpr float eps = std::numeric_limits<float>::epsilon();
+
+  // Input validation and preparation
+  assert(t.scalar_type() == at::ScalarType::BFloat16);
+  auto t_bf16 = t.contiguous();
+  int64_t num_channels = t_bf16.size(0);
+  int64_t elements_per_channel = t_bf16.numel() / num_channels;
+  assert(elements_per_channel % 32 == 0);  // do not consider tile currently
+  at::Tensor quant_t = at::empty_like(t_bf16).to(at::kFloat8_e4m3fn);
+
+  // Allocate output tensors
+  at::Tensor scale_tensor = at::empty({num_channels}, t_bf16.options().dtype(at::ScalarType::Float));
+  float* scale_data = scale_tensor.data_ptr<float>();
+
+  // Unified processing: compute max, apply scale, and quantize in single pass
+  at::parallel_for(0, num_channels, 1, [&](int64_t start, int64_t end) {
+    for (int64_t c = start; c < end; ++c) {
+      const at::BFloat16* channel_src = t_bf16.data_ptr<at::BFloat16>() + c * elements_per_channel;
+      at::Float8_e4m3fn* quant_dst = quant_t.data_ptr<at::Float8_e4m3fn>() + c * elements_per_channel;
+
+      // Step 1: Compute channel-wise max using AVX512
+      float channel_max = 0.0f;
+      int64_t i = 0;
+
+      // Process 32 elements at a time for max computation
+      for (; i <= elements_per_channel - 32; i += 32) {
+        // Load 32 BF16 values (2x 256-bit vectors)
+        __m256i src_vec1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&channel_src[i]));
+        __m256i src_vec2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&channel_src[i + 16]));
+
+        // Convert BF16 to FP32
+        __m512i fp32_int1 = _mm512_cvtepu16_epi32(src_vec1);
+        __m512 fp32_vec1 = _mm512_castsi512_ps(_mm512_slli_epi32(fp32_int1, 16));
+
+        __m512i fp32_int2 = _mm512_cvtepu16_epi32(src_vec2);
+        __m512 fp32_vec2 = _mm512_castsi512_ps(_mm512_slli_epi32(fp32_int2, 16));
+
+        // Compute absolute values
+        __m512 abs_vec1 = _mm512_abs_ps(fp32_vec1);
+        __m512 abs_vec2 = _mm512_abs_ps(fp32_vec2);
+
+        // Find max in each vector
+        float max1 = _mm512_reduce_max_ps(abs_vec1);
+        float max2 = _mm512_reduce_max_ps(abs_vec2);
+        channel_max = std::max(channel_max, std::max(max1, max2));
+      }
+
+      // Step 2: Apply quant_max and EPS to compute scale
+      float scale_val = std::max(channel_max / quant_max, eps);
+      float scale_reciprocal = 1.0f / scale_val;
+      scale_data[c] = scale_val;
+
+      // Step 3: Scale and clamp using AVX512 (reuse the same loop structure)
+      i = 0;
+      const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
+      const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+      const __m512 neg_quant_max_vec = _mm512_set1_ps(-quant_max);
+
+      for (; i <= elements_per_channel - 32; i += 32) {
+        // Load 32 BF16 values
+        __m256i src_vec1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&channel_src[i]));
+        __m256i src_vec2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&channel_src[i + 16]));
+
+        // Convert BF16 to FP32
+        __m512 fp32_vec1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec1), 16));
+        __m512 fp32_vec2 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec2), 16));
+
+        // Scale and clamp
+        __m512 scaled_vec1 = _mm512_mul_ps(fp32_vec1, scale_recip_vec);
+        __m512 clamped_vec1 = _mm512_min_ps(_mm512_max_ps(scaled_vec1, neg_quant_max_vec), quant_max_vec);
+
+        __m512 scaled_vec2 = _mm512_mul_ps(fp32_vec2, scale_recip_vec);
+        __m512 clamped_vec2 = _mm512_min_ps(_mm512_max_ps(scaled_vec2, neg_quant_max_vec), quant_max_vec);
+
+        __m128i fp8_vec1 = cvtfp32_fp8e4m3(clamped_vec1);
+        __m128i fp8_vec2 = cvtfp32_fp8e4m3(clamped_vec2);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(quant_dst + i), fp8_vec1);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(quant_dst + i + 16), fp8_vec2);
+      }
+    }
+  });
+
+  return std::make_tuple(quant_t, scale_tensor);
+}
+
+std::tuple<at::Tensor, at::Tensor>
+_quantize_fp8e4m3_bf16_per_tensor_with_scale(const at::Tensor& t, at::Tensor& scale_tensor) {
+  constexpr float quant_max = 448.0f;  // torch.finfo(torch.float8_e4m3fn).max
+  constexpr float eps = std::numeric_limits<float>::epsilon();
+
+  // Input validation
+  assert(t.scalar_type() == at::ScalarType::BFloat16);
+
+  auto t_bf16 = t.contiguous();
+  auto scale_tensor_contig = scale_tensor.contiguous().to(at::ScalarType::Float);
+
+  // Get scale value (handle scalar or tensor)
+  float scale_val;
+  if (scale_tensor_contig.numel() == 1) {
+    scale_val = scale_tensor_contig.item<float>();
+  } else {
+    // Take max if scale is a tensor (though should be scalar for global quantization)
+    scale_val = scale_tensor_contig.max().item<float>();
+  }
+
+  // Apply EPS to scale
+  scale_val = std::max(scale_val, eps);
+  float scale_reciprocal = 1.0f / scale_val;
+
+  at::Tensor scale_output = at::tensor({scale_val}, scale_tensor_contig.options());
+
+  // Apply scale and clamp using AVX512
+  const at::BFloat16* src_data = t_bf16.data_ptr<at::BFloat16>();
+  at::Tensor quant_t = at::empty_like(t_bf16).to(at::kFloat8_e4m3fn);
+  int64_t total_elements = t_bf16.numel();
+  const __m512 scale_recip_vec = _mm512_set1_ps(scale_reciprocal);
+  const __m512 quant_max_vec = _mm512_set1_ps(quant_max);
+  const __m512 neg_quant_max_vec = _mm512_set1_ps(-quant_max);
+  int64_t num_channels = t_bf16.size(0);
+  int64_t elements_per_channel = total_elements / num_channels;
+  assert(elements_per_channel % 32 == 0);  // do not consider tile currently
+  // Process in parallel blocks
+  at::parallel_for(0, num_channels, 1, [&](int64_t start, int64_t end) {
+    for (int64_t c = start; c < end; ++c) {
+      const at::BFloat16* src_data = t_bf16.data_ptr<at::BFloat16>() + c * elements_per_channel;
+      at::Float8_e4m3fn* quant_t_data = quant_t.data_ptr<at::Float8_e4m3fn>() + c * elements_per_channel;
+
+      int64_t i = 0;
+      // Process 32 elements at a time using AVX512
+      for (; i <= elements_per_channel - 32; i += 32) {
+        // Load 32 BF16 values (2x 256-bit vectors)
+        __m256i src_vec1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&src_data[i]));
+        __m256i src_vec2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&src_data[i + 16]));
+
+        // Convert BF16 to FP32
+        __m512 fp32_vec1 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec1), 16));
+        __m512 fp32_vec2 = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(src_vec2), 16));
+
+        // Scale and clamp
+        __m512 scaled_vec1 = _mm512_mul_ps(fp32_vec1, scale_recip_vec);
+        __m512 clamped_vec1 = _mm512_min_ps(_mm512_max_ps(scaled_vec1, neg_quant_max_vec), quant_max_vec);
+
+        __m512 scaled_vec2 = _mm512_mul_ps(fp32_vec2, scale_recip_vec);
+        __m512 clamped_vec2 = _mm512_min_ps(_mm512_max_ps(scaled_vec2, neg_quant_max_vec), quant_max_vec);
+
+        __m128i fp8_vec1 = cvtfp32_fp8e4m3(clamped_vec1);
+        __m128i fp8_vec2 = cvtfp32_fp8e4m3(clamped_vec2);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(quant_t_data + i), fp8_vec1);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(quant_t_data + i + 16), fp8_vec2);
+      }
+    }
+  });
+
+  return std::make_tuple(quant_t, scale_output);
+}
+
+std::tuple<at::Tensor, at::Tensor>
+_quantize_fp8e4m3_vec(const at::Tensor& t, bool channelwise, c10::optional<at::Tensor> scale_opt) {
+  if (channelwise) {
+    return _quantize_fp8e4m3_bf16_per_tensor_no_scale(t);
+  } else {
+    assert(scale_opt.has_value());
+    return _quantize_fp8e4m3_bf16_per_tensor_with_scale(t, scale_opt.value());
+  }
+}
+
 at::Tensor fp8_scaled_mm_with_quant(
     const at::Tensor& act,
     const std::optional<at::Tensor>& act_scales,
@@ -719,7 +949,10 @@ at::Tensor fp8_scaled_mm_with_quant(
     const at::Tensor& weight_scales,
     const std::optional<at::Tensor>& bias,
     at::ScalarType output_dtype) {
-  std::tuple<at::Tensor, at::Tensor> quant_act = _quantize_fp8e4m3(act, channelwise, act_scales);
+  // TODO: refine here to use tensor ptr and in below dispatch api.
+  std::tuple<at::Tensor, at::Tensor> quant_act = act.scalar_type() == at::ScalarType::BFloat16
+                                                     ? _quantize_fp8e4m3_vec(act, channelwise, act_scales)
+                                                     : _quantize_fp8e4m3(act, channelwise, act_scales);
   auto input = std::get<0>(quant_act);
   auto input_scales = std::get<1>(quant_act);
   int64_t N = weight.dim() == 4 ? weight.size(0) * weight.size(-1) : weight.size(0);
