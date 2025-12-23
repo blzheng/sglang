@@ -117,10 +117,10 @@ import os
 
 SGLANG_DEEPSEEK_FP8A8 = os.getenv("SGLANG_DEEPSEEK_FP8A8", "0") == "1"
 SGLANG_LLAMA_BRGEMM_FP8A8 = os.getenv("SGLANG_LLAMA_BRGEMM_FP8A8", "0") == "1"
-SGLANG_BRGEMM_FUSED_FP8A8 = os.getenv("SGLANG_BRGEMM_FUSED_FP8A8", "0") == "1"
-if SGLANG_BRGEMM_FUSED_FP8A8:
-    SGLANG_LLAMA_BRGEMM_FP8A8 = True
-    SGLANG_DEEPSEEK_FP8A8  = True
+SGLANG_BRGEMM_REF_FP8A8 = os.getenv("SGLANG_BRGEMM_REF_FP8A8", "0") == "1"
+if SGLANG_BRGEMM_REF_FP8A8:
+    SGLANG_LLAMA_BRGEMM_FP8A8 = False
+    SGLANG_DEEPSEEK_FP8A8  = False
 
 def _quantize_fp8e4m3(
     t: torch.Tensor, channelwise: bool, scale: Optional[torch.Tensor] = None
@@ -428,7 +428,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 # _amx_process_weight_after_loading(layer, ["weight"])
                 layer.use_f8f8 = False
                 if (
-                    SGLANG_DEEPSEEK_FP8A8
+                    (SGLANG_DEEPSEEK_FP8A8 or SGLANG_BRGEMM_REF_FP8A8)
                     and not "shared_experts" in self.prefix
                     and not "qkv_a" in self.prefix
                     and not "q_b_proj" in self.prefix
@@ -465,7 +465,7 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv.data = weight_scale.data
 
         elif (
-            SGLANG_LLAMA_BRGEMM_FP8A8
+            (SGLANG_LLAMA_BRGEMM_FP8A8 or SGLANG_BRGEMM_REF_FP8A8)
             and hasattr(self.quant_config, "activation_scheme")
             and self.quant_config.activation_scheme == "static"
         ):
@@ -640,18 +640,17 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             if use_intel_amx_backend(layer):
                 if SGLANG_DEEPSEEK_FP8A8 and layer.use_f8f8:
-                    if SGLANG_BRGEMM_FUSED_FP8A8:
-                        return torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
-                            x,
-                            None,
-                            True,
-                            layer.weight,
-                            layer.weight_scale_inv,
-                            bias,
-                            x.dtype,
-                        )
+                    return torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
+                        x,
+                        None,
+                        True,
+                        layer.weight,
+                        layer.weight_scale_inv,
+                        bias,
+                        x.dtype,
+                    )
+                elif SGLANG_BRGEMM_REF_FP8A8 and layer.use_f8f8:
                     x_q, x_s = _quantize_fp8e4m3(x, True)
-                    # x_zp = torch.zeros_like(x_s).to(torch.int)
                     return torch.ops.sgl_kernel.float8_linear_cpu(
                         x_q,
                         x_s,
@@ -680,9 +679,17 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         if self.quant_config.activation_scheme == "static":
-            if not SGLANG_BRGEMM_FUSED_FP8A8:
+            if SGLANG_BRGEMM_REF_FP8A8:
                 q_input, scale = _quantize_fp8e4m3(x, False, layer.input_scale)
-            else:
+                return torch.ops.sgl_kernel.float8_linear_cpu(
+                    q_input,
+                    scale,
+                    layer.weight,
+                    layer.weight_scale,
+                    bias,
+                    x.dtype,
+                )
+            elif SGLANG_LLAMA_BRGEMM_FP8A8:
                 return torch.ops.sgl_kernel.fp8_scaled_mm_with_quant(
                     x,
                     layer.input_scale,
@@ -692,24 +699,15 @@ class Fp8LinearMethod(LinearMethodBase):
                     bias,
                     x.dtype,
                 )
-
-            if SGLANG_LLAMA_BRGEMM_FP8A8:
-                return torch.ops.sgl_kernel.float8_linear_cpu(
+            else:
+                return torch._scaled_mm(
                     q_input,
-                    scale,
                     layer.weight,
-                    layer.weight_scale,
-                    bias,
-                    x.dtype,
+                    bias=bias,
+                    out_dtype=x.dtype,
+                    scale_a=layer.input_scale,
+                    scale_b=layer.weight_scale,
                 )
-            return torch._scaled_mm(
-                q_input,
-                layer.weight,
-                bias=bias,
-                out_dtype=x.dtype,
-                scale_a=layer.input_scale,
-                scale_b=layer.weight_scale,
-            )
 
         return apply_fp8_linear(
             input=x,
@@ -978,7 +976,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 assert (
                     _is_cpu_amx_available
                 ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
-                if not SGLANG_BRGEMM_FUSED_FP8A8:
+                if not SGLANG_DEEPSEEK_FP8A8:
                     _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
                 else:
                     _amx_process_weight_after_loading(layer, ["w2_weight"])
@@ -1234,7 +1232,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             x, topk_weights = apply_topk_weights_cpu(
                 moe_runner_config.apply_router_weight_on_input, topk_weights, x
             )
-            if not SGLANG_BRGEMM_FUSED_FP8A8:
+            if not SGLANG_DEEPSEEK_FP8A8:
                 output = torch.ops.sgl_kernel.fused_experts_cpu(
                     x,
                     layer.w13_weight,
@@ -1244,7 +1242,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     False,  # inplace See [Note] inplace should be False in fused_experts.
                     False,  # use_int8_w8a8
                     True,  # use_fp8_w8a16
-                    False,
+                    False,  # use_fp8_w8a8
                     layer.w13_weight_scale_inv,  # w1_scale
                     layer.w2_weight_scale_inv,  # w2_scale
                     self.quant_config.weight_block_size,  # block_size
