@@ -24,6 +24,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
     sglang_per_token_quant_fp8,
     static_quant_fp8,
+    static_quant_fp8_cpu,
     triton_scaled_mm,
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
@@ -35,6 +36,7 @@ from sglang.srt.utils import (
     get_cuda_version,
     get_device_capability,
     is_blackwell_supported,
+    is_cpu,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
@@ -49,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
@@ -1381,9 +1384,12 @@ def apply_fp8_linear(
         if input_scale is not None:
             assert input_scale.numel() == 1
             # broadcast per-tensor scale to per-token scale when supporting cutlass
-            qinput, x_scale = static_quant_fp8(
-                input_2d, input_scale, repeat_scale=cutlass_fp8_supported
-            )
+            if _is_cpu:
+                qinput, x_scale = static_quant_fp8_cpu(input_2d, input_scale)
+            else:
+                qinput, x_scale = static_quant_fp8(
+                    input_2d, input_scale, repeat_scale=cutlass_fp8_supported
+                )
         else:
             # default use per-token quantization if dynamic
             if _is_cuda:

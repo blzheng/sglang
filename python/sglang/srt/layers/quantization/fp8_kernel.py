@@ -606,6 +606,39 @@ def sglang_per_token_quant_fp8(
     return x_q, x_s
 
 
+def static_quant_fp8_cpu(
+    x: torch.Tensor,
+    x_s: torch.Tensor,
+    repeat_scale: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.is_contiguous(), "`x` must be contiguous"
+    assert x_s.numel() == 1, "only supports per-tensor scale"
+
+    N = x.shape[-1]
+    M = x.numel() // N
+
+    x_q = torch.empty_like(x, dtype=fp8_dtype)
+
+    scale = x_s.item()
+    scale_inv = 1.0 / scale
+
+    x_2d = x.view(M, N)
+    x_q_2d = x_q.view(M, N)
+
+    for m in range(M):
+        y = x_2d[m].to(torch.float32)
+        y_q_fp32 = torch.clamp(y * scale_inv, fp8_min, fp8_max)
+        x_q_2d[m] = y_q_fp32.to(fp8_dtype)
+
+    if repeat_scale:
+        x_s_out = torch.empty((M, 1), device=x.device, dtype=torch.float32)
+        x_s_out.fill_(scale)
+    else:
+        x_s_out = x_s
+
+    return x_q, x_s_out
+
+
 @triton.jit
 def _static_quant_fp8(
     # Pointers to inputs and output
@@ -1681,9 +1714,12 @@ else:
             assert (
                 scale.numel() == 1
             ), f"Expected scalar scale, got numel={scale.numel()}"
-            sgl_per_tensor_quant_fp8(
-                input, output, scale, is_static=True
-            )  # True for static
+            if _is_cpu:
+                output = torch.clamp(input / scale, fp8_min, fp8_max).to(fp8_dtype)
+            else:
+                sgl_per_tensor_quant_fp8(
+                    input, output, scale, is_static=True
+                )  # True for static
 
         return output, scale
 
