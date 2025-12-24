@@ -1251,7 +1251,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     True,  # is_vnni
                 )
             else:
-                x_q, x_s = torch.ops.sgl_kernel.quantize_fp8e4m3(x, True, None)
+                x_q, x_s = torch.ops.sgl_kernel._quantize_fp8e4m3_vec(x, True, None)
                 output = torch.ops.sgl_kernel.fused_experts_cpu(
                     x_q,
                     layer.w13_weight,
