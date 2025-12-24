@@ -47,7 +47,7 @@ from sglang.srt.managers.schedule_batch import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
-from sglang.srt.utils import add_prefix, is_cpu
+from sglang.srt.utils import add_prefix, is_cpu, cpu_has_amx_support
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,7 @@ logger = logging.getLogger(__name__)
 
 # === Vision Encoder === #
 _is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -158,6 +159,10 @@ class Qwen3_VisionBlock(nn.Module):
         elif attn_implementation == "flash_attention_3":
             softmax_in_single_precision = False
             qkv_backend = "fa3"
+            flatten_batch = True
+        elif attn_implementation == "amx_attn":
+            softmax_in_single_precision = False
+            qkv_backend = "amx_attn"
             flatten_batch = True
 
         self.attn = VisionAttention(
@@ -281,7 +286,9 @@ class Qwen3VLMoeVisionModel(nn.Module):
         else:
             head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = Qwen2_5_VisionRotaryEmbedding(head_dim // 2)
-
+        attn_implementation = "flash_attention_3"
+        if _is_cpu and _is_cpu_amx_available:
+            attn_implementation = "amx_attn"
         self.blocks = nn.ModuleList(
             [
                 Qwen3_VisionBlock(
@@ -291,7 +298,7 @@ class Qwen3VLMoeVisionModel(nn.Module):
                     intermediate_dim=vision_config.intermediate_size,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
-                    attn_implementation="flash_attention_3" if not _is_cpu else "sdpa",
+                    attn_implementation=attn_implementation,
                     quant_config=quant_config,
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                 )
