@@ -27,7 +27,13 @@ class Mod(nn.Module):
 
 
 class TestGemm(CustomTestCase):
-    @parametrize(M=[1, 101], N=[16, 32 * 13], K=[32 * 16], has_bias=[False, True], dim=[2, 3, 4, 5])
+    @parametrize(
+        M=[1, 101],
+        N=[16, 32 * 13],
+        K=[32 * 16],
+        has_bias=[False, True],
+        dim=[2, 3, 4, 5],
+    )
     def test_bf16_gemm(self, M, N, K, has_bias, dim):
         mat1 = torch.randn(M, K, dtype=torch.bfloat16)
         mat2 = torch.randn(N, K, dtype=torch.bfloat16)
@@ -58,7 +64,13 @@ class TestGemm(CustomTestCase):
         torch.testing.assert_close(ref, out, atol=atol, rtol=rtol)
         torch.testing.assert_close(ref, out2, atol=atol, rtol=rtol)
 
-    @parametrize(M=[1, 8, 32, 1024], N=[12, 1], K=[32 * 16], has_bias=[False, True], use_post_sigmul=[False, True])
+    @parametrize(
+        M=[1, 8, 32, 1024],
+        N=[12, 1],
+        K=[32 * 16],
+        has_bias=[False, True],
+        use_post_sigmul=[False, True],
+    )
     def test_bf16_gemm_with_small_oc(self, M, N, K, has_bias, use_post_sigmul):
         use_post_sigmul = use_post_sigmul and N == 1
         mat_mul = (
