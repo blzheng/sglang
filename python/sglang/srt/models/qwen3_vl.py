@@ -30,6 +30,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv3d
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -133,7 +134,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         self.embed_dim = config.hidden_size
 
         kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
-        self.proj = nn.Conv3d(
+        self.proj = Conv3d(
             self.in_channels,
             self.embed_dim,
             kernel_size=kernel_size,
