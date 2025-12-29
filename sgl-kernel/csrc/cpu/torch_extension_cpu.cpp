@@ -231,6 +231,11 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     bool disable_grouping,
     at::ScalarType out_dtype);
 
+// conv3d fast path for patch embedding
+at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight);
+
+at::Tensor conv3d_embed_cpu(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias, bool is_vnni);
+
 // shared memory init
 void initialize(int64_t size, int64_t rank);
 
@@ -386,6 +391,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "routed_scaling_factor, bool inplace, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? w1_scale, Tensor? "
       "w2_scale, int[]? block_size, Tensor? a1_scale, Tensor? a2_scale, bool is_vnni) -> Tensor");
   m.impl("shared_expert_cpu", torch::kCPU, &shared_expert_cpu);
+
+  // conv3d fast path for patch embedding
+  m.def("conv3d_embed_weight_pack(Tensor weight) -> Tensor");
+  m.impl("conv3d_embed_weight_pack", torch::kCPU, &conv3d_embed_weight_pack);
+  m.def("conv3d_embed_cpu(Tensor input, Tensor weight, Tensor bias, bool is_vnni) -> Tensor");
+  m.impl("conv3d_embed_cpu", torch::kCPU, &conv3d_embed_cpu);
 
   // all reduce
   m.def("initialize(int size, int rank) -> ()");
