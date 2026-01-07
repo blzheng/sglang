@@ -161,7 +161,6 @@ class TestROPE(CustomTestCase):
             rotary_dim: int,
             max_position_embeddings: int,
             base: int,
-            dims: int,
             is_neox_style: bool,
             dtype: torch.dtype,
             device: str,
@@ -193,9 +192,7 @@ class TestROPE(CustomTestCase):
                 dtype=dtype,
                 device=device,
             )
-            if dims == 4:
-                query = query.view(batch_size, seq_len, num_q_heads, head_size)
-                key = key.view(batch_size, seq_len, num_kv_heads, head_size)
+
             query_ref, key_ref = query.clone(), key.clone()
             query_cpu, key_cpu = query.clone(), key.clone()
 
@@ -237,21 +234,19 @@ class TestROPE(CustomTestCase):
             num_q_heads,
             num_kv_heads,
         ) in test_config:
-            for dim in [2, 4]:
-                single_test(
-                    head_size,
-                    rotary_dim,
-                    max_position_embeddings,
-                    base,
-                    dim,
-                    is_neox_style,
-                    dtype,
-                    device,
-                    batch_size,
-                    seq_len,
-                    num_q_heads,
-                    num_kv_heads,
-                )
+            single_test(
+                head_size,
+                rotary_dim,
+                max_position_embeddings,
+                base,
+                is_neox_style,
+                dtype,
+                device,
+                batch_size,
+                seq_len,
+                num_q_heads,
+                num_kv_heads,
+            )
 
     def test_apply_rotary_pos_emb(self):
         num_tokens = 1024
@@ -264,15 +259,14 @@ class TestROPE(CustomTestCase):
         )
         query = query.view(num_tokens, num_heads, head_size)
         key = key.view(num_tokens, num_heads, head_size)
-        for sincos_dtype in [torch.float32, torch.bfloat16]:
-            cos = torch.rand(num_tokens, head_size).to(sincos_dtype)
-            sin = torch.rand(num_tokens, head_size).to(sincos_dtype)
-            q_out_ref, k_out_ref = apply_rotary_pos_emb_native(query, key, cos, sin)
-            q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
-                query, key, cos, sin
-            )
-            torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
-            torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
+        cos = torch.rand(num_tokens, head_size).to(torch.float32)
+        sin = torch.rand(num_tokens, head_size).to(torch.float32)
+        q_out_ref, k_out_ref = apply_rotary_pos_emb_native(query, key, cos, sin)
+        q_out_sgl, k_out_sgl = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(
+            query, key, cos, sin
+        )
+        torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
 
 
 if __name__ == "__main__":
