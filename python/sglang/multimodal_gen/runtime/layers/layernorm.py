@@ -277,7 +277,7 @@ def fuse_scale_shift_native(
     block_l: int = 128,
     block_c: int = 128,
 ):
-    assert x.is_contiguous()
+    x = x.contiguous()
 
     B, L, C = x.shape
     output = torch.empty_like(x)
