@@ -269,7 +269,102 @@ class FP32LayerNorm(nn.LayerNorm):
         ).to(origin_dtype)
 
 
-class ScaleResidualLayerNormScaleShift(nn.Module):
+
+def fuse_scale_shift_native(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    block_l: int = 128,
+    block_c: int = 128,
+):
+    assert x.is_contiguous()
+
+    B, L, C = x.shape
+    output = torch.empty_like(x)
+
+    # =========================
+    # Case 1: 4D scale / shift
+    # scale, shift: [B, F, 1, C]
+    # =========================
+    if scale.dim() == 4:
+        assert scale.shape == shift.shape
+        assert scale.shape[0] == B
+        assert scale.shape[3] == C
+
+        num_frames = scale.shape[1]
+        assert L % num_frames == 0, \
+            "seq_len must be divisible by num_frames for 4D scale/shift"
+
+        frame_seqlen = L // num_frames
+
+        # [B, F, 1, C] -> [B, F, C]
+        scale_bc = scale.squeeze(2)
+        shift_bc = shift.squeeze(2)
+
+        # Iterate explicitly to match Triton logic
+        for b in range(B):
+            for t in range(L):
+                frame_idx = t // frame_seqlen
+                # scale / shift row for this frame
+                s = scale_bc[b, frame_idx]   # [C]
+                sh = shift_bc[b, frame_idx]  # [C]
+                output[b, t] = x[b, t] * (1 + s) + sh
+
+        return output
+
+    # =========================
+    # Case 2: Non-4D
+    # =========================
+    # Normalize scale
+    if scale.dim() == 0 or (scale.dim() == 1 and scale.numel() == 1):
+        scale_blc = scale.view(1)
+        scale_is_scalar = True
+    elif scale.dim() == 2:  # [B, C]
+        scale_blc = scale[:, None, :]
+        scale_is_scalar = False
+    elif scale.dim() == 3:  # [B, L, C] or broadcastable
+        scale_blc = scale
+        scale_is_scalar = False
+    else:
+        raise ValueError("scale must be 0D/1D/2D/3D or 4D")
+
+    # Normalize shift
+    if shift.dim() == 0 or (shift.dim() == 1 and shift.numel() == 1):
+        shift_blc = shift.view(1)
+        shift_is_scalar = True
+    elif shift.dim() == 2:
+        shift_blc = shift[:, None, :]
+        shift_is_scalar = False
+    elif shift.dim() == 3:
+        shift_blc = shift
+        shift_is_scalar = False
+    else:
+        shift_blc = shift
+        shift_is_scalar = False
+
+    # Fast-path: both scalar and both zero
+    if scale_is_scalar and shift_is_scalar:
+        if scale_blc.item() == 0 and shift_blc.item() == 0:
+            output.copy_(x)
+            return output
+
+    # Expand for broadcasting (matches kernel behavior)
+    if scale_is_scalar:
+        scale_exp = scale_blc
+    else:
+        scale_exp = scale_blc.expand(B, L, C)
+
+    if shift_is_scalar:
+        shift_exp = shift_blc
+    else:
+        shift_exp = shift_blc.expand(B, L, C)
+
+    # Core computation
+    output = x * (1 + scale_exp) + shift_exp
+    return output
+
+@CustomOp.register("scale_residual_layernorm_scale_shift")
+class ScaleResidualLayerNormScaleShift(CustomOp):
     """
     Fused operation that combines:
     1. Gated residual connection
@@ -309,7 +404,23 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
         else:
             raise NotImplementedError(f"Norm type {norm_type} not implemented")
 
-    def forward(
+    def forward_cpu(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(
+            residual,
+            x,
+            gate,
+            shift,
+            scale,
+        )
+
+    def forward_cuda(
         self,
         residual: torch.Tensor,
         x: torch.Tensor,
@@ -358,6 +469,56 @@ class ScaleResidualLayerNormScaleShift(nn.Module):
         #     shift,
         # )
         modulated = fuse_scale_shift_kernel(
+            normalized,
+            scale,
+            shift,
+        )
+        return modulated, residual_output
+
+    def forward_native(
+        self,
+        residual: torch.Tensor,
+        x: torch.Tensor,
+        gate: torch.Tensor | int,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Apply gated residual connection, followed by layernorm and
+        scale/shift in a single fused operation.
+
+        Returns:
+            Tuple containing:
+            - normalized and modulated output of shape: [batch_size, seq_len, inner_dim]
+            - residual value (value after residual connection
+              but before normalization)
+        """
+        # x.shape: [batch_size, seq_len, inner_dim]
+        # Apply residual connection with gating
+        if isinstance(gate, int):
+            # used by cross-attention, should be 1
+            assert gate == 1
+            residual_output = residual + x
+        elif isinstance(gate, torch.Tensor):
+            if gate.dim() == 4:
+                # gate.shape: [batch_size, num_frames, 1, inner_dim]
+                num_frames = gate.shape[1]
+                frame_seqlen = x.shape[1] // num_frames
+                residual_output = residual + (
+                    x.unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * gate
+                ).flatten(1, 2)
+            else:
+                # used by bidirectional self attention
+                # gate.shape: [batch_size, 1, inner_dim]
+                residual_output = residual + x * gate
+        else:
+            raise ValueError(f"Gate type {type(gate)} not supported")
+        # residual_output.shape: [batch_size, seq_len, inner_dim]
+
+        # Apply normalization
+        normalized = self.norm(residual_output)
+
+        modulated = fuse_scale_shift_native(
             normalized,
             scale,
             shift,

@@ -35,7 +35,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_grou
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 # from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
+from sglang.multimodal_gen.runtime.utils.common import is_cpu
+_is_cpu = is_cpu()
 logger = init_logger(__name__)
 
 
@@ -69,7 +70,7 @@ def _apply_rotary_emb(
     """
     # cos = cos.unsqueeze(-2).to(x.dtype)
     # sin = sin.unsqueeze(-2).to(x.dtype)
-    if is_neox_style:
+    if _is_cpu:
         cos = cos.unsqueeze(-2)
         sin = sin.unsqueeze(-2)
         if is_neox_style:
