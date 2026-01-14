@@ -127,7 +127,7 @@ class DmdDenoisingStage(DenoisingStage):
 
                     # Predict noise residual
                     with torch.autocast(
-                        device_type="cuda",
+                        device_type=("cuda" if torch.cuda.is_available() else "cpu"),
                         dtype=target_dtype,
                         enabled=autocast_enabled,
                     ):

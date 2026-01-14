@@ -247,7 +247,9 @@ class ImageVAEEncodingStage(PipelineStage):
 
         # Encode Image
         with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+            device_type=("cuda" if torch.cuda.is_available() else "cpu"),
+            dtype=vae_dtype,
+            enabled=vae_autocast_enabled,
         ):
             if server_args.pipeline_config.vae_tiling:
                 self.vae.enable_tiling()

@@ -167,7 +167,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     image_latent[:, :, :1, :, :].to(target_dtype).permute(0, 2, 1, 3, 4)
                 )
                 with torch.autocast(
-                    device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                    device_type=("cuda" if torch.cuda.is_available() else "cpu"),
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
                         image_first_btchw,
@@ -195,7 +197,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     .permute(0, 2, 1, 3, 4)
                 )
                 with torch.autocast(
-                    device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                    device_type=("cuda" if torch.cuda.is_available() else "cpu"),
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
                         ref_btchw,
@@ -295,7 +299,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
                     with (
                         torch.autocast(
-                            device_type="cuda",
+                            device_type=(
+                                "cuda" if torch.cuda.is_available() else "cpu"
+                            ),
                             dtype=target_dtype,
                             enabled=autocast_enabled,
                         ),
@@ -372,7 +378,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 context_bcthw = current_latents.to(target_dtype)
                 with (
                     torch.autocast(
-                        device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                        device_type=("cuda" if torch.cuda.is_available() else "cpu"),
+                        dtype=target_dtype,
+                        enabled=autocast_enabled,
                     ),
                     set_forward_context(
                         current_timestep=0,
