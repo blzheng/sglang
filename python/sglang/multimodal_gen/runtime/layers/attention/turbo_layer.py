@@ -12,6 +12,7 @@ from einops import rearrange
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Module
+from sglang.multimodal_gen.runtime.platforms import current_platform
 
 
 def post_all2all(local_seq_2_local_head, seq_world_size):
@@ -182,8 +183,8 @@ def get_block_map(q, k, topk_ratio, BLKQ=64, BLKK=64):
     arg_k = k - torch.mean(
         k, dim=-2, keepdim=True
     )  # smooth-k technique in SageAttention
-    pooled_qblocks = mean_pool(q, BLKQ)
-    pooled_kblocks = mean_pool(arg_k, BLKK)
+    pooled_qblocks = mean_pool(q, BLKQ) if current_platform.is_cuda() else mean_pool_ref(q, BLKQ)
+    pooled_kblocks = mean_pool(arg_k, BLKK) if current_platform.is_cuda() else mean_pool_ref(arg_k, BLKK)
     pooled_score = pooled_qblocks @ pooled_kblocks.transpose(-1, -2)
 
     K = pooled_score.shape[-1]
@@ -231,6 +232,27 @@ def compress_kernel(
     x_mean = tl.sum(x, axis=0, dtype=tl.float32) / nx
     tl.store(XM + xm_offset + idx_l * D + offs_d, x_mean.to(XM.dtype.element_ty))
 
+
+def mean_pool_ref(x: torch.Tensor, BLK: int):
+    assert x.is_contiguous()
+
+    B, H, L, D = x.shape
+    L_BLOCKS = (L + BLK - 1) // BLK
+
+    x_mean = torch.empty(
+        (B, H, L_BLOCKS, D),
+        device=x.device,
+        dtype=x.dtype,
+    )
+
+    for blk in range(L_BLOCKS):
+        start = blk * BLK
+        end = min(start + BLK, L)
+        block = x[:, :, start:end, :]
+        block_mean = block.float().mean(dim=2)
+        x_mean[:, :, blk, :] = block_mean.to(x.dtype)
+
+    return x_mean
 
 class _SeqAllToAll(torch.autograd.Function):
     @staticmethod
@@ -431,7 +453,7 @@ class SparseLinearAttention(nn.Module):
 
         o_l = self._torch_calc_linear(q, k, v)
 
-        with torch.amp.autocast("cuda", dtype=self.dtype):
+        with torch.amp.autocast(current_platform.device_type, dtype=self.dtype):
             o_l = self.proj_l(o_l)
         o = (o_s + o_l).to(dtype).transpose(1, 2)
 
@@ -459,7 +481,99 @@ class SparseLinearAttention(nn.Module):
 
 class _attention(torch.autograd.Function):
     @staticmethod
+    def forward_cpu(ctx, q, k, v, k_block_id, lut, topk, BLOCK_M, BLOCK_N, qk_scale=None):
+        assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+        assert lut.is_contiguous()
+
+        B, H, L, D = q.shape
+        device = q.device
+        dtype = q.dtype
+
+        if qk_scale is None:
+            qk_scale = D ** -0.5
+
+        M_BLOCKS = (L + BLOCK_M - 1) // BLOCK_M
+        o_s = torch.empty_like(v)
+        lse = torch.empty((B, H, L), device=device, dtype=torch.float32)
+
+        for b in range(B):
+            for h in range(H):
+                for m_block in range(M_BLOCKS):
+                    m_start = m_block * BLOCK_M
+                    m_end = min(m_start + BLOCK_M, L)
+                    m_len = m_end - m_start
+
+                    # Q block: [m_len, D]
+                    q_block = q[b, h, m_start:m_end]
+
+                    # online softmax state (base-2)
+                    m_i = torch.full((m_len,), -float("inf"), device=device, dtype=torch.float32)
+                    l_i = torch.zeros((m_len,), device=device, dtype=torch.float32)
+                    o_block = torch.zeros((m_len, D), device=device, dtype=torch.float32)
+
+                    # LUT offset
+                    lut_row = lut[b, h, m_block]  # [topk]
+
+                    for block_idx in range(topk):
+                        idx_n = int(lut_row[block_idx].item())
+
+                        n_start = idx_n * BLOCK_N
+                        if n_start >= L:
+                            continue
+                        n_end = min(n_start + BLOCK_N, L)
+
+                        # K, V blocks
+                        k_block = k[b, h, n_start:n_end]  # [n_len, D]
+                        v_block = v[b, h, n_start:n_end]  # [n_len, D]
+
+                        # qk = Q @ K^T
+                        qk = torch.matmul(
+                            q_block, k_block.transpose(0, 1)
+                        )  # [m_len, n_len]
+
+                        # scale & convert to base-2 exp domain
+                        qk = qk * (qk_scale * 1.4426950408889634)
+
+                        # local max
+                        local_m = qk.max(dim=1).values
+                        new_m = torch.maximum(m_i, local_m)
+
+                        # shift
+                        qk = qk - new_m[:, None]
+
+                        # exp2
+                        p = torch.exp2(qk)
+
+                        l_ij = p.sum(dim=1)
+                        alpha = torch.exp2(m_i - new_m)
+
+                        o_block *= alpha[:, None]
+                        o_block += torch.matmul(p.to(v_block.dtype), v_block).float()
+
+                        l_i = l_i * alpha + l_ij
+                        m_i = new_m
+
+                    # normalize
+                    o_block = o_block / l_i[:, None]
+
+                    # write output
+                    o_s[b, h, m_start:m_end] = o_block.to(dtype)
+
+                    # LSE = log2(sum exp) + max
+                    lse[b, h, m_start:m_end] = m_i + torch.log2(l_i)
+        ctx.save_for_backward(q, k, v, k_block_id, lut, lse, o_s)
+        ctx.qk_scale = qk_scale
+        ctx.topk = topk
+        ctx.BLOCK_M = BLOCK_M
+        ctx.BLOCK_N = BLOCK_N
+        return o_s
+
+    @staticmethod
     def forward(ctx, q, k, v, k_block_id, lut, topk, BLOCK_M, BLOCK_N, qk_scale=None):
+        if current_platform.is_cpu():
+            return _attention.forward_cpu(
+                ctx, q, k, v, k_block_id, lut, topk, BLOCK_M, BLOCK_N, qk_scale
+            )
         assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
         assert k_block_id.is_contiguous() and lut.is_contiguous()
 
