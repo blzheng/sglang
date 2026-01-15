@@ -27,7 +27,7 @@
 """Rotary Positional Embeddings."""
 import functools
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Optional, Tuple
 
 import torch
 
@@ -35,9 +35,91 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import get_sp_grou
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 # from sglang.multimodal_gen.runtime.layers.triton_ops import apply_rotary_embedding
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.common import is_cpu
-_is_cpu = is_cpu()
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
 logger = init_logger(__name__)
+
+
+def apply_flashinfer_rope_qk_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    head_size: Optional[int] = None,
+    is_neox: bool = False,
+    positions: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if q.dim() != 4 or k.dim() != 4:
+        raise ValueError(
+            f"Expected q/k to be 4D [bsz, seqlen, nheads, head_size], "
+            f"got q:{tuple(q.shape)} k:{tuple(k.shape)}"
+        )
+    if q.shape != k.shape:
+        raise ValueError(
+            f"q and k must have the same shape, got {q.shape} vs {k.shape}"
+        )
+
+    if not (isinstance(cos_sin_cache, torch.Tensor) and cos_sin_cache.dim() == 2):
+        raise ValueError("cos_sin_cache must be a 2D torch.Tensor")
+
+    bsz, seqlen, nheads, d = q.shape
+    if head_size is None:
+        head_size = d
+    if head_size != d:
+        raise ValueError(f"head_size mismatch: inferred {d}, but head_size={head_size}")
+    try:
+        from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+            
+        if positions is None:
+            pos_1d = torch.arange(seqlen, device=q.device, dtype=torch.long)
+            positions = pos_1d if bsz == 1 else pos_1d.repeat(bsz)
+        else:
+            if not (
+                isinstance(positions, torch.Tensor)
+                and positions.dtype == torch.long
+                and positions.dim() == 1
+            ):
+                raise ValueError("positions must be a 1D torch.long Tensor")
+            if positions.numel() != bsz * seqlen:
+                raise ValueError(
+                    f"positions length must be bsz*seqlen={bsz*seqlen}, got {positions.numel()}"
+                )
+
+        q_flat = q.reshape(bsz * seqlen, nheads * d).contiguous()
+        k_flat = k.reshape(bsz * seqlen, nheads * d).contiguous()
+        apply_rope_with_cos_sin_cache_inplace(
+            positions=positions,
+            query=q_flat,
+            key=k_flat,
+            head_size=d,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox,
+        )
+        return q_flat.view(bsz, seqlen, nheads, d), k_flat.view(bsz, seqlen, nheads, d)
+    except Exception:
+        # fallback for AMD/ROCm/CPU where FlashInfer is not available
+        import warnings
+
+        warnings.warn(
+            "FlashInfer not available, using fallback path for RoPE",
+            stacklevel=2,
+        )
+        half_size = cos_sin_cache.shape[-1] // 2
+        if positions is None:
+            cos = cos_sin_cache[:seqlen, :half_size].to(q.dtype)
+            sin = cos_sin_cache[:seqlen, half_size:].to(q.dtype)
+            cos = cos.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * seqlen, -1)
+            sin = sin.unsqueeze(0).expand(bsz, -1, -1).reshape(bsz * seqlen, -1)
+        else:
+            positions = positions.to(cos_sin_cache.device).view(-1)
+            cos = cos_sin_cache[positions, :half_size].to(q.dtype)
+            sin = cos_sin_cache[positions, half_size:].to(q.dtype)
+        q_flat = q.reshape(bsz * seqlen, nheads, d)
+        k_flat = k.reshape(bsz * seqlen, nheads, d)
+        q_rot = _apply_rotary_emb(q_flat, cos, sin, is_neox, interleaved=not is_neox)
+        k_rot = _apply_rotary_emb(k_flat, cos, sin, is_neox, interleaved=not is_neox)
+        return q_rot.view(bsz, seqlen, nheads, d), k_rot.view(bsz, seqlen, nheads, d)
+
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -70,7 +152,7 @@ def _apply_rotary_emb(
     """
     # cos = cos.unsqueeze(-2).to(x.dtype)
     # sin = sin.unsqueeze(-2).to(x.dtype)
-    if _is_cpu:
+    if current_platform.is_cpu():
         cos = cos.unsqueeze(-2)
         sin = sin.unsqueeze(-2)
         if is_neox_style:

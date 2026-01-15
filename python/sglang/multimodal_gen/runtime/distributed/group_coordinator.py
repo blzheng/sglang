@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_
 from sglang.multimodal_gen.runtime.distributed.device_communicators.cpu_communicator import (
     CpuCommunicator,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
     suppress_stdout,
@@ -43,10 +44,9 @@ _group_name_counter: dict[str, int] = {}
 
 
 def get_local_torch_device() -> torch.device:
-    return torch.device("cpu") # gjn
     """Return the torch device for the current rank."""
-    from sglang.multimodal_gen.runtime.platforms import current_platform
-
+    if current_platform.is_cpu():
+        return torch.device("cpu")
     return (
         torch.device(f"cuda:{envs.LOCAL_RANK}")
         if current_platform.is_cuda_alike()
@@ -847,7 +847,7 @@ class PipelineGroupCoordinator(GroupCoordinator):
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        self.device = envs.get_device(local_rank)
+        self.device = current_platform.get_device(local_rank)
 
         self.recv_buffer_set: bool = False
         self.recv_tasks_queue: List[Tuple[str, int]] = []
