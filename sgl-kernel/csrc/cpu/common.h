@@ -332,4 +332,10 @@ struct Unroll<1> {
   }
 };
 
+// conditional data ptr for optional tensor
+template <typename T>
+inline T* conditional_data_ptr(const std::optional<at::Tensor>& opt) {
+  return opt.has_value() ? opt.value().data_ptr<T>() : nullptr;
+}
+
 }  // anonymous namespace
