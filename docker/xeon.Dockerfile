@@ -26,7 +26,8 @@ RUN curl -fsSL -o miniforge.sh -O https://github.com/conda-forge/miniforge/relea
     bash miniforge.sh -b -p ./miniforge3 && \
     rm -f miniforge.sh && \
     . miniforge3/bin/activate && \
-    conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl
+    conda install -y libsqlite==3.48.0 gperftools tbb libnuma numactl && \
+    conda install --update-deps -c conda-forge -y gxx gcc sysroot_linux-64
 
 ENV PATH=/sgl-workspace/miniforge3/bin:/sgl-workspace/miniforge3/condabin:${PATH}
 ENV PIP_ROOT_USER_ACTION=ignore
