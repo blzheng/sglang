@@ -299,8 +299,7 @@ void fused_experts_fp_kernel_impl(
   const int64_t stride_n = packed_K;
 
   int64_t avg_M = std::max(int64_t(1), M * topk / E);
-  // const bool use_brgemm = can_use_brgemm<packed_t>(avg_M);
-  const bool use_brgemm = true;
+  const bool use_brgemm = can_use_brgemm<packed_t>(avg_M);
 
   int64_t B_tmp_offset_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * 2 * N * K;
   int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * 3 * N * K;
@@ -311,7 +310,6 @@ void fused_experts_fp_kernel_impl(
     int tid = get_thread_num();
     scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
     float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
-    
 
     loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
@@ -358,21 +356,13 @@ void fused_experts_fp_kernel_impl(
         }
       }
       if (act_func == CPUAcTMethod::swiglu) {
-        clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(
-            ic1 + offset * N,
-            C0,
-            m_size,
-            N,
-            alpha,
-            limit,
-            nb * (BLOCK_N / 2));
+        clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N, C0, m_size, N, alpha, limit, nb * (BLOCK_N / 2));
       } else if (act_func == CPUAcTMethod::silu_and_mul) {
         // copy C0 to ic0
         for (int64_t m = 0; m < m_size; ++m) {
           copy_stub(ic0 + (offset + m) * N * 2 + nb * BLOCK_N, C0 + m * BLOCK_N, n_size);
         }
       }
-
     });
 
     if (use_brgemm) {
@@ -439,7 +429,7 @@ void fused_experts_fp_kernel_impl(
           /*   brg          */ use_brgemm,
           /*   block_size_K */ block_size_K,
           /*   do_unpack    */ do_unpack);
-     
+
       if (with_bias) {
         const scalar_t* __restrict__ B_bias = w2_bias + expert_id * OC + nb * BLOCK_N;
         for (int64_t m = 0; m < m_size; ++m) {
