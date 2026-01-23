@@ -1,9 +1,11 @@
-import itertools
 import math
 import unittest
 
 # TODO: use interface in cpu.py
 import torch
+
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.test_utils import CustomTestCase
 from utils import (
     BLOCK_K,
     BLOCK_N,
@@ -11,6 +13,7 @@ from utils import (
     factor_for_scale,
     fp8_max,
     fp8_min,
+    parametrize,
     per_token_quant_int8,
     precision,
     scaled_weight,
@@ -18,23 +21,12 @@ from utils import (
     torch_w8a8_per_column_moe,
 )
 
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.test.test_utils import CustomTestCase
-
 torch.manual_seed(1234)
 
 
 class TestSharedExpert(CustomTestCase):
-    M = [2, 121]
-    N = [32, 32 * 4]
-    K = [32, 32 * 2]
-    routed_scaling_factor = [16]
-
-    M_fp8 = [2, 12]
-    N_fp8 = [512]
-    K_fp8 = [256]
-
-    def _bf16_shared_expert(self, m, n, k, routed_scaling_factor):
+    @parametrize(m=[2, 121], n=[32, 32 * 4], k=[32, 32 * 2], routed_scaling_factor=[16])
+    def test_bf16_shared_expert(self, m, n, k, routed_scaling_factor):
         dtype = torch.bfloat16
         prepack = True
 
@@ -74,22 +66,8 @@ class TestSharedExpert(CustomTestCase):
         atol = rtol = precision[ref.dtype]
         torch.testing.assert_close(ref, res, atol=atol, rtol=rtol)
 
-    def test_bf16_shared_expert(self):
-        for params in itertools.product(
-            self.M,
-            self.N,
-            self.K,
-            self.routed_scaling_factor,
-        ):
-            with self.subTest(
-                m=params[0],
-                n=params[1],
-                k=params[2],
-                routed_scaling_factor=params[3],
-            ):
-                self._bf16_shared_expert(*params)
-
-    def _int8_shared_expert(self, m, n, k, routed_scaling_factor):
+    @parametrize(m=[2, 121], n=[32, 32 * 4], k=[32, 32 * 2], routed_scaling_factor=[16])
+    def test_int8_shared_expert(self, m, n, k, routed_scaling_factor):
         dtype = torch.bfloat16
         prepack = True
 
@@ -132,22 +110,13 @@ class TestSharedExpert(CustomTestCase):
         atol = rtol = precision[ref2.dtype]
         torch.testing.assert_close(ref2, res2, atol=atol, rtol=rtol)
 
-    def test_int8_shared_expert(self):
-        for params in itertools.product(
-            self.M,
-            self.N,
-            self.K,
-            self.routed_scaling_factor,
-        ):
-            with self.subTest(
-                m=params[0],
-                n=params[1],
-                k=params[2],
-                routed_scaling_factor=params[3],
-            ):
-                self._int8_shared_expert(*params)
-
-    def _fp8_shared_expert(self, M, N, K, routed_scaling_factor):
+    @parametrize(
+        M=[2, 12],
+        N=[512],
+        K=[256],
+        routed_scaling_factor=[16],
+    )
+    def test_fp8_shared_expert(self, M, N, K, routed_scaling_factor):
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
         dtype = torch.bfloat16
@@ -203,21 +172,6 @@ class TestSharedExpert(CustomTestCase):
 
         atol = rtol = precision[ref_out.dtype]
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
-
-    def test_fp8_shared_expert(self):
-        for params in itertools.product(
-            self.M_fp8,
-            self.N_fp8,
-            self.K_fp8,
-            self.routed_scaling_factor,
-        ):
-            with self.subTest(
-                M=params[0],
-                N=params[1],
-                K=params[2],
-                routed_scaling_factor=params[3],
-            ):
-                self._fp8_shared_expert(*params)
 
 
 if __name__ == "__main__":
