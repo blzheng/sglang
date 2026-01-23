@@ -159,18 +159,19 @@ void shared_expert_int8_kernel_impl(
     int64_t N,
     int64_t K);
 
-template <typename scalar_t>
-void shared_expert_fp8_kernel_impl(
+// moe implementations for fp8 w8a16 and mxfp4
+template <typename scalar_t, typename packed_t, typename param_t, bool is_mxfp4>
+void shared_expert_fp_kernel_impl(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic0,
     scalar_t* __restrict__ ic1,
     scalar_t* __restrict__ B_tmp,
     float* __restrict__ C_tmp,
     const scalar_t* __restrict__ input,
-    const at::Float8_e4m3fn* __restrict__ packed_w1,
-    const at::Float8_e4m3fn* __restrict__ packed_w2,
-    const float* __restrict__ w1s,
-    const float* __restrict__ w2s,
+    const packed_t* __restrict__ packed_w1,
+    const packed_t* __restrict__ packed_w2,
+    const param_t* __restrict__ w1s,
+    const param_t* __restrict__ w2s,
     int64_t block_size_N,
     int64_t block_size_K,
     const scalar_t* __restrict__ fused_experts_out,
@@ -228,7 +229,6 @@ void tinygemm_kernel(
     int64_t block_size_K,
     bool do_unpack = true);
 
-    
 template <typename scalar_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
@@ -245,7 +245,6 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack = true);
-
 
 // mxfp4
 template <typename scalar_t>
