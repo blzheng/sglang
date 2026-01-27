@@ -1196,14 +1196,24 @@ at::Tensor fused_experts_cpu(
   int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
                                num_threads * BLOCK_M * K * (use_int8_w8a8 ? 1 : 2) +
                                num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
-
+  bool use_brgemm = false;
   if (use_int8_w8a8) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
-  if (use_fp8_w8a16 || use_mxfp4) {
-    buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * (3 * N * K) * 2;
+  if (use_fp8_w8a16) {
+    use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(std::max(int64_t(1), M * topk / E));
+    buffer_size_nbytes += M * topk * 2 * N * 2;
+    if (use_brgemm) {
+      buffer_size_nbytes += num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * (3 * N * K) * 2;
+    }
   }
-
+  if (use_mxfp4) {
+    use_brgemm = can_use_brgemm<uint8_t>(std::max(int64_t(1), M * topk / E));
+    buffer_size_nbytes += M * topk * 2 * N * 2;
+    if (use_brgemm) {
+      buffer_size_nbytes += num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * (3 * N * K) * 2;
+    }
+  }
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "fused_experts_kernel_impl", [&] {
@@ -1249,7 +1259,8 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
-      scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
+      scalar_t* __restrict__ B_tmp =
+          use_brgemm ? (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N)) : nullptr;
       bool with_bias = w1_bias.has_value();
       auto act_func = alpha.has_value() && limit.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::silu_and_mul;
 
@@ -1289,7 +1300,8 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
-      scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
+      scalar_t* __restrict__ B_tmp =
+          use_brgemm ? (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N)) : nullptr;
       bool with_bias = w1_bias.has_value();
       auto act_func = alpha.has_value() && limit.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::silu_and_mul;
 
