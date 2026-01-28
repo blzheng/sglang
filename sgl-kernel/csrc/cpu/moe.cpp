@@ -1189,30 +1189,18 @@ at::Tensor fused_experts_cpu(
   //   5. Aq_tmp : [M, K] or [M * topk, N]
   //   6. As_tmp : [M * topk]
   //
-  // for fp8 w8a16:
+  // for fp8 w8a16 and mxfp4:
   //   7. intermediate_cache0 : [M * topk, 2N]
-  //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, 2N * K + K * N]
+  //   8. B_tmp : [T, MAX_CACHE_BLOCK_SIZE, BLOCK_N, std::max(N, K)]
   //
   int64_t buffer_size_nbytes = M * topk * N * 2 + M * topk * K * 2 +
                                num_threads * BLOCK_M * K * (use_int8_w8a8 ? 1 : 2) +
                                num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
-  bool use_brgemm = false;
   if (use_int8_w8a8) {
     buffer_size_nbytes += std::max(M * K, M * topk * N) + M * topk * sizeof(float);
   }
-  if (use_fp8_w8a16) {
-    use_brgemm = can_use_brgemm<at::Float8_e4m3fn>(std::max(int64_t(1), M * topk / E));
-    buffer_size_nbytes += M * topk * 2 * N * 2;
-    if (use_brgemm) {
-      buffer_size_nbytes += num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * (3 * N * K) * 2;
-    }
-  }
-  if (use_mxfp4) {
-    use_brgemm = can_use_brgemm<uint8_t>(std::max(int64_t(1), M * topk / E));
-    buffer_size_nbytes += M * topk * 2 * N * 2;
-    if (use_brgemm) {
-      buffer_size_nbytes += num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * (3 * N * K) * 2;
-    }
+  if (use_fp8_w8a16 || use_mxfp4) {
+    buffer_size_nbytes += M * topk * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(N, K) * 2;
   }
   auto buffer2 = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
 
@@ -1259,8 +1247,7 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
-      scalar_t* __restrict__ B_tmp =
-          use_brgemm ? (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N)) : nullptr;
+      scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
       auto act_func = alpha.has_value() && limit.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::silu_and_mul;
 
@@ -1300,8 +1287,7 @@ at::Tensor fused_experts_cpu(
       scalar_t* __restrict__ A_tmp = (scalar_t*)((void*)(intermediate_cache2 + M * topk * K));
       float* __restrict__ C_tmp = (float*)((void*)(A_tmp + num_threads * BLOCK_M * K));
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
-      scalar_t* __restrict__ B_tmp =
-          use_brgemm ? (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N)) : nullptr;
+      scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * topk * 2 * N));
       bool with_bias = w1_bias.has_value();
       auto act_func = alpha.has_value() && limit.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::silu_and_mul;
 
@@ -1445,9 +1431,9 @@ at::Tensor shared_expert_cpu(
   //   3. Aq_tmp : [M, K] or [M, N]
   //   4. As_tmp : [M]
   //
-  // for fp8 w8a16:
+  // for fp8 w8a16 and mxfp4:
   //   5. intermediate_cache0 : [M, 2N]
-  //   6. B_tmp: [T, MAX_CACHE_BLOCK_SIZE, BLOCK_M, N * K + 2N * K]
+  //   6. B_tmp: [T, MAX_CACHE_BLOCK_SIZE, BLOCK_M, std::max(N, K)]
   //
   int num_threads = at::get_num_threads();
   int64_t buffer_size_nbytes = M * N * 2 + num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
@@ -1456,7 +1442,7 @@ at::Tensor shared_expert_cpu(
     buffer_size_nbytes += std::max(M * K, M * N) + M * sizeof(float);
   }
   if (use_fp8_w8a16 || use_mxfp4) {
-    buffer_size_nbytes += M * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_M * 3 * N * K * 2;
+    buffer_size_nbytes += M * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_M * std::max(N, K) * 2;
   }
 
   auto buffer = at::empty({buffer_size_nbytes}, hidden_states.options().dtype(at::kChar));
