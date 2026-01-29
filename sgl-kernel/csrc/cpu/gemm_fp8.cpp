@@ -43,6 +43,23 @@ inline void copy_add_stub(
   }
 }
 
+template <>
+inline void
+copy_add_stub(float* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = fVec::size();
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    fVec data = fVec::loadu(input + d) + fVec::loadu(bias + d);
+    data.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = input[d] + bias[d];
+  }
+}
+
 inline void unpack_B(
     at::BFloat16* __restrict__ Btmp,
     const at::Float8_e4m3fn* __restrict__ packed_B,
@@ -372,7 +389,6 @@ struct tinygemm_kernel_nn<at::BFloat16, uint8_t, uint8_t, has_bias, BLOCK_M, BLO
 };
 #endif
 
-
 template <typename scalar_t, typename packed_t, typename param_t, bool has_bias, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2 {
   static inline void apply(
@@ -601,15 +617,15 @@ struct tinygemm_kernel_nn2<at::BFloat16, uint8_t, uint8_t, has_bias, BLOCK_M, BL
 
 #define LAUNCH_TINYGEMM_KERNEL_NN2(MB_SIZE, NB_SIZE)                                   \
   tinygemm_kernel_nn2<scalar_t, packed_t, param_t, has_bias, MB_SIZE, NB_SIZE>::apply( \
-      A + mb_start * lda,                                                             \
-      B + nb_start * 2,                                                               \
-      C + mb_start * ldc + nb_start,                                                  \
-      has_bias ? bias + nb_start : nullptr,                                           \
-      scale,                                                                          \
-      K,                                                                              \
-      lda,                                                                            \
-      ldb,                                                                            \
-      ldc,                                                                            \
+      A + mb_start * lda,                                                              \
+      B + nb_start * 2,                                                                \
+      C + mb_start * ldc + nb_start,                                                   \
+      has_bias ? bias + nb_start : nullptr,                                            \
+      scale,                                                                           \
+      K,                                                                               \
+      lda,                                                                             \
+      ldb,                                                                             \
+      ldc,                                                                             \
       block_size_K);
 
 template <typename scalar_t, typename packed_t, typename param_t, bool has_bias>
@@ -719,8 +735,6 @@ struct brgemm<at::BFloat16, uint8_t, uint8_t, has_bias> {
   }
 };
 
-
-
 template <typename scalar_t, typename packed_t, typename param_t, bool has_bias>
 struct brgemm2 {
   static inline void apply(
@@ -772,6 +786,11 @@ struct brgemm2<at::BFloat16, at::Float8_e4m3fn, float, has_bias> {
     }
 
     at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, C);
+    if constexpr (has_bias) {
+      for (int m = 0; m < M; ++m) {
+        copy_add_stub(C + m * ldc, C + m * ldc, bias, N);
+      }
+    }
   }
 };
 
@@ -804,7 +823,11 @@ struct brgemm2<at::BFloat16, uint8_t, uint8_t, has_bias> {
     }
 
     at::native::cpublas::brgemm(M, N, K, lda, ldb_tmp, BLOCK_N, /* add_C */ false, A, Btmp, C);
-
+    if constexpr (has_bias) {
+      for (int m = 0; m < M; ++m) {
+        copy_add_stub(C + m * ldc, C + m * ldc, bias, N);
+      }
+    }
   }
 };
 
@@ -862,7 +885,6 @@ void tinygemm_kernel(
     }
   }
 }
-
 
 template <typename scalar_t, typename packed_t, typename param_t, bool has_bias>
 void tinygemm_kernel(
@@ -1007,6 +1029,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     const float* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -1017,6 +1040,11 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, true>(
+        A, B, C, Btmp, Ctmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
   tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, false>(
       A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
@@ -1028,6 +1056,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     const uint8_t* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -1038,10 +1067,14 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, uint8_t, uint8_t, true>(
+        A, B, C, Btmp, Ctmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
   tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
       A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
-
 
 // tinygemm interface
 template <typename scalar_t>
@@ -1050,6 +1083,7 @@ void tinygemm_kernel(
     const at::Float8_e4m3fn* __restrict__ B,
     float* __restrict__ C,
     scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
     const float* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -1060,6 +1094,11 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, true>(
+        A, B, C, Btmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
   tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, false>(
       A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
@@ -1070,6 +1109,7 @@ void tinygemm_kernel(
     const uint8_t* __restrict__ B,
     float* __restrict__ C,
     scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
     const uint8_t* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -1080,6 +1120,11 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, uint8_t, uint8_t, true>(
+        A, B, C, Btmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
   tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
       A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
@@ -1091,6 +1136,7 @@ void tinygemm_kernel(
       TYPE_A* __restrict__ C,                                 \
       TYPE_A* __restrict__ Btmp,                              \
       float* __restrict__ Ctmp,                               \
+      const float* __restrict__ Bbias,                        \
       const TYPE_S* __restrict__ scale,                       \
       int64_t M,                                              \
       int64_t N,                                              \
@@ -1103,20 +1149,21 @@ void tinygemm_kernel(
       bool do_unpack)
 
 #define INSTANTIATE_TINYGEMM_TEMPLATE2(TYPE_A, TYPE_B, TYPE_S) \
-  template void tinygemm_kernel<TYPE_A>(                      \
-      const TYPE_A* __restrict__ A,                           \
-      const TYPE_B* __restrict__ B,                           \
-      float* __restrict__ C,                                 \
-      TYPE_A* __restrict__ Btmp,                              \
-      const TYPE_S* __restrict__ scale,                       \
-      int64_t M,                                              \
-      int64_t N,                                              \
-      int64_t K,                                              \
-      int64_t lda,                                            \
-      int64_t ldb,                                            \
-      int64_t ldc,                                            \
-      bool brg,                                               \
-      int64_t block_size_K,                                   \
+  template void tinygemm_kernel<TYPE_A>(                       \
+      const TYPE_A* __restrict__ A,                            \
+      const TYPE_B* __restrict__ B,                            \
+      float* __restrict__ C,                                   \
+      TYPE_A* __restrict__ Btmp,                               \
+      const float* __restrict__ Bbias,                         \
+      const TYPE_S* __restrict__ scale,                        \
+      int64_t M,                                               \
+      int64_t N,                                               \
+      int64_t K,                                               \
+      int64_t lda,                                             \
+      int64_t ldb,                                             \
+      int64_t ldc,                                             \
+      bool brg,                                                \
+      int64_t block_size_K,                                    \
       bool do_unpack)
 
 INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float);

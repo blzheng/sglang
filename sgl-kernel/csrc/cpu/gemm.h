@@ -119,8 +119,8 @@ void fused_experts_fp_kernel_impl(
     const scalar_t* __restrict__ input,
     const packed_t* __restrict__ packed_w1,
     const packed_t* __restrict__ packed_w2,
-    const scalar_t* __restrict__ w1_bias,
-    const scalar_t* __restrict__ w2_bias,
+    const float* __restrict__ w1_bias,
+    const float* __restrict__ w2_bias,
     const param_t* __restrict__ w1s,
     const param_t* __restrict__ w2s,
     int64_t block_size_N,
@@ -217,6 +217,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     const float* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -228,13 +229,13 @@ void tinygemm_kernel(
     int64_t block_size_K,
     bool do_unpack = true);
 
-    
 template <typename scalar_t>
 void tinygemm_kernel(
     const scalar_t* __restrict__ A,
     const at::Float8_e4m3fn* __restrict__ B,
     float* __restrict__ C,
     scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
     const float* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -245,7 +246,6 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack = true);
-
 
 // mxfp4
 template <typename scalar_t>
@@ -255,6 +255,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     const uint8_t* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -272,6 +273,7 @@ void tinygemm_kernel(
     const uint8_t* __restrict__ B,
     float* __restrict__ C,
     scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
     const uint8_t* __restrict__ scale,
     int64_t M,
     int64_t N,
