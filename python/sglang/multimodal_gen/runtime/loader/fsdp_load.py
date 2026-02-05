@@ -32,6 +32,8 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
+from sglang.srt.model_loader.loader import device_loading_context
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 
 logger = init_logger(__name__)
 
@@ -149,6 +151,17 @@ def maybe_load_fsdp_model(
         # Avoid unintended computation graph accumulation during inference
         if isinstance(p, torch.nn.Parameter):
             p.requires_grad = False
+    local_torch_device = get_local_torch_device()
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None:
+            # When quant methods need to process weights after loading
+            # (for repacking, quantizing, etc), they expect parameters
+            # to be on the global target device. This scope is for the
+            # case where cpu offloading is used, where we will move the
+            # parameters onto device for processing and back off after.
+            with device_loading_context(module, local_torch_device):
+                quant_method.process_weights_after_loading(module)
     return model
 
 

@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
+from sglang.srt.model_loader.loader import device_loading_context
 
 logger = init_logger(__name__)
 
@@ -479,6 +480,16 @@ class TextEncoderLoader(ComponentLoader):
             loaded_weights = model.load_weights(
                 self._get_all_weights(model, model_path, to_cpu=should_offload)
             )
+            for _, module in model.named_modules():
+                quant_method = getattr(module, "quant_method", None)
+                if quant_method is not None:
+                    # When quant methods need to process weights after loading
+                    # (for repacking, quantizing, etc), they expect parameters
+                    # to be on the global target device. This scope is for the
+                    # case where cpu offloading is used, where we will move the
+                    # parameters onto device for processing and back off after.
+                    with device_loading_context(module, local_torch_device):
+                        quant_method.process_weights_after_loading(module)
 
             # Explicitly move model to target device after loading weights
             model = model.to(local_torch_device)

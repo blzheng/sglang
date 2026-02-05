@@ -57,6 +57,13 @@ def _amx_process_weight_after_loading(
             )
             module.use_intel_amx_backend = False
             return
+        if weight_tensor.dtype not in [torch.bfloat16, torch.float16, torch.int8, torch.float8_e4m3fn]:
+            logger.warning(
+                f"Unsupported dtype for prepacking for weight '{weight_name}' with dtype {weight_tensor.dtype} in {module}. "
+                f"Only bfloat16, float16, int8 and fp8_e4m3fn are supported. "
+            )
+            module.use_intel_amx_backend = False
+            return
 
         packed_weight = torch.nn.Parameter(
             amx_process_weight_after_loading(weight_tensor),

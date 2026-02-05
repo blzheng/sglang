@@ -43,11 +43,14 @@ class SGLDiffusionProfiler:
         if torch.cuda.is_available():
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
+        def trace_handler(prof):
+            print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=-1))
         common_torch_profiler_args = dict(
             activities=activities,
             record_shapes=True,
             with_stack=True,
-            on_trace_ready=None,
+            # on_trace_ready=None,
+            on_trace_ready=trace_handler,
         )
         if self.full_profile:
             # profile all stages
