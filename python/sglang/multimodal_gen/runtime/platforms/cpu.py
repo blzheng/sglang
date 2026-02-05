@@ -18,6 +18,12 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 )
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+)
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 logger = init_logger(__name__)
 
 class CpuPlatform(Platform):
@@ -93,6 +99,11 @@ class CpuPlatform(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
+        if _is_cpu and _is_cpu_amx_available:
+            logger.info("Using AMX Attention backend for CPU.")
+            return (
+                "sglang.multimodal_gen.runtime.layers.attention.backends.amx_attn.AMXAttentionBackend"
+            )
         # CPU supports SDPA (Scaled Dot-Product Attention) which is the most compatible
         logger.info("Using Torch SDPA backend for CPU.")
         return (

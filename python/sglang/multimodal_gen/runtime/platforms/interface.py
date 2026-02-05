@@ -34,6 +34,7 @@ class AttentionBackendEnum(enum.Enum):
     VMOBA_ATTN = enum.auto()
     AITER = enum.auto()
     NO_ATTENTION = enum.auto()
+    AMX_ATTN = enum.auto()
 
     def __str__(self):
         return self.name.lower()
