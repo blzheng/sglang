@@ -31,7 +31,6 @@ from sglang.srt.configs.qwen3_omni import (
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -47,7 +46,7 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, is_cpu, logger, cpu_has_amx_support
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu, logger
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -68,21 +67,14 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         if _is_cpu and hasattr(config, "original_encoder_attention_heads"):
             head_size = embed_dim // config.original_encoder_attention_heads
             projection_size = config.encoder_attention_heads * head_size
-        qkv_backend = "fa3"
-        if _is_cpu and _is_cpu_amx_available:
-            qkv_backend = "amx_attn"
-        elif _is_cpu:
-            qkv_backend = "sdpa"
+
         self.self_attn = VisionAttention(
             embed_dim=embed_dim,
             num_heads=config.encoder_attention_heads,
             head_dim=head_size,
             projection_size=projection_size,
             use_qkv_parallel=True,
-            rotary_embed="normal",
             proj_bias=True,
-            qkv_backend=qkv_backend,
-            softmax_in_single_precision=False,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -309,6 +301,9 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         cu_seqlens = torch.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(
             -1, dtype=torch.int32
         )
+        # cu_seqlens must be on cpu because of npu_flash_attention_unpad operator restriction
+        if is_npu():
+            cu_seqlens = cu_seqlens.to("cpu")
 
         for encoder_layer in self.layers:
             layer_outputs = encoder_layer(
@@ -348,7 +343,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.use_postshuffle_norm = use_postshuffle_norm
-        self.ln_q = RMSNorm(
+        self.ln_q = nn.LayerNorm(
             self.hidden_size if use_postshuffle_norm else context_dim, eps=1e-6
         )
         self.mlp = nn.ModuleList(
@@ -645,7 +640,10 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                             and name_mapped not in params_dict
                         ):
                             continue
-                        param = params_dict[name_mapped]
+                        if name_mapped in params_dict.keys():
+                            param = params_dict[name_mapped]
+                        else:
+                            continue
                         # We should ask the weight loader to return success or
                         # not here since otherwise we may skip experts with
                         # # other available replicas.

@@ -189,7 +189,7 @@ def register_fake_ops():
         cos_sin_cache,
         mrope_section,
         mrope_interleaved,
-        is_neox
+        is_neox,
     ):
         return query, key
 
@@ -619,7 +619,10 @@ class CPUGraphRunner:
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
-        if self.model_runner.spec_algorithm.is_eagle():
+        if (
+            self.model_runner.spec_algorithm.is_eagle()
+            or self.model_runner.spec_algorithm.is_standalone()
+        ):
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:
