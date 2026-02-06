@@ -41,7 +41,14 @@ def get_moe_padding_size(weight_block_size):
     return DEFAULT_MOE_PADDING_SIZE
 
 
-def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
+def get_num_heads_padding_size(tp_size, weight_block_size, head_dim=None):
+    if head_dim is None:
+        pad_size = (
+            tp_size * 2
+            if tp_size % 2 == 1 and weight_block_size is not None
+            else tp_size
+        )
+        return pad_size
     pad_size = tp_size
 
     if weight_block_size is not None and head_dim % weight_block_size[0] != 0:
@@ -208,13 +215,6 @@ def adjust_config_with_unaligned_cpu_tp(
                 "qwen3_omni_moe_vision_encoder",
                 "num_heads",
             ]
-        )
-    if (
-        hasattr(model_config.hf_config, "vision_config")
-        and model_config.hf_config.vision_config.model_type == "siglip_vision_model"
-    ):
-        model_config.hf_config.vision_config.original_num_attention_heads = (
-            model_config.num_attention_heads
         )
         multimodal_config.append(
             [
