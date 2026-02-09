@@ -244,6 +244,7 @@ void fused_experts_fp_kernel_impl(
     int tid = get_thread_num();
     scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
     float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+    bool is_brgemm_used = use_brgemm;
 
     loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
@@ -261,6 +262,11 @@ void fused_experts_fp_kernel_impl(
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
+      const bool use_brgemm2 = can_use_brgemm<packed_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm2;
+      if (!use_brgemm && use_brgemm2) {
+        do_unpack = true;
+      }
 
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m] / topk;
@@ -282,12 +288,12 @@ void fused_experts_fp_kernel_impl(
           /*   lda          */ K,
           /*   ldb          */ n_size,
           /*   ldc          */ 2 * N,
-          /*   brg          */ use_brgemm,
+          /*   brg          */ is_brgemm_used,
           /*   block_size_K */ block_size_K,
           /*   do_unpack    */ do_unpack);
     });
 
-    if (use_brgemm) {
+    if (is_brgemm_used) {
       at::native::cpublas::brgemm_release();
     }
   });
@@ -324,6 +330,7 @@ void fused_experts_fp_kernel_impl(
     int tid = get_thread_num();
     alignas(64) scalar_t C[BLOCK_M * BLOCK_K];
 
+    bool is_brgemm_used = use_brgemm;
     loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
@@ -343,6 +350,11 @@ void fused_experts_fp_kernel_impl(
       // do unpacking for the first row or a new expert
       int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
       bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
+      const bool use_brgemm2 = can_use_brgemm<packed_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm2;
+      if(!use_brgemm && use_brgemm2) {
+        do_unpack = true;
+      }
 
       tinygemm_kernel<scalar_t>(
           /*   A            */ A,
@@ -358,7 +370,7 @@ void fused_experts_fp_kernel_impl(
           /*   lda          */ IC,
           /*   ldb          */ n_size,
           /*   ldc          */ BLOCK_N,
-          /*   brg          */ use_brgemm,
+          /*   brg          */ is_brgemm_used,
           /*   block_size_K */ block_size_K,
           /*   do_unpack    */ do_unpack);
 
@@ -371,7 +383,7 @@ void fused_experts_fp_kernel_impl(
       }
     });
 
-    if (use_brgemm) {
+    if (is_brgemm_used) {
       at::native::cpublas::brgemm_release();
     }
   });
