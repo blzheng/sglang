@@ -259,8 +259,6 @@ void fused_experts_fp_kernel_impl(
       int32_t pre_expert_id = mb == 0 ? -1 : expert_ids[mb - 1];
       bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
 
-      // 1.a load A
-      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       const bool use_brgemm2 = can_use_brgemm<packed_t>(m_size);
       is_brgemm_used = is_brgemm_used || use_brgemm2;
@@ -268,9 +266,13 @@ void fused_experts_fp_kernel_impl(
         do_unpack = true;
       }
 
-      for (int64_t m = 0; m < m_size; ++m) {
-        int32_t index = A_ids[m] / topk;
-        copy_stub(A + m * K, input + index * K, K);
+      // 1.a load A
+      if (nb_offset == 0) {
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, input + index * K, K);
+        }
       }
 
       const int64_t offset = offsets[mb];
