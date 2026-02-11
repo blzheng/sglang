@@ -684,13 +684,15 @@ void fused_experts_kernel_impl(
       const scalar_t* __restrict__ B0_bias = w1_bias + expert_id * 2 * N + nb_upper * BLOCK_N;
       const scalar_t* __restrict__ B1_bias = w1_bias + expert_id * 2 * N + nb_lower * BLOCK_N;
 
-      // 1.a load A
-      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
 
-      for (int64_t m = 0; m < m_size; ++m) {
-        int32_t index = A_ids[m] / topk;
-        copy_stub(A + m * K, input + index * K, K);
+      // 1.a load A
+      if (nb_offset == 0) {
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, input + index * K, K);
+        }
       }
 
       if (use_brgemm) {
