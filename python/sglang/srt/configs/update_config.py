@@ -95,7 +95,13 @@ def adjust_tp_num_heads_if_necessary(model_config, tp_size, is_post_update):
 
 def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
     attr_value = intermediate_padding_size
-    if hasattr(model_config, "hf_config") and hasattr(
+    if (
+        hasattr(model_config, "hf_config")
+        and hasattr(model_config.hf_config, "text_config")
+        and hasattr(model_config.hf_config.text_config, attr_name)
+    ):
+        attr_value = getattr(model_config.hf_config.text_config, attr_name)
+    elif hasattr(model_config, "hf_config") and hasattr(
         model_config.hf_config, attr_name
     ):
         attr_value = getattr(model_config.hf_config, attr_name)
@@ -110,6 +116,8 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
             setattr(model_config.hf_config, attr_name, attr_value)
             if hasattr(model_config, "hf_text_config"):
                 setattr(model_config.hf_text_config, attr_name, attr_value)
+            if hasattr(model_config.hf_config, "text_config"):
+                setattr(model_config.hf_config.text_config, attr_name, attr_value)
         else:
             setattr(model_config, attr_name, attr_value)
 
@@ -177,6 +185,10 @@ def adjust_config_with_unaligned_cpu_tp(
         model_config.hf_text_config.num_attention_heads = num_attention_heads
 
     adjust_tp_num_heads_if_necessary(model_config.hf_config, tp_size, True)
+    if hasattr(model_config.hf_config, "text_config"):
+        adjust_tp_num_heads_if_necessary(
+            model_config.hf_config.text_config, tp_size, True
+        )
 
     intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
     model_config = update_intermediate_size(
@@ -200,6 +212,8 @@ def adjust_config_with_unaligned_cpu_tp(
         ],
         [model_config.hf_config, "vision_config", "qwen3_vl_moe", "num_heads"],
         [model_config.hf_config, "vision_config", "qwen3_vl", "num_heads"],
+        [model_config.hf_config, "vision_config", "qwen3_5_moe", "num_heads"],
+        [model_config.hf_config, "vision_config", "qwen3_5", "num_heads"],
     ]
     if hasattr(model_config.hf_config, "thinker_config"):
         multimodal_config.append(

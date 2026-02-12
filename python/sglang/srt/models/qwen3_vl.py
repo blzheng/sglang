@@ -181,7 +181,7 @@ class Qwen3_VisionBlock(nn.Module):
             embed_dim=dim,
             num_heads=num_heads,
             head_size=head_size,
-            projection_size=dim,
+            projection_size=num_heads * head_size,
             use_qkv_parallel=True,
             proj_bias=True,
             flatten_batch=True,
@@ -231,6 +231,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self,
         dim: int,
         context_dim: int,
+        padded_context_dim: int,
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
         spatial_merge_size: int = 2,
         use_postshuffle_norm: bool = False,
@@ -240,6 +241,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = context_dim * (spatial_merge_size**2)
+        self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
 
         self.use_postshuffle_norm = use_postshuffle_norm
 
@@ -252,7 +254,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.linear_fc1 = ColumnParallelLinear(
             self.hidden_size,
-            self.hidden_size,
+            self.padded_context_dim,
             bias=True,
             quant_config=quant_config,
             prefix=add_prefix("linear_fc1", prefix),
@@ -261,7 +263,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         )
         self.act_fn = nn.GELU()
         self.linear_fc2 = RowParallelLinear(
-            self.hidden_size,
+            self.padded_context_dim,
             dim,
             bias=True,
             quant_config=quant_config,
@@ -357,6 +359,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         self.merger = Qwen3VLMoeVisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
+            padded_context_dim=self.num_heads * head_dim,
             norm_layer=norm_layer,
             spatial_merge_size=self.spatial_merge_size,
             quant_config=quant_config,
@@ -369,6 +372,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 Qwen3VLMoeVisionPatchMerger(
                     dim=vision_config.out_hidden_size,
                     context_dim=self.hidden_size,
+                    padded_context_dim=self.num_heads * head_dim,
                     spatial_merge_size=self.spatial_merge_size,
                     use_postshuffle_norm=True,
                     norm_layer=norm_layer,
