@@ -31,7 +31,11 @@ from sglang.srt.configs.qwen3_omni import (
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeConfig
 from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
@@ -42,7 +46,10 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3VLMoeForConditionalGeneration,
     load_fused_expert_weights,
 )
-from sglang.srt.utils import add_prefix, is_npu, logger
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu, is_npu, logger
+
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
@@ -55,12 +62,25 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         super().__init__()
         embed_dim = config.d_model
         self.embed_dim = config.d_model
+        head_size = None
+        projection_size = embed_dim
+        if _is_cpu and hasattr(config, "original_encoder_attention_heads"):
+            head_size = embed_dim // config.original_encoder_attention_heads
+            projection_size = config.encoder_attention_heads * head_size
+        qkv_backend = "fa3"
+        if _is_cpu and _is_cpu_amx_available:
+            qkv_backend = "amx_attn"
+        elif _is_cpu:
+            qkv_backend = "sdpa"
         self.self_attn = VisionAttention(
             embed_dim=embed_dim,
             num_heads=config.encoder_attention_heads,
-            projection_size=embed_dim,
+            head_dim=head_size,
+            projection_size=projection_size,
             use_qkv_parallel=True,
             proj_bias=True,
+            qkv_backend=qkv_backend,
+            softmax_in_single_precision=False,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -69,8 +89,12 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
-        self.fc1 = nn.Linear(self.embed_dim, config.encoder_ffn_dim)
-        self.fc2 = nn.Linear(config.encoder_ffn_dim, self.embed_dim)
+        self.fc1 = ReplicatedLinear(
+            self.embed_dim, config.encoder_ffn_dim, quant_config=quant_config
+        )
+        self.fc2 = ReplicatedLinear(
+            config.encoder_ffn_dim, self.embed_dim, quant_config=quant_config
+        )
         self.final_layer_norm = nn.LayerNorm(self.embed_dim)
 
     def forward(
@@ -97,9 +121,9 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.fc1(hidden_states)[0]
         hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states = self.fc2(hidden_states)[0]
         hidden_states = residual + hidden_states
 
         if hidden_states.dtype == torch.float16:
@@ -151,7 +175,7 @@ def _get_feat_extract_output_lengths(input_lengths):
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
-    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig):
+    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig, quant_config=None):
         super().__init__(config)
         self.dropout = config.dropout
 
@@ -186,15 +210,20 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             2,
             padding=1,
         )
-        self.conv_out = nn.Linear(
+        self.conv_out = ReplicatedLinear(
             config.downsample_hidden_size
             * ((((config.num_mel_bins + 1) // 2 + 1) // 2 + 1) // 2),
             config.d_model,
             bias=False,
+            quant_config=quant_config,
         )
-        self.proj1 = nn.Linear(config.d_model, config.d_model)
+        self.proj1 = ReplicatedLinear(
+            config.d_model, config.d_model, quant_config=quant_config
+        )
         self.act = ACT2FN[config.activation_function]
-        self.proj2 = nn.Linear(config.d_model, config.output_dim)
+        self.proj2 = ReplicatedLinear(
+            config.d_model, config.output_dim, quant_config=quant_config
+        )
         self.n_window_infer = self.config.n_window_infer
         self.conv_chunksize = self.config.conv_chunksize
 
@@ -257,7 +286,7 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         b, c, f, t = padded_embed.size()
         padded_embed = self.conv_out(
             padded_embed.permute(0, 3, 1, 2).contiguous().view(b, t, c * f)
-        )
+        )[0]
 
         positional_embedding = (
             self.positional_embedding.positional_embedding[: padded_embed.shape[1], :]
@@ -291,9 +320,9 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             hidden_states = layer_outputs[0]
 
         hidden_states = self.ln_post(hidden_states)
-        hidden_states = self.proj1(hidden_states)
+        hidden_states = self.proj1(hidden_states)[0]
         hidden_states = self.act(hidden_states)
-        hidden_states = self.proj2(hidden_states)
+        hidden_states = self.proj2(hidden_states)[0]
         return BaseModelOutput(last_hidden_state=hidden_states)
 
     # Ignore copy
@@ -425,7 +454,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
         super().__init__(
             config, quant_config, prefix, language_model_cls=Qwen3MoeLLMModel
         )
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config)
+        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config, quant_config)
         self.visual = Qwen3OmniMoeVisionEncoder(
             config.vision_config,
             quant_config=quant_config,

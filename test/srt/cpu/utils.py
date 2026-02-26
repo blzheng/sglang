@@ -29,6 +29,19 @@ def parametrize(**params):
     return decorator
 
 
+def parametrize(**params):
+    def decorator(func):
+        def wrapper(self):
+            for combo in itertools.product(*params.values()):
+                kwargs = dict(zip(params.keys(), combo))
+                with self.subTest(**kwargs):
+                    func(self, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 def SiluAndMul(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1] // 2
     return F.silu(x[..., :d]) * x[..., d:]
