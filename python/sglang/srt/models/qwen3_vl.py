@@ -70,6 +70,7 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cpu,
     is_npu,
+    use_intel_amx_backend,
 )
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
@@ -119,9 +120,21 @@ class Qwen3_VisionMLP(nn.Module):
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor):
-        if self.linear_fc2.tp_size == 1 and _is_cpu and _is_cpu_amx_available:
+        if (
+            self.linear_fc2.tp_size == 1
+            and use_intel_amx_backend(self.linear_fc1)
+            and use_intel_amx_backend(self.linear_fc2)
+        ):
             x_shape = x.shape
-            out = torch.ops.sgl_kernel.fused_linear_gelu_linear(x.view(-1, x.shape[-1]), self.linear_fc1.weight, self.linear_fc2.weight, self.linear_fc1.bias, self.linear_fc2.bias, True, True)
+            out = torch.ops.sgl_kernel.fused_linear_gelu_linear(
+                x.view(-1, x.shape[-1]),
+                self.linear_fc1.weight,
+                self.linear_fc2.weight,
+                self.linear_fc1.bias,
+                self.linear_fc2.bias,
+                True,
+                True,
+            )
             mlp_output = out.view(x_shape[0], x_shape[1], -1)
         else:
             x_fc1, _ = self.linear_fc1(x)
