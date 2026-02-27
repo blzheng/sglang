@@ -32,6 +32,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.layers.conv import Conv3d
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -63,13 +64,22 @@ from sglang.srt.models.utils import (
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.vit_cuda_graph_runner import ViTCudaGraphRunner
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_int_env_var, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    get_int_env_var,
+    is_cpu,
+    is_npu,
+    use_intel_amx_backend,
+)
 from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
 
 # === Vision Encoder === #
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 
 class Qwen3_VisionMLP(nn.Module):
@@ -110,8 +120,25 @@ class Qwen3_VisionMLP(nn.Module):
         self.act = ACT2FN[hidden_act]
 
     def forward(self, x: torch.Tensor):
-        x_fc1, _ = self.linear_fc1(x)
-        mlp_output, _ = self.linear_fc2(self.act(x_fc1))
+        if (
+            self.linear_fc2.tp_size == 1
+            and use_intel_amx_backend(self.linear_fc1)
+            and use_intel_amx_backend(self.linear_fc2)
+        ):
+            x_shape = x.shape
+            out = torch.ops.sgl_kernel.fused_linear_gelu_linear(
+                x.view(-1, x.shape[-1]),
+                self.linear_fc1.weight,
+                self.linear_fc2.weight,
+                self.linear_fc1.bias,
+                self.linear_fc2.bias,
+                True,
+                True,
+            )
+            mlp_output = out.view(x_shape[0], x_shape[1], -1)
+        else:
+            x_fc1, _ = self.linear_fc1(x)
+            mlp_output, _ = self.linear_fc2(self.act(x_fc1))
         return mlp_output
 
 
@@ -124,7 +151,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         self.embed_dim = config.hidden_size
 
         kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
-        self.proj = nn.Conv3d(
+        self.proj = Conv3d(
             self.in_channels,
             self.embed_dim,
             kernel_size=kernel_size,
@@ -155,6 +182,7 @@ class Qwen3_VisionBlock(nn.Module):
         num_heads: int,
         intermediate_dim: int,
         hidden_act="silu",
+        head_size: Optional[int] = None,
         norm_layer: Optional[Callable[[int], nn.Module]] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -313,8 +341,16 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         else:
             self.pos_embed = PPMissingLayer()
 
-        norm_layer = partial(nn.LayerNorm, eps=norm_eps)
-        head_dim = self.hidden_size // self.num_heads
+        if _is_cpu and hasattr(vision_config, "original_num_heads"):
+            head_dim = self.hidden_size // vision_config.original_num_heads
+        else:
+            head_dim = self.hidden_size // self.num_heads
+        if _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.layernorm import LayerNorm
+
+            norm_layer = partial(LayerNorm, eps=norm_eps, dtype=self.dtype)
+        else:
+            norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.rotary_pos_emb = get_rope(
             head_size=head_dim,
             rotary_dim=head_dim // 2,
@@ -322,12 +358,12 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             base=10000.0,
             is_neox_style=True,
         )
-
         self.blocks = nn.ModuleList(
             [
                 Qwen3_VisionBlock(
                     dim=self.hidden_size,
                     num_heads=self.num_heads,
+                    head_size=head_dim,
                     intermediate_dim=vision_config.intermediate_size,
                     hidden_act=vision_config.hidden_act,
                     norm_layer=norm_layer,
@@ -958,7 +994,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             layer_id = get_layer_id(name)
 
-            if self.pp_group.is_last_rank and "model.embed_tokens.weight" in name:
+            # port fix from main https://github.com/sgl-project/sglang/pull/18024
+            # Only copy embed_tokens to lm_head when tie_word_embeddings=True
+            # For models with tie_word_embeddings=False (e.g. 8B), lm_head has independent weights
+            if (
+                self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+                and self.config.tie_word_embeddings
+            ):
                 if "lm_head.weight" in params_dict:
                     lm_head_param = params_dict["lm_head.weight"]
                     weight_loader = getattr(

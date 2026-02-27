@@ -16,9 +16,11 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     get_bool_env_var,
     get_device_capability,
     is_blackwell,
+    is_cpu,
     is_cuda,
     is_hip,
     is_npu,
@@ -32,9 +34,13 @@ from sglang.srt.utils.multi_stream_utils import (
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_cuda:
     from sgl_kernel.flash_attn import flash_attn_varlen_func
+if _is_cpu and _is_cpu_amx_available:
+    flash_attn_varlen_func = torch.ops.sgl_kernel.flash_attn_varlen_func
 
 if _is_npu:
     import torch_npu
@@ -222,7 +228,7 @@ class VisionSdpaAttention(nn.Module):
         s = q.shape[0] // bsz
 
         # [b, 1, s, s]
-        if attention_mask is None:
+        if attention_mask is None and not (_is_cpu and _is_cpu_amx_available):
             attention_mask = self.generate_patch_attention_mask(
                 s, cu_seqlens, flatten_batch=self.flatten_batch
             )
@@ -252,8 +258,21 @@ class VisionSdpaAttention(nn.Module):
             )
             output = torch.matmul(attn_weights, v)
             del attn_weights, v
+        elif _is_cpu and _is_cpu_amx_available and cu_seqlens is not None:
+            starts = cu_seqlens[:-1].tolist()
+            ends = cu_seqlens[1:].tolist()
+            output = torch.empty_like(q)
+            for start, end in zip(starts, ends):
+                output[:, :, start:end, :] = F.scaled_dot_product_attention(
+                    q[:, :, start:end, :],
+                    k[:, :, start:end, :],
+                    v[:, :, start:end, :],
+                    is_causal=False,
+                )
         else:
             # SDPA
+            if attention_mask.dim() == 3:
+                attention_mask = attention_mask.squeeze(0)  # [s, s]
             # [b, h, s, head_size]
             output = F.scaled_dot_product_attention(
                 q,
@@ -444,6 +463,60 @@ class VisionAiterAttention(nn.Module):
         )
 
 
+class VisionAMXAttention(nn.Module):
+    def __init__(
+        self,
+        **kwargs,
+    ):
+        if not _is_cpu or not _is_cpu_amx_available:
+            raise Exception(
+                "VisionAMXAttention is only available for cpu with amx support"
+            )
+        super().__init__()
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: Optional[Union[SingletonCache, torch.Tensor]],
+        bsz: int,
+        seq_len: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        r"""
+        Args:
+            cu_seqlens: [b]
+        Returns:
+             [b * s, h, head_size]
+        """
+        if cu_seqlens is None:
+            cu_seqlens = _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+        elif isinstance(cu_seqlens, SingletonCache):
+            if cu_seqlens.empty():
+                cu_seqlens.set_data(
+                    _get_cu_seqlens_for_shape(bsz, seq_len, device=q.device)
+                )
+            cu_seqlens = cu_seqlens.get_data()
+
+        cu_seqlens = cu_seqlens.to(dtype=torch.int32).to(q.device)
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        max_seqlen = seq_lens.max().item()
+
+        output = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=False,
+        )
+
+        return output
+
+
 class VisionAscendAttention(nn.Module):
 
     def __init__(
@@ -501,6 +574,7 @@ QKV_BACKEND_IMPL = {
     "fa3": VisionFlash3Attention,
     "ascend_attn": VisionAscendAttention,
     "aiter_attn": VisionAiterAttention,
+    "amx_attn": VisionAMXAttention,
 }
 
 
@@ -523,6 +597,7 @@ class VisionAttention(nn.Module):
         num_heads: int,
         projection_size: int,
         use_qkv_parallel: bool,
+        head_size: Optional[int] = None,
         qkv_backend: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         dropout: float = 0.0,
@@ -545,7 +620,10 @@ class VisionAttention(nn.Module):
         self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
         self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.dropout = dropout
-        self.head_size = embed_dim // num_heads
+        if head_size is not None:
+            self.head_size = head_size
+        else:
+            self.head_size = embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )
@@ -669,6 +747,8 @@ class VisionAttention(nn.Module):
                 backend = "aiter_attn"
             else:
                 backend = "triton_attn"
+        elif _is_cpu and _is_cpu_amx_available:
+            backend = "amx_attn"
         else:
             backend = "sdpa"
         if backend == "fa3" and is_blackwell():
@@ -755,9 +835,9 @@ class VisionAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             # [b, s, embed_dim] --> [b * s, head, head_size]
-            q = q.reshape(bsz * s, head, -1).contiguous()
-            k = k.reshape(bsz * s, kv_head, -1).contiguous()
-            v = v.reshape(bsz * s, kv_head, -1).contiguous()
+            q = q.reshape(bsz * s, head, -1)
+            k = k.reshape(bsz * s, kv_head, -1)
+            v = v.reshape(bsz * s, kv_head, -1)
         else:
             # [b, s, embed_dim] --> [s, b, embed_dim]
             x = rearrange(x, "b s ... -> s b ...")
@@ -775,9 +855,7 @@ class VisionAttention(nn.Module):
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
             # [s, b, head, head_size] --> [b, s, head, head_size]
-            q, k, v = [
-                rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v)
-            ]
+            q, k, v = [rearrange(x, "s b ... -> b s ...") for x in (q, k, v)]
 
         cos = None
         sin = None
