@@ -163,15 +163,13 @@ def adjust_config_with_unaligned_cpu_tp(
         total_kv_heads = model_config.get_total_num_kv_heads()
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-        head_dim = (
-                model_config.hidden_size // model_config.num_attention_heads
-            )
+        head_dim = model_config.hidden_size // model_config.num_attention_heads
         if hasattr(model_config.hf_config, "qk_head_dim"):
-            head_dim =  model_config.hf_config.qk_head_dim
+            head_dim = model_config.hf_config.qk_head_dim
         elif hasattr(model_config.hf_text_config, "head_dim"):
-            head_dim =  model_config.hf_text_config.head_dim
+            head_dim = model_config.hf_text_config.head_dim
         elif hasattr(model_config.hf_config, "head_dim"):
-            head_dim =  model_config.hf_text_config.head_dim
+            head_dim = model_config.hf_text_config.head_dim
 
         pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
@@ -191,18 +189,15 @@ def adjust_config_with_unaligned_cpu_tp(
         )
 
     intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
-    model_config = update_intermediate_size(
-        model_config, "moe_intermediate_size", intermediate_padding_size
-    )
-    model_config = update_intermediate_size(
-        model_config, "intermediate_size", intermediate_padding_size
-    )
-    model_config = update_intermediate_size(
-        model_config, "intermediate_size_mlp", intermediate_padding_size
-    )
-    model_config = update_intermediate_size(
-        model_config, "shared_expert_intermediate_size", intermediate_padding_size
-    )
+    for moe_intermediate_attr in [
+        "moe_intermediate_size",
+        "intermediate_size",
+        "intermediate_size_mlp",
+        "shared_expert_intermediate_size",
+    ]:
+        model_config = update_intermediate_size(
+            model_config, moe_intermediate_attr, intermediate_padding_size
+        )
 
     multimodal_config = [
         [
