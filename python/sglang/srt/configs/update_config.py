@@ -3,6 +3,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from sglang.srt.utils import (
+    log_info_on_rank0,
+)
+
 logger = logging.getLogger(__name__)
 DEFAULT_MOE_PADDING_SIZE = 32
 
@@ -145,11 +149,12 @@ def update_config(model_config, attr_name, new_value):
     if hasattr(model_config, attr_name):
         old_value = getattr(model_config, attr_name)
         if old_value != new_value:
-            logger.warning(
-                f"Updating {config_name}.{attr_name} from {old_value} to {new_value}"
+            log_info_on_rank0(
+                logger,
+                f"Updating {config_name}.{attr_name} from {old_value} to {new_value}",
             )
     else:
-        logger.info(f"Setting {config_name}.{attr_name} to {new_value}")
+        log_info_on_rank0(logger, f"Setting {config_name}.{attr_name} to {new_value}")
     setattr(model_config, attr_name, new_value)
 
 
