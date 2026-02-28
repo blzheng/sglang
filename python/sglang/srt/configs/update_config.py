@@ -164,26 +164,17 @@ def adjust_config_with_unaligned_cpu_tp(
     # Support the case where the num_attention_heads is not divisible by the TP size.
     weight_block_size = may_get_weight_block_size(model_config, load_config)
 
-    update_config(
-        model_config.hf_config,
-        "original_num_attention_heads",
-        model_config.num_attention_heads,
-    )
-    update_config(
-        model_config.hf_text_config,
-        "original_num_attention_heads",
-        model_config.num_attention_heads,
-    )
-    update_config(
-        model_config.hf_config,
-        "original_total_num_kv_heads",
-        model_config.get_total_num_kv_heads(),
-    )
-    update_config(
-        model_config.hf_text_config,
-        "original_total_num_kv_heads",
-        model_config.get_total_num_kv_heads(),
-    )
+    for config in [model_config.hf_config, model_config.hf_text_config]:
+        update_config(
+            config,
+            "original_num_attention_heads",
+            model_config.num_attention_heads,
+        )
+        update_config(
+            config,
+            "original_total_num_kv_heads",
+            model_config.get_total_num_kv_heads(),
+        )
 
     if (
         model_config.num_attention_heads % tp_size != 0
@@ -216,22 +207,15 @@ def adjust_config_with_unaligned_cpu_tp(
 
         pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
         num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
-        update_config(model_config, "num_key_value_heads", num_key_value_heads)
-        update_config(
-            model_config.hf_config, "num_key_value_heads", num_key_value_heads
-        )
-        update_config(
-            model_config.hf_text_config, "num_key_value_heads", num_key_value_heads
-        )
 
         num_attention_heads = num_key_value_heads * query_heads_per_kv
-        update_config(model_config, "num_attention_heads", num_attention_heads)
-        update_config(
-            model_config.hf_config, "num_attention_heads", num_attention_heads
-        )
-        update_config(
-            model_config.hf_text_config, "num_attention_heads", num_attention_heads
-        )
+        for config in [
+            model_config,
+            model_config.hf_config,
+            model_config.hf_text_config,
+        ]:
+            update_config(config, "num_key_value_heads", num_key_value_heads)
+            update_config(config, "num_attention_heads", num_attention_heads)
 
     adjust_tp_num_heads_if_necessary(model_config.hf_config, tp_size, True)
     if hasattr(model_config.hf_config, "text_config"):
