@@ -122,14 +122,29 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     if attr_value % intermediate_padding_size != 0:
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
+        orig_attr_value = attr_value
         attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
         if hasattr(model_config, "hf_config"):
+            update_config(
+                model_config.hf_config, "original_" + attr_name, orig_attr_value
+            )
             update_config(model_config.hf_config, attr_name, attr_value)
             if hasattr(model_config, "hf_text_config"):
+                update_config(
+                    model_config.hf_text_config,
+                    "original_" + attr_name,
+                    orig_attr_value,
+                )
                 update_config(model_config.hf_text_config, attr_name, attr_value)
             if hasattr(model_config.hf_config, "text_config"):
+                update_config(
+                    model_config.hf_config.text_config,
+                    "original_" + attr_name,
+                    orig_attr_value,
+                )
                 update_config(model_config.hf_config.text_config, attr_name, attr_value)
         else:
+            update_config(model_config, "original_" + attr_name, orig_attr_value)
             update_config(model_config, attr_name, attr_value)
 
     return model_config
@@ -213,6 +228,9 @@ def adjust_config_with_unaligned_cpu_tp(
             update_config(config, "num_attention_heads", num_attention_heads)
 
     intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
+    if model_config.quantization == "mxfp4":
+        # for mxfp4 quantization, 2 mx4 value are packed in 1 uint8, so we need to double the intermediate padding size to ensure the padded intermediate size is divisible by 2 for proper packing.
+        intermediate_padding_size = intermediate_padding_size * 2
     for moe_intermediate_attr in [
         "moe_intermediate_size",
         "intermediate_size",
