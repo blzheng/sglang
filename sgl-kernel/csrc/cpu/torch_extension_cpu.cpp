@@ -216,6 +216,15 @@ at::Tensor fused_linear_sigmoid_mul(
     bool is_vnni,
     const at::Tensor& post_mul_mat);
 
+at::Tensor fused_linear_gelu_linear(
+    at::Tensor& input,
+    at::Tensor& weight1,
+    at::Tensor& weight2,
+    const std::optional<at::Tensor>& bias1,
+    const std::optional<at::Tensor>& bias2,
+    bool approximate_tanh,
+    bool is_vnni);
+
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
 
@@ -514,6 +523,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
 
+  // gemm
+  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
+  m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
+
+  // gemm fusion
+  m.def(
+      "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
+  m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
+
+  m.def(
+      "fused_linear_gelu_linear(Tensor input, Tensor weight1, Tensor weight2, Tensor? bias1, Tensor? bias2, bool "
+      "approximate_tanh, bool is_vnni) -> Tensor");
+  m.impl("fused_linear_gelu_linear", torch::kCPU, &fused_linear_gelu_linear);
+
   // igemm
   m.def(
       "int8_scaled_mm_cpu(Tensor mat1, Tensor mat2, Tensor scales1, Tensor scales2, Tensor? bias, ScalarType "
@@ -547,15 +570,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor, Tensor)");
   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
 #endif
-
-  // gemm
-  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
-  m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
-
-  // gemm fusion
-  m.def(
-      "fused_linear_sigmoid_mul(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, Tensor post_mul_mat) -> Tensor");
-  m.impl("fused_linear_sigmoid_mul", torch::kCPU, &fused_linear_sigmoid_mul);
 
   // bmm
   m.def("bmm_cpu(Tensor(a!) out, Tensor mat1, Tensor mat2, bool is_vnni, Tensor? scale) -> ()");
