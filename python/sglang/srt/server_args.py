@@ -1681,6 +1681,8 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
+                elif is_cpu() and cpu_has_amx_support():
+                    self.attention_backend = "intel_amx"
                 elif is_hip():
                     self.attention_backend = "aiter"
                 else:
@@ -1692,6 +1694,7 @@ class ServerArgs:
                 "fa3",
                 "fa4",
                 "ascend",
+                "intel_amx",
                 "aiter",
             ]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
@@ -1756,6 +1759,7 @@ class ServerArgs:
                     self.ep_size == 1
                     and is_triton_kernels_available()
                     and self.quantization is None
+                    and not (is_cpu() and cpu_has_amx_support())
                 ):
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
