@@ -124,12 +124,12 @@ class IntelAMXAttnBackend(AttentionBackend):
             max_extend_len,
             layer.scaling,
             layer.logit_cap,
-            layer.is_cross_attention,
+            layer.is_cross_attention or k is None or v is None,
             layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
             sinks,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_decode(
         self,
@@ -173,7 +173,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             forward_batch.encoder_lens,
             sinks,
         )
-        return o
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def support_triton(self):
         return False
