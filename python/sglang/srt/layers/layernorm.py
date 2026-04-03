@@ -333,8 +333,7 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # TODO: add 3d support for rmsnorm_cpu / fused_add_rmsnorm_cpu
-        if _is_cpu_amx_available and x.dim() == 2:
+        if _is_cpu_amx_available:
             if residual is not None:
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
