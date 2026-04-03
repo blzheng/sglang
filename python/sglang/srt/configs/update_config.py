@@ -35,7 +35,14 @@ def get_moe_padding_size(weight_block_size):
     return DEFAULT_MOE_PADDING_SIZE
 
 
-def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
+def get_num_heads_padding_size(tp_size, weight_block_size, head_dim=None):
+    if head_dim is None:
+        pad_size = (
+            tp_size * 2
+            if tp_size % 2 == 1 and weight_block_size is not None
+            else tp_size
+        )
+        return pad_size
     pad_size = tp_size
 
     if weight_block_size is not None and head_dim % weight_block_size[0] != 0:
@@ -184,12 +191,14 @@ def adjust_config_with_unaligned_cpu_tp(
     model_config = update_intermediate_size(
         model_config, "shared_expert_intermediate_size", intermediate_padding_size
     )
-    if (
-        hasattr(model_config.hf_config, "vision_config")
-        and model_config.hf_config.vision_config.model_type == "siglip_vision_model"
-    ):
+    if hasattr(
+        model_config.hf_config, "vision_config"
+    ) and model_config.hf_config.vision_config.model_type in [
+        "siglip_vision_model",
+        "gemma4_vision",
+    ]:
         model_config.hf_config.vision_config.original_num_attention_heads = (
-            model_config.num_attention_heads
+            model_config.hf_config.vision_config.num_attention_heads
         )
         if model_config.hf_config.vision_config.num_attention_heads % tp_size != 0:
             model_config.hf_config.vision_config.head_dim = (
@@ -198,10 +207,31 @@ def adjust_config_with_unaligned_cpu_tp(
             )
             from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
-            pad_size = get_num_heads_padding_size(tp_size, weight_block_size)
+            pad_size = get_num_heads_padding_size(
+                tp_size,
+                weight_block_size,
+                getattr(model_config.hf_config.vision_config, "head_dim", None),
+            )
             model_config.hf_config.vision_config.num_attention_heads = pad_vocab_size(
                 model_config.hf_config.vision_config.num_attention_heads, pad_size
             )
+        if hasattr(model_config.hf_config.vision_config, "num_key_value_heads"):
+            model_config.hf_config.vision_config.original_num_key_value_heads = (
+                model_config.hf_config.vision_config.num_key_value_heads
+            )
+            if model_config.hf_config.vision_config.num_key_value_heads % tp_size != 0:
+                pad_size = get_num_heads_padding_size(
+                    tp_size,
+                    weight_block_size,
+                    getattr(model_config.hf_config.vision_config, "head_dim", None),
+                )
+                model_config.hf_config.vision_config.num_key_value_heads = (
+                    pad_vocab_size(
+                        model_config.hf_config.vision_config.num_key_value_heads,
+                        pad_size,
+                    )
+                )
+
         model_config.hf_config.vision_config = update_intermediate_size(
             model_config.hf_config.vision_config,
             "intermediate_size",
