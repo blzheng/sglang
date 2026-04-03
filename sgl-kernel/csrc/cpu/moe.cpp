@@ -753,7 +753,9 @@ void fused_experts_kernel_impl(
       } else {
         const int64_t offset = offsets[mb];
         if (act_func == CPUAcTMethod::silu_and_mul) {
-          // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
+          // silu_and_mul uses the fused tinygemm_kernel_nn2 path which has
+          // SiLU hardcoded in its store step. Other activations (gelu_and_mul,
+          // swiglu) use separate GEMMs followed by a dedicated activation step.
           tinygemm_kernel(
               /* A     */ A,
               /* B0    */ B0,
@@ -1121,7 +1123,7 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni,
     const std::optional<std::string>& activation) {
-   RECORD_FUNCTION(
+  RECORD_FUNCTION(
       "sgl-kernel::fused_experts_cpu", std::vector<c10::IValue>({hidden_states, w1, w2, topk_weights, topk_ids}));
 
   // Determine activation function

@@ -194,7 +194,12 @@ def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize, activation="silu"
     if renormalize:
         topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
 
-    act_fn = SiluAndMul if activation == "silu" else lambda x: GeluAndMul(x, approximate="none")
+    if activation == "silu":
+        act_fn = SiluAndMul
+    elif activation == "gelu":
+        act_fn = lambda x: GeluAndMul(x, approximate="none")
+    else:
+        raise ValueError(f"Unsupported activation: {activation}")
 
     topk_weight = topk_weight.view(-1)
     topk_ids = topk_ids.view(-1)
