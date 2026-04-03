@@ -30,7 +30,7 @@ from utils import (
 from sglang.test.test_utils import CustomTestCase
 
 
-def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
+def fused_moe(a, w1, w2, score, topk, renormalize, prepack, activation="silu"):
 
     G = 1
     topk_group = 1
@@ -64,6 +64,7 @@ def fused_moe(a, w1, w2, score, topk, renormalize, prepack):
         None,
         None,
         prepack,
+        activation,
     )
 
 
@@ -81,6 +82,26 @@ class TestFusedExperts(CustomTestCase):
 
         torch_output = torch_naive_fused_moe(a, w1, w2, score, topk, renormalize)
         fused_output = fused_moe(a, w1, w2, score, topk, renormalize, prepack)
+
+        atol = rtol = precision[torch_output.dtype]
+        torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
+
+    @parametrize(m=[2, 114], n=[32], k=[32], e=[4], topk=[2], renormalize=[False, True])
+    def test_bf16_moe_gelu(self, m, n, k, e, topk, renormalize):
+        dtype = torch.bfloat16
+        prepack = True
+
+        a = torch.randn((m, k), device="cpu", dtype=dtype) / 10
+        w1 = torch.randn((e, 2 * n, k), device="cpu", dtype=dtype) / 10
+        w2 = torch.randn((e, k, n), device="cpu", dtype=dtype) / 10
+        score = torch.randn((m, e), device="cpu", dtype=dtype)
+
+        torch_output = torch_naive_fused_moe(
+            a, w1, w2, score, topk, renormalize, activation="gelu"
+        )
+        fused_output = fused_moe(
+            a, w1, w2, score, topk, renormalize, prepack, activation="gelu"
+        )
 
         atol = rtol = precision[torch_output.dtype]
         torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)

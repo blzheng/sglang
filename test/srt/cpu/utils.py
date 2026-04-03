@@ -184,7 +184,7 @@ def scaled_weight(weight, scales):
     return weight_scaled
 
 
-def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
+def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize, activation="silu"):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -194,12 +194,14 @@ def torch_naive_fused_moe(a, w1, w2, score, topk, renormalize):
     if renormalize:
         topk_weight = topk_weight / topk_weight.sum(dim=-1, keepdim=True)
 
+    act_fn = SiluAndMul if activation == "silu" else lambda x: GeluAndMul(x, approximate="none")
+
     topk_weight = topk_weight.view(-1)
     topk_ids = topk_ids.view(-1)
     for i in range(w1.shape[0]):
         mask = topk_ids == i
         if mask.sum():
-            out[mask] = SiluAndMul(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(
+            out[mask] = act_fn(a[mask] @ w1[i].transpose(0, 1)) @ w2[i].transpose(
                 0, 1
             )
     return (
