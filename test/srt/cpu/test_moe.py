@@ -270,7 +270,64 @@ class TestFusedExperts(CustomTestCase):
         torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
 
     @parametrize(M=[2, 121], N=[352, 512], K=[256, 320], E=[8], topk=[4])
-    def test_mxfp4_moe(self, M, N, K, E, topk):
+    def test_fp8_moe_gelu(self, M, N, K, E, topk):
+        dtype = torch.bfloat16
+
+        a = torch.randn(M, K, dtype=dtype) / math.sqrt(K)
+
+        w1_fp32 = torch.randn(E, 2 * N, K)
+        w1 = (w1_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+        w2_fp32 = torch.randn(E, K, N)
+        w2 = (w2_fp32 * fp8_max).clamp(min=fp8_min, max=fp8_max).to(torch.float8_e4m3fn)
+
+        w1s = (
+            torch.randn(E, math.ceil(2 * N / BLOCK_N), math.ceil(K / BLOCK_K))
+            * factor_for_scale
+        )
+        w2s = (
+            torch.randn(E, math.ceil(K / BLOCK_N), math.ceil(N / BLOCK_K))
+            * factor_for_scale
+        )
+
+        w1_scaled = scaled_weight(w1, w1s)
+        w2_scaled = scaled_weight(w2, w2s)
+
+        score = torch.randn((M, E), dtype=dtype)
+        score = torch.softmax(score, dim=-1, dtype=torch.float32)
+        topk_weight, topk_ids = torch.topk(score, topk)
+
+        w1 = kernel.convert_weight_packed(w1)
+        w2 = kernel.convert_weight_packed(w2)
+
+        ref_out = native_fp8_fused_moe(
+            a, w1_scaled, w2_scaled, topk_weight, topk_ids, topk, activation="gelu"
+        )
+        out = kernel.fused_experts_cpu(
+            a,
+            w1,
+            w2,
+            topk_weight,
+            topk_ids.to(torch.int32),
+            False,
+            CPUQuantMethod.FP8_W8A16,
+            w1s,
+            w2s,
+            None,
+            None,
+            [BLOCK_N, BLOCK_K],
+            None,
+            None,
+            None,
+            None,
+            True,
+            "gelu",
+        )
+
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(ref_out.bfloat16(), out, atol=atol, rtol=rtol)
+
+    @parametrize(M=[2, 121], N=[352, 512], K=[256, 320], E=[8], topk=[4])
         dtype = torch.bfloat16
 
         a = torch.randn(M, K, dtype=dtype) / 10
