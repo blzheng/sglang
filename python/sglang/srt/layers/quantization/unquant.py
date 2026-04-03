@@ -248,11 +248,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU
-        if (
-            _is_cpu
-            and _is_cpu_amx_available
-            and self.moe_runner_config.activation == "silu"
-        ):
+        if _is_cpu and _is_cpu_amx_available:
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
             if hasattr(layer, "w13_weight_bias"):
                 layer.w13_weight_bias = Parameter(
