@@ -11,9 +11,6 @@ torch.manual_seed(1234)
 
 
 class TestNorm(CustomTestCase):
-    M = [4096, 1024]
-    N = [4096, 4096 + 13]
-    dtype = [torch.float16, torch.bfloat16]
 
     def _forward_native(
         self,
@@ -65,7 +62,8 @@ class TestNorm(CustomTestCase):
         x = x.to(orig_dtype)
         return x if residual is None else (x, residual)
 
-    def _norm_test(self, m, n, dtype):
+    @parametrize(m=[4096, 1024], n=[4096, 4109], dtype=[torch.float16, torch.bfloat16])
+    def test_norm(self, m, n, dtype):
 
         x = torch.randn([m, n], dtype=dtype)
         x = make_non_contiguous(x)
@@ -94,7 +92,38 @@ class TestNorm(CustomTestCase):
         torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
-    def _l2norm_test(self, m, n, dtype):
+    @parametrize(l=[1, 4], m=[4096, 1024], n=[4096, 4109], dtype=[torch.float16, torch.bfloat16])
+    def test_norm_3d(self, l, m, n, dtype):
+
+        x = torch.randn([l, m, n], dtype=dtype)
+        x = make_non_contiguous(x)
+        hidden_size = x.size(-1)
+        weight = torch.randn(hidden_size, dtype=dtype)
+        variance_epsilon = 1e-6
+
+        out = torch.ops.sgl_kernel.rmsnorm_cpu(x, weight, variance_epsilon)
+        ref_out = self._forward_native(x, weight, variance_epsilon)
+
+        atol = rtol = precision[ref_out.dtype]
+        torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+
+        ref_x = x.clone()
+        residual = torch.randn([l, m, hidden_size], dtype=dtype)
+        ref_residual = residual.clone()
+
+        torch.ops.sgl_kernel.fused_add_rmsnorm_cpu(
+            x, residual, weight, variance_epsilon
+        )
+
+        ref_x, ref_residual = self._forward_native(
+            ref_x, weight, variance_epsilon, ref_residual
+        )
+
+        torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
+        torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
+
+    @parametrize(m=[4096, 1024], n=[4096, 4109], dtype=[torch.float16, torch.bfloat16])
+    def test_l2norm(self, m, n, dtype):
 
         x = torch.randn([m, n], dtype=dtype)
         hidden_size = x.size(-1)
@@ -107,7 +136,8 @@ class TestNorm(CustomTestCase):
         atol = rtol = precision[ref_out.dtype]
         torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
-    def _gemma_rmsnorm_test(self, m, n, dtype):
+    @parametrize(m=[4096, 1024], n=[4096, 4109], dtype=[torch.float16, torch.bfloat16])
+    def test_gemma_rmsnorm(self, m, n, dtype):
 
         x = torch.randn([m, n], dtype=dtype)
         x = make_non_contiguous(x)
@@ -136,7 +166,8 @@ class TestNorm(CustomTestCase):
         torch.testing.assert_close(x, ref_x, atol=atol, rtol=rtol)
         torch.testing.assert_close(residual, ref_residual, atol=atol, rtol=rtol)
 
-    def _gemma3_rmsnorm_test(self, m, n, dtype):
+    @parametrize(m=[4096, 1024], n=[4096, 4109], dtype=[torch.float16, torch.bfloat16])
+    def test_gemma3_rmsnorm(self, m, n, dtype):
         x_list = [
             torch.randn([m, n], dtype=dtype),
             torch.randn([1, m, 2, n], dtype=dtype),
@@ -151,14 +182,6 @@ class TestNorm(CustomTestCase):
 
             atol = rtol = precision[ref_out.dtype]
             torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
-
-    def test_norm(self):
-        for params in itertools.product(self.M, self.N, self.dtype):
-            with self.subTest(m=params[0], n=params[1], dtype=params[2]):
-                self._norm_test(*params)
-                self._l2norm_test(*params)
-                self._gemma_rmsnorm_test(*params)
-                self._gemma3_rmsnorm_test(*params)
 
 
 class TestFusedRMSNormGated(CustomTestCase):
