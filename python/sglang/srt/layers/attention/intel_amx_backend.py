@@ -141,8 +141,20 @@ class IntelAMXAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
-        attn_logits, _ = self.forward_metadata
-
+        if layer.v_head_dim == self.v_head_dim:
+            attn_logits, _ = self.forward_metadata
+        else:
+            bs = forward_batch.batch_size
+            attn_logits = torch.zeros(
+                (
+                    bs,
+                    self.num_head,
+                    8,  # self.num_kv_splits,
+                    layer.v_head_dim + 1,
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
 
         if layer.qk_head_dim != layer.v_head_dim:
