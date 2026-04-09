@@ -128,7 +128,7 @@ def update_intermediate_size(model_config, attr_name, intermediate_padding_size)
     elif hasattr(model_config, attr_name):
         attr_value = getattr(model_config, attr_name)
 
-    if attr_value % intermediate_padding_size != 0:
+    if attr_value is not None and attr_value % intermediate_padding_size != 0:
         from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 
         attr_value = pad_vocab_size(attr_value, intermediate_padding_size)
