@@ -312,6 +312,7 @@ def adjust_config_with_unaligned_cpu_tp(
     for m_config, config_name, model_type, num_head_str in multimodal_config:
         if (
             hasattr(m_config, config_name)
+            and getattr(m_config, config_name) is not None
             and getattr(m_config, config_name).model_type == model_type
         ):
             num_heads = getattr(getattr(m_config, config_name), num_head_str)
