@@ -702,6 +702,44 @@ at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps)
   return output;
 }
 
+// Gemma4RMSNorm: norm(x) * (weight + scale_shift)
+// input : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
+// weight: {hidden_size}
+at::Tensor gemma4_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps, double scale_shift) {
+  RECORD_FUNCTION("sgl-kernel::gemma4_rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_INPUT(weight);
+  int64_t inp_dim{input.dim()};
+  TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "gemma4_rmsnorm_cpu: expected input dim 2 or 3, got ", inp_dim);
+  CHECK_DIM(1, weight);
+  CHECK_EQ(input.size(-1), weight.size(0));
+
+  int64_t batch_size{input.size(0)}, hidden_size{input.size(-1)}, input_strideN{input.stride(0)};
+  if (inp_dim == 3) {
+    batch_size *= input.size(1);
+    input_strideN = input.stride(1);
+  }
+  at::Tensor output = at::empty_like(input);
+
+  float shift = static_cast<float>(scale_shift);
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
+    using Vec = at::vec::Vectorized<float>;
+    Vec shift_vec = Vec(shift);
+    rmsnorm_kernel_impl<scalar_t>(
+        output.data_ptr<scalar_t>(),
+        input.data_ptr<scalar_t>(),
+        weight.data_ptr<scalar_t>(),
+        batch_size,
+        hidden_size,
+        input_strideN,
+        [shift](float x) { return x + shift; },
+        [shift_vec](Vec x) { return x + shift_vec; },
+        eps);
+  });
+  return output;
+}
+
 // input : {batch_size, hidden_size}
 // weight: {hidden_size}
 // gate: {batch_size, hidden_size}

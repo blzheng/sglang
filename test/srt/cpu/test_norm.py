@@ -183,6 +183,39 @@ class TestNorm(CustomTestCase):
             atol = rtol = precision[ref_out.dtype]
             torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
 
+    def _gemma4_rmsnorm_native(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float = 1e-6,
+        scale_shift: float = 0.0,
+    ):
+        output = self._norm(x.float(), variance_epsilon)
+        output = output * (weight.float() + scale_shift)
+        return output.type_as(x)
+
+    def _gemma4_rmsnorm_test(self, m, n, dtype):
+        for scale_shift in [0.0, 1.0]:
+            x_list = [
+                torch.randn([m, n], dtype=dtype),
+                torch.randn([4, m, n], dtype=dtype),
+            ]
+            for x in x_list:
+                x = make_non_contiguous(x)
+                hidden_size = x.size(-1)
+                weight = torch.randn(hidden_size, dtype=dtype)
+                variance_epsilon = 1e-6
+
+                out = torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
+                    x, weight, variance_epsilon, scale_shift
+                )
+                ref_out = self._gemma4_rmsnorm_native(
+                    x, weight, variance_epsilon, scale_shift
+                )
+
+                atol = rtol = precision[ref_out.dtype]
+                torch.testing.assert_close(ref_out, out, atol=atol, rtol=rtol)
+
     def test_norm(self):
         for params in itertools.product(self.M, self.N, self.dtype):
             with self.subTest(m=params[0], n=params[1], dtype=params[2]):
@@ -190,6 +223,7 @@ class TestNorm(CustomTestCase):
                 self._l2norm_test(*params)
                 self._gemma_rmsnorm_test(*params)
                 self._gemma3_rmsnorm_test(*params)
+                self._gemma4_rmsnorm_test(*params)
         for params in itertools.product(self.L, self.S, self.N, self.dtype):
             with self.subTest(l=params[0], m=params[1], n=params[2], dtype=params[3]):
                 self._norm_test_3d(*params)
