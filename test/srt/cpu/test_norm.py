@@ -197,7 +197,12 @@ class TestNorm(CustomTestCase):
         return output.type_as(x)
 
     def _gemma4_rmsnorm_test(self, m, n, dtype):
-        for scale_shift, with_scale in [(0.0, True), (1.0, True), (0.0, False)]:
+        for scale_shift, with_scale in [
+            (0.0, True),
+            (1.0, True),
+            (0.0, False),
+            (1.0, False),
+        ]:
             x_list = [
                 torch.randn([m, n], dtype=dtype),
                 torch.randn([4, m, n], dtype=dtype),
