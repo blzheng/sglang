@@ -723,10 +723,19 @@ at::Tensor gemma4_rmsnorm_cpu(
 
   int64_t batch_size{input.size(0)}, hidden_size{input.size(-1)}, input_strideN{input.stride(0)};
   if (inp_dim == 3) {
+    TORCH_CHECK(
+        input.stride(0) == input.size(1) * input.stride(1),
+        "gemma4_rmsnorm_cpu: unsupported non-block-contiguous 3D input layout; ",
+        "expected stride(0) == size(1) * stride(1), but got stride(0)=",
+        input.stride(0),
+        ", size(1)=",
+        input.size(1),
+        ", stride(1)=",
+        input.stride(1));
     batch_size *= input.size(1);
     input_strideN = input.stride(1);
   }
-  at::Tensor output = at::empty_like(input);
+  at::Tensor output = at::empty(input.sizes(), input.options());
 
   if (with_scale) {
     float shift = static_cast<float>(scale_shift);
