@@ -685,7 +685,7 @@ class Gemma4RMSNorm(MultiPlatformOp):
     def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
         if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
-                x, self.weight.data, self.eps, self.scale_shift
+                x, self.weight.data, self.eps, self.scale_shift, self.with_scale
             )
         return self.forward_native(x)
 

@@ -189,13 +189,15 @@ class TestNorm(CustomTestCase):
         weight: torch.Tensor,
         variance_epsilon: float = 1e-6,
         scale_shift: float = 0.0,
+        with_scale: bool = True,
     ):
         output = self._norm(x.float(), variance_epsilon)
-        output = output * (weight.float() + scale_shift)
+        if with_scale:
+            output = output * (weight.float() + scale_shift)
         return output.type_as(x)
 
     def _gemma4_rmsnorm_test(self, m, n, dtype):
-        for scale_shift in [0.0, 1.0]:
+        for scale_shift, with_scale in [(0.0, True), (1.0, True), (0.0, False)]:
             x_list = [
                 torch.randn([m, n], dtype=dtype),
                 torch.randn([4, m, n], dtype=dtype),
@@ -207,10 +209,10 @@ class TestNorm(CustomTestCase):
                 variance_epsilon = 1e-6
 
                 out = torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
-                    x, weight, variance_epsilon, scale_shift
+                    x, weight, variance_epsilon, scale_shift, with_scale
                 )
                 ref_out = self._gemma4_rmsnorm_native(
-                    x, weight, variance_epsilon, scale_shift
+                    x, weight, variance_epsilon, scale_shift, with_scale
                 )
 
                 atol = rtol = precision[ref_out.dtype]
