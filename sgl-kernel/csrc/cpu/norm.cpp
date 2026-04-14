@@ -5,13 +5,14 @@ namespace {
 
 // NB: avoid using `at::vec::map<>` on bfloat16 or half
 // Llama4TextL2Norm
-template <typename scalar_t>
-void l2norm_kernel_impl(
+// Core template with flexible input offset computation via InputOffsetFn
+template <typename scalar_t, typename InputOffsetFn>
+void l2norm_kernel_core(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
     int64_t batch_size,
     int64_t hidden_size,
-    int64_t input_strideN,
+    InputOffsetFn input_offset_fn,
     float eps = 1e-5) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
@@ -21,7 +22,7 @@ void l2norm_kernel_impl(
     for (int64_t i = begin; i < end; ++i) {
       // local ptrs
       scalar_t* __restrict__ out_ptr = output + i * hidden_size;
-      const scalar_t* __restrict__ input_ptr = input + i * input_strideN;
+      const scalar_t* __restrict__ input_ptr = input + input_offset_fn(i);
 
       fVec sum_fvec = fVec(float(0));
       float sum_val = float(0);
@@ -66,14 +67,45 @@ void l2norm_kernel_impl(
     }
   });
 }
-template <typename scalar_t, typename func_t, typename vec_func_t>
-void rmsnorm_kernel_impl(
+
+// Original 2D API (preserved for existing callers)
+template <typename scalar_t>
+void l2norm_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    int64_t batch_size,
+    int64_t hidden_size,
+    int64_t input_strideN,
+    float eps = 1e-5) {
+  l2norm_kernel_core<scalar_t>(output, input, batch_size, hidden_size,
+      [input_strideN](int64_t i) { return i * input_strideN; }, eps);
+}
+
+// 3D variant for non-block-contiguous input
+template <typename scalar_t>
+void l2norm_kernel_3d_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    int64_t total_rows,
+    int64_t dim1,
+    int64_t hidden_size,
+    int64_t input_stride0,
+    int64_t input_stride1,
+    float eps = 1e-5) {
+  l2norm_kernel_core<scalar_t>(output, input, total_rows, hidden_size,
+      [dim1, input_stride0, input_stride1](int64_t i) {
+        return (i / dim1) * input_stride0 + (i % dim1) * input_stride1;
+      }, eps);
+}
+// Core template with flexible input offset computation via InputOffsetFn
+template <typename scalar_t, typename InputOffsetFn, typename func_t, typename vec_func_t>
+void rmsnorm_kernel_core(
     scalar_t* __restrict__ output,
     const scalar_t* __restrict__ input,
     const scalar_t* __restrict__ weight,
     int64_t batch_size,
     int64_t hidden_size,
-    int64_t input_strideN,
+    InputOffsetFn input_offset_fn,
     const func_t& f,
     const vec_func_t& vf,
     float eps = 1e-5) {
@@ -85,7 +117,7 @@ void rmsnorm_kernel_impl(
     for (int64_t i = begin; i < end; ++i) {
       // local ptrs
       scalar_t* __restrict__ out_ptr = output + i * hidden_size;
-      const scalar_t* __restrict__ input_ptr = input + i * input_strideN;
+      const scalar_t* __restrict__ input_ptr = input + input_offset_fn(i);
 
       fVec sum_fvec = fVec(float(0));
       float sum_val = float(0);
@@ -134,6 +166,42 @@ void rmsnorm_kernel_impl(
       }
     }
   });
+}
+
+// Original 2D API (preserved for existing callers)
+template <typename scalar_t, typename func_t, typename vec_func_t>
+void rmsnorm_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    int64_t batch_size,
+    int64_t hidden_size,
+    int64_t input_strideN,
+    const func_t& f,
+    const vec_func_t& vf,
+    float eps = 1e-5) {
+  rmsnorm_kernel_core<scalar_t>(output, input, weight, batch_size, hidden_size,
+      [input_strideN](int64_t i) { return i * input_strideN; }, f, vf, eps);
+}
+
+// 3D variant for non-block-contiguous input
+template <typename scalar_t, typename func_t, typename vec_func_t>
+void rmsnorm_kernel_3d_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    const scalar_t* __restrict__ weight,
+    int64_t total_rows,
+    int64_t dim1,
+    int64_t hidden_size,
+    int64_t input_stride0,
+    int64_t input_stride1,
+    const func_t& f,
+    const vec_func_t& vf,
+    float eps = 1e-5) {
+  rmsnorm_kernel_core<scalar_t>(output, input, weight, total_rows, hidden_size,
+      [dim1, input_stride0, input_stride1](int64_t i) {
+        return (i / dim1) * input_stride0 + (i % dim1) * input_stride1;
+      }, f, vf, eps);
 }
 
 template <typename scalar_t>
@@ -721,48 +789,77 @@ at::Tensor gemma4_rmsnorm_cpu(
   CHECK_DIM(1, weight);
   CHECK_EQ(input.size(-1), weight.size(0));
 
-  int64_t batch_size{input.size(0)}, hidden_size{input.size(-1)}, input_strideN{input.stride(0)};
-  if (inp_dim == 3) {
-    TORCH_CHECK(
-        input.stride(0) == input.size(1) * input.stride(1),
-        "gemma4_rmsnorm_cpu: unsupported non-block-contiguous 3D input layout; ",
-        "expected stride(0) == size(1) * stride(1), but got stride(0)=",
-        input.stride(0),
-        ", size(1)=",
-        input.size(1),
-        ", stride(1)=",
-        input.stride(1));
-    batch_size *= input.size(1);
-    input_strideN = input.stride(1);
-  }
+  int64_t hidden_size{input.size(-1)};
   at::Tensor output = at::empty(input.sizes(), input.options());
 
-  if (with_scale) {
-    float shift = static_cast<float>(scale_shift);
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
-      using Vec = at::vec::Vectorized<float>;
-      Vec shift_vec = Vec(shift);
-      rmsnorm_kernel_impl<scalar_t>(
-          output.data_ptr<scalar_t>(),
-          input.data_ptr<scalar_t>(),
-          weight.data_ptr<scalar_t>(),
-          batch_size,
-          hidden_size,
-          input_strideN,
-          [shift](float x) { return x + shift; },
-          [shift_vec](Vec x) { return x + shift_vec; },
-          eps);
-    });
+  if (inp_dim == 3) {
+    int64_t total_rows = input.size(0) * input.size(1);
+    int64_t dim1 = input.size(1);
+    int64_t input_stride0 = input.stride(0);
+    int64_t input_stride1 = input.stride(1);
+
+    if (with_scale) {
+      float shift = static_cast<float>(scale_shift);
+      AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
+        using Vec = at::vec::Vectorized<float>;
+        Vec shift_vec = Vec(shift);
+        rmsnorm_kernel_3d_impl<scalar_t>(
+            output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            total_rows,
+            dim1,
+            hidden_size,
+            input_stride0,
+            input_stride1,
+            [shift](float x) { return x + shift; },
+            [shift_vec](Vec x) { return x + shift_vec; },
+            eps);
+      });
+    } else {
+      AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
+        l2norm_kernel_3d_impl<scalar_t>(
+            output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            total_rows,
+            dim1,
+            hidden_size,
+            input_stride0,
+            input_stride1,
+            eps);
+      });
+    }
   } else {
-    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
-      l2norm_kernel_impl<scalar_t>(
-          output.data_ptr<scalar_t>(),
-          input.data_ptr<scalar_t>(),
-          batch_size,
-          hidden_size,
-          input_strideN,
-          eps);
-    });
+    int64_t batch_size = input.size(0);
+    int64_t input_strideN = input.stride(0);
+
+    if (with_scale) {
+      float shift = static_cast<float>(scale_shift);
+      AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
+        using Vec = at::vec::Vectorized<float>;
+        Vec shift_vec = Vec(shift);
+        rmsnorm_kernel_impl<scalar_t>(
+            output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            weight.data_ptr<scalar_t>(),
+            batch_size,
+            hidden_size,
+            input_strideN,
+            [shift](float x) { return x + shift; },
+            [shift_vec](Vec x) { return x + shift_vec; },
+            eps);
+      });
+    } else {
+      AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
+        l2norm_kernel_impl<scalar_t>(
+            output.data_ptr<scalar_t>(),
+            input.data_ptr<scalar_t>(),
+            batch_size,
+            hidden_size,
+            input_strideN,
+            eps);
+      });
+    }
   }
   return output;
 }

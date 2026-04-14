@@ -207,6 +207,11 @@ class TestNorm(CustomTestCase):
                 torch.randn([m, n], dtype=dtype),
                 torch.randn([4, m, n], dtype=dtype),
             ]
+            # Add non-block-contiguous 3D input: slice middle dim from a larger
+            # tensor so stride(0) != size(1) * stride(1)
+            base = torch.randn([4, 2 * m, n], dtype=dtype)
+            x_list.append(base[:, :m, :])  # shape [4, m, n] but with gaps
+
             for x in x_list:
                 x = make_non_contiguous(x)
                 hidden_size = x.size(-1)
