@@ -11,6 +11,7 @@ void l2norm_kernel_impl(
     const scalar_t* __restrict__ input,
     int64_t batch_size,
     int64_t hidden_size,
+    int64_t input_strideN,
     float eps = 1e-5) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
@@ -20,7 +21,7 @@ void l2norm_kernel_impl(
     for (int64_t i = begin; i < end; ++i) {
       // local ptrs
       scalar_t* __restrict__ out_ptr = output + i * hidden_size;
-      const scalar_t* __restrict__ input_ptr = input + i * hidden_size;
+      const scalar_t* __restrict__ input_ptr = input + i * input_strideN;
 
       fVec sum_fvec = fVec(float(0));
       float sum_val = float(0);
@@ -523,7 +524,7 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
   at::Tensor output = at::empty_like(input);
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "l2norm_kernel", [&] {
-    l2norm_kernel_impl<scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), batch_size, hidden_size, eps);
+    l2norm_kernel_impl<scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), batch_size, hidden_size, hidden_size, eps);
   });
   return output;
 }
@@ -696,6 +697,70 @@ at::Tensor gemma3_rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps)
           output_strideB,
           output_strideH,
           output_strideS,
+          eps);
+    });
+  }
+  return output;
+}
+
+// Gemma4RMSNorm: with_scale ? norm(x) * (weight + scale_shift) : norm(x)
+// input : {batch_size, hidden_size} or {batch_size, seq_len, hidden_size}
+// weight: {hidden_size}
+at::Tensor gemma4_rmsnorm_cpu(
+    at::Tensor& input,
+    at::Tensor& weight,
+    double eps,
+    double scale_shift,
+    bool with_scale) {
+  RECORD_FUNCTION("sgl-kernel::gemma4_rmsnorm_cpu", std::vector<c10::IValue>({input, weight}));
+
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_INPUT(weight);
+  int64_t inp_dim{input.dim()};
+  TORCH_CHECK(inp_dim == 2 || inp_dim == 3, "gemma4_rmsnorm_cpu: expected input dim 2 or 3, got ", inp_dim);
+  CHECK_DIM(1, weight);
+  CHECK_EQ(input.size(-1), weight.size(0));
+
+  int64_t batch_size{input.size(0)}, hidden_size{input.size(-1)}, input_strideN{input.stride(0)};
+  if (inp_dim == 3) {
+    TORCH_CHECK(
+        input.stride(0) == input.size(1) * input.stride(1),
+        "gemma4_rmsnorm_cpu: unsupported non-block-contiguous 3D input layout; ",
+        "expected stride(0) == size(1) * stride(1), but got stride(0)=",
+        input.stride(0),
+        ", size(1)=",
+        input.size(1),
+        ", stride(1)=",
+        input.stride(1));
+    batch_size *= input.size(1);
+    input_strideN = input.stride(1);
+  }
+  at::Tensor output = at::empty(input.sizes(), input.options());
+
+  if (with_scale) {
+    float shift = static_cast<float>(scale_shift);
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
+      using Vec = at::vec::Vectorized<float>;
+      Vec shift_vec = Vec(shift);
+      rmsnorm_kernel_impl<scalar_t>(
+          output.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          weight.data_ptr<scalar_t>(),
+          batch_size,
+          hidden_size,
+          input_strideN,
+          [shift](float x) { return x + shift; },
+          [shift_vec](Vec x) { return x + shift_vec; },
+          eps);
+    });
+  } else {
+    AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gemma4_rmsnorm_kernel", [&] {
+      l2norm_kernel_impl<scalar_t>(
+          output.data_ptr<scalar_t>(),
+          input.data_ptr<scalar_t>(),
+          batch_size,
+          hidden_size,
+          input_strideN,
           eps);
     });
   }
