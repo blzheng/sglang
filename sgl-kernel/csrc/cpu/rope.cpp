@@ -788,45 +788,24 @@ apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& 
   int64_t q_stride_s = query.stride(0);
   int64_t k_stride_s = key.stride(0);
   TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "apply_multidimensional_rope_cpu", [&] {
-    if (cos.scalar_type() == at::kFloat && sin.scalar_type() == at::kFloat) {
-      apply_multidimensional_rope_kernel_impl<scalar_t, float>(
-          query.data_ptr<scalar_t>(),
-          cos.data_ptr<float>(),
-          sin.data_ptr<float>(),
-          q_stride_s,
-          num_heads,
-          head_dim,
-          num_tokens);
-      apply_multidimensional_rope_kernel_impl<scalar_t, float>(
-          key.data_ptr<scalar_t>(),
-          cos.data_ptr<float>(),
-          sin.data_ptr<float>(),
-          k_stride_s,
-          num_heads,
-          head_dim,
-          num_tokens);
-    } else if (cos.scalar_type() == input_dtype && sin.scalar_type() == input_dtype) {
-      apply_multidimensional_rope_kernel_impl<scalar_t, scalar_t>(
-          query.data_ptr<scalar_t>(),
-          cos.data_ptr<scalar_t>(),
-          sin.data_ptr<scalar_t>(),
-          q_stride_s,
-          num_heads,
-          head_dim,
-          num_tokens);
-      apply_multidimensional_rope_kernel_impl<scalar_t, scalar_t>(
-          key.data_ptr<scalar_t>(),
-          cos.data_ptr<scalar_t>(),
-          sin.data_ptr<scalar_t>(),
-          k_stride_s,
-          num_heads,
-          head_dim,
-          num_tokens);
-    } else {
-      TORCH_CHECK(
-          false, "cos and sin must have the same data type, and must be either float or the same type as query/key");
-    }
+  TORCH_CHECK(cos.scalar_type() == sin.scalar_type(), "cos and sin must have the same data type");
+  CPU_DISPATCH_REDUCED_FLOATING_TYPES_EXT(input_dtype, cos.scalar_type(), "apply_multidimensional_rope_cpu", [&] {
+    apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
+        query.data_ptr<scalar_t>(),
+        cos.data_ptr<param_t>(),
+        sin.data_ptr<param_t>(),
+        q_stride_s,
+        num_heads,
+        head_dim,
+        num_tokens);
+    apply_multidimensional_rope_kernel_impl<scalar_t, param_t>(
+        key.data_ptr<scalar_t>(),
+        cos.data_ptr<param_t>(),
+        sin.data_ptr<param_t>(),
+        k_stride_s,
+        num_heads,
+        head_dim,
+        num_tokens);
   });
   return std::make_tuple(query, key);
 }
