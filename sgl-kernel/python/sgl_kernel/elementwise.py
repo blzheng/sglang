@@ -344,6 +344,29 @@ def rotary_embedding(
     )
 
 
+def apply_multidimensional_rope_cpu(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """Apply 2-D multidimensional RoPE (in-place) on CPU.
+
+    Splits head_dim into ndim=2 chunks and applies standard rotary
+    embedding to each chunk independently.
+
+    Parameters
+    ----------
+    x   : CPU tensor of shape [num_tokens, num_heads, head_dim]
+    cos : CPU tensor of shape [num_tokens, head_dim]
+    sin : CPU tensor of shape [num_tokens, head_dim]
+
+    Returns
+    -------
+    x (modified in-place)
+    """
+    return torch.ops.sgl_kernel.apply_multidimensional_rope_cpu.default(x, cos, sin)
+
+
 def copy_to_gpu_no_ce(input: torch.Tensor, output: torch.Tensor):
     torch.ops.sgl_kernel.copy_to_gpu_no_ce(input, output)
 
