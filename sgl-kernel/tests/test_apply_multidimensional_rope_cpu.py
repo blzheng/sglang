@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-import sgl_kernel  # noqa: F401 – ensure ops are registered
+import sgl_kernel  # noqa: F401 - ensure ops are registered
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
