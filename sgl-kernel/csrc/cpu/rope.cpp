@@ -777,7 +777,7 @@ at::Tensor apply_multidimensional_rope_cpu(at::Tensor& x, at::Tensor& cos, at::T
   CHECK_EQ(head_dim, cos.size(1));
   CHECK_EQ(head_dim, sin.size(1));
   TORCH_CHECK(head_dim % 2 == 0, "head_dim must be divisible by 2 (ndim=2)");
-  TORCH_CHECK((head_dim / 2) % 2 == 0, "chunk_size (head_dim/2) must be even for rotary embedding");
+  TORCH_CHECK(head_dim % 4 == 0, "head_dim must be divisible by 4 so each RoPE chunk is even");
   int64_t x_stride_s = x.stride(0);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "apply_multidimensional_rope_cpu", [&] {
     if (cos.scalar_type() == at::kFloat && sin.scalar_type() == at::kFloat) {
