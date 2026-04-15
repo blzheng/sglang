@@ -277,6 +277,73 @@ class TestROPE(CustomTestCase):
             torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
             torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
 
+    def test_apply_multidimensional_rope(self):
+        """Test apply_multidimensional_rope_cpu against the native Python reference."""
+
+        def _rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        def _apply_rotary(x, cos, sin):
+            return (x * cos) + (_rotate_half(x) * sin)
+
+        def _apply_multidimensional_rope_ref(x, cos, sin):
+            ndim = 2
+            chunk_size = x.shape[-1] // ndim
+            cos_3d = cos.unsqueeze(1)
+            sin_3d = sin.unsqueeze(1)
+            x_parts = x.split(chunk_size, dim=-1)
+            cos_parts = cos_3d.split(chunk_size, dim=-1)
+            sin_parts = sin_3d.split(chunk_size, dim=-1)
+            y_parts = [
+                _apply_rotary(x_parts[k], cos_parts[k], sin_parts[k])
+                for k in range(ndim)
+            ]
+            return torch.cat(y_parts, dim=-1)
+
+        test_configs = [
+            # (num_tokens, num_heads, head_dim, dtype, sincos_dtype)
+            (4, 8, 64, torch.bfloat16, torch.bfloat16),
+            (32, 16, 128, torch.bfloat16, torch.bfloat16),
+            (128, 4, 256, torch.bfloat16, torch.bfloat16),
+            (1, 1, 32, torch.bfloat16, torch.float32),
+            (32, 16, 128, torch.bfloat16, torch.float32),
+        ]
+
+        for num_tokens, num_heads, head_dim, dtype, sincos_dtype in test_configs:
+            with self.subTest(
+                num_tokens=num_tokens,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                dtype=dtype,
+                sincos_dtype=sincos_dtype,
+            ):
+                torch.manual_seed(42)
+                x = torch.randn(
+                    num_tokens, num_heads, head_dim, dtype=dtype, device="cpu"
+                )
+                x_ref = x.clone()
+                cos = torch.randn(
+                    num_tokens, head_dim, dtype=sincos_dtype, device="cpu"
+                )
+                sin = torch.randn(
+                    num_tokens, head_dim, dtype=sincos_dtype, device="cpu"
+                )
+
+                expected = _apply_multidimensional_rope_ref(
+                    x_ref.float(), cos.float(), sin.float()
+                ).to(dtype)
+
+                result = torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(
+                    x, cos, sin
+                )
+                self.assertTrue(
+                    result.data_ptr() == x.data_ptr(), "should be in-place"
+                )
+                atol = rtol = precision[dtype]
+                torch.testing.assert_close(result, expected, atol=atol, rtol=atol)
+
 
 if __name__ == "__main__":
     unittest.main()
