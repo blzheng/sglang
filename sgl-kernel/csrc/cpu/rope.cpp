@@ -785,6 +785,18 @@ apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& 
   CHECK_EQ(head_dim, sin.size(1));
   TORCH_CHECK(head_dim % 2 == 0, "head_dim must be divisible by 2 (ndim=2)");
   TORCH_CHECK(head_dim % 4 == 0, "head_dim must be divisible by 4 so each RoPE chunk is even");
+  TORCH_CHECK(
+      query.stride(1) == head_dim,
+      "query must be contiguous across heads: expected stride(1) == head_dim, got stride(1)=",
+      query.stride(1),
+      " and head_dim=",
+      head_dim);
+  TORCH_CHECK(
+      key.stride(1) == head_dim,
+      "key must be contiguous across heads: expected stride(1) == head_dim, got stride(1)=",
+      key.stride(1),
+      " and head_dim=",
+      head_dim);
   int64_t q_stride_s = query.stride(0);
   int64_t k_stride_s = key.stride(0);
   TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
