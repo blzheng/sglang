@@ -209,6 +209,8 @@ class Gemma4VisionAttention(nn.Module):
             # ROCm: use triton_attn to avoid SDPA flatten_batch issues
             # with multi-image/video inputs
             return "triton_attn"
+        if is_cpu():
+            return "amx_attn"
         return "sdpa"
 
     def forward(
