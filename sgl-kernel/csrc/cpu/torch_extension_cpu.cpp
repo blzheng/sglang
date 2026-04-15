@@ -344,7 +344,8 @@ std::tuple<at::Tensor, at::Tensor>
 apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
 // multidimensional rope
-at::Tensor apply_multidimensional_rope_cpu(at::Tensor& x, at::Tensor& cos, at::Tensor& sin);
+std::tuple<at::Tensor, at::Tensor>
+apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
 
 // mrope
 std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
@@ -617,7 +618,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // multidimensional rope
-  m.def("apply_multidimensional_rope_cpu(Tensor(a!) x, Tensor cos, Tensor sin) -> Tensor");
+  m.def("apply_multidimensional_rope_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
   m.impl("apply_multidimensional_rope_cpu", torch::kCPU, &apply_multidimensional_rope_cpu);
 
   // multimodal rope

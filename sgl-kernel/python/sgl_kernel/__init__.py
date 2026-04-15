@@ -18,7 +18,6 @@ from sgl_kernel.attention import (
 )
 from sgl_kernel.cutlass_moe import cutlass_w4a8_moe_mm, get_cutlass_w4a8_moe_mm_data
 from sgl_kernel.elementwise import (
-    apply_multidimensional_rope_cpu,
     concat_mla_absorb_q,
     concat_mla_k,
     copy_to_gpu_no_ce,
@@ -114,7 +113,6 @@ if torch.version.hip is not None:
 
 
 _DEBUG_EXPORT_NAMES = [
-    "apply_multidimensional_rope_cpu",
     "apply_shuffle_mul_sum",
     "apply_token_bitmask_inplace_cuda",
     "awq_dequantize",

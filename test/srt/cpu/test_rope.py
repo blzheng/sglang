@@ -320,10 +320,12 @@ class TestROPE(CustomTestCase):
                 sincos_dtype=sincos_dtype,
             ):
                 torch.manual_seed(42)
-                x = torch.randn(
+                query = torch.randn(
                     num_tokens, num_heads, head_dim, dtype=dtype, device="cpu"
                 )
-                x_ref = x.clone()
+                key = torch.randn(
+                    num_tokens, num_heads, head_dim, dtype=dtype, device="cpu"
+                )
                 cos = torch.randn(
                     num_tokens, head_dim, dtype=sincos_dtype, device="cpu"
                 )
@@ -331,18 +333,19 @@ class TestROPE(CustomTestCase):
                     num_tokens, head_dim, dtype=sincos_dtype, device="cpu"
                 )
 
-                expected = _apply_multidimensional_rope_ref(
-                    x_ref.float(), cos.float(), sin.float()
+                q_expected = _apply_multidimensional_rope_ref(
+                    query.float(), cos.float(), sin.float()
+                ).to(dtype)
+                k_expected = _apply_multidimensional_rope_ref(
+                    key.float(), cos.float(), sin.float()
                 ).to(dtype)
 
-                result = torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(
-                    x, cos, sin
-                )
-                self.assertTrue(
-                    result.data_ptr() == x.data_ptr(), "should be in-place"
+                q_out, k_out = torch.ops.sgl_kernel.apply_multidimensional_rope_cpu(
+                    query, key, cos, sin
                 )
                 atol = rtol = precision[dtype]
-                torch.testing.assert_close(result, expected, atol=atol, rtol=atol)
+                torch.testing.assert_close(q_out, q_expected, atol=atol, rtol=atol)
+                torch.testing.assert_close(k_out, k_expected, atol=atol, rtol=atol)
 
 
 if __name__ == "__main__":

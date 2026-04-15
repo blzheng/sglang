@@ -755,55 +755,80 @@ void apply_multidimensional_rope_kernel_impl(
 
 }  // namespace
 
-// x: [num_tokens, num_heads, head_dim]
-// cos: [num_tokens, head_dim]
-// sin: [num_tokens, head_dim]
+// query: [num_tokens, num_heads, head_dim]
+// key:   [num_tokens, num_heads, head_dim]
+// cos:   [num_tokens, head_dim]
+// sin:   [num_tokens, head_dim]
 // Applies 2-D multidimensional RoPE: splits head_dim into 2 chunks and applies
-// standard rotary embedding to each independently (in-place on x).
-at::Tensor apply_multidimensional_rope_cpu(at::Tensor& x, at::Tensor& cos, at::Tensor& sin) {
-  RECORD_FUNCTION("sgl-kernel::apply_multidimensional_rope_cpu", std::vector<c10::IValue>({x}));
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(x);
+// standard rotary embedding to each independently (in-place on query and key).
+std::tuple<at::Tensor, at::Tensor>
+apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
+  RECORD_FUNCTION("sgl-kernel::apply_multidimensional_rope_cpu", std::vector<c10::IValue>({query, key}));
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
   CHECK_INPUT(cos);
   CHECK_INPUT(sin);
-  CHECK_DIM(3, x);
+  CHECK_DIM(3, query);
+  CHECK_DIM(3, key);
   CHECK_DIM(2, cos);
   CHECK_DIM(2, sin);
-  const auto input_dtype = x.scalar_type();
-  int64_t num_tokens = x.size(0);
+  const auto input_dtype = query.scalar_type();
+  int64_t num_tokens = query.size(0);
+  CHECK_EQ(num_tokens, key.size(0));
   CHECK_EQ(num_tokens, cos.size(0));
   CHECK_EQ(num_tokens, sin.size(0));
-  int64_t num_heads = x.size(1);
-  int64_t head_dim = x.size(2);
+  int64_t num_heads = query.size(1);
+  CHECK_EQ(num_heads, key.size(1));
+  int64_t head_dim = query.size(2);
+  CHECK_EQ(head_dim, key.size(2));
   CHECK_EQ(head_dim, cos.size(1));
   CHECK_EQ(head_dim, sin.size(1));
   TORCH_CHECK(head_dim % 2 == 0, "head_dim must be divisible by 2 (ndim=2)");
   TORCH_CHECK(head_dim % 4 == 0, "head_dim must be divisible by 4 so each RoPE chunk is even");
-  int64_t x_stride_s = x.stride(0);
+  int64_t q_stride_s = query.stride(0);
+  int64_t k_stride_s = key.stride(0);
+  TORCH_CHECK(input_dtype == key.scalar_type(), "query and key must have the same data type");
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "apply_multidimensional_rope_cpu", [&] {
     if (cos.scalar_type() == at::kFloat && sin.scalar_type() == at::kFloat) {
       apply_multidimensional_rope_kernel_impl<scalar_t, float>(
-          x.data_ptr<scalar_t>(),
+          query.data_ptr<scalar_t>(),
           cos.data_ptr<float>(),
           sin.data_ptr<float>(),
-          x_stride_s,
+          q_stride_s,
+          num_heads,
+          head_dim,
+          num_tokens);
+      apply_multidimensional_rope_kernel_impl<scalar_t, float>(
+          key.data_ptr<scalar_t>(),
+          cos.data_ptr<float>(),
+          sin.data_ptr<float>(),
+          k_stride_s,
           num_heads,
           head_dim,
           num_tokens);
     } else if (cos.scalar_type() == input_dtype && sin.scalar_type() == input_dtype) {
       apply_multidimensional_rope_kernel_impl<scalar_t, scalar_t>(
-          x.data_ptr<scalar_t>(),
+          query.data_ptr<scalar_t>(),
           cos.data_ptr<scalar_t>(),
           sin.data_ptr<scalar_t>(),
-          x_stride_s,
+          q_stride_s,
+          num_heads,
+          head_dim,
+          num_tokens);
+      apply_multidimensional_rope_kernel_impl<scalar_t, scalar_t>(
+          key.data_ptr<scalar_t>(),
+          cos.data_ptr<scalar_t>(),
+          sin.data_ptr<scalar_t>(),
+          k_stride_s,
           num_heads,
           head_dim,
           num_tokens);
     } else {
       TORCH_CHECK(
-          false, "cos and sin must have the same data type, and must be either float or the same type as x");
+          false, "cos and sin must have the same data type, and must be either float or the same type as query/key");
     }
   });
-  return x;
+  return std::make_tuple(query, key);
 }
 
 std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
