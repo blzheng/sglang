@@ -344,8 +344,8 @@ class TestROPE(CustomTestCase):
                     query, key, cos, sin
                 )
                 atol = rtol = precision[dtype]
-                torch.testing.assert_close(q_out, q_expected, atol=atol, rtol=atol)
-                torch.testing.assert_close(k_out, k_expected, atol=atol, rtol=atol)
+                torch.testing.assert_close(q_out, q_expected, atol=atol, rtol=rtol)
+                torch.testing.assert_close(k_out, k_expected, atol=atol, rtol=rtol)
 
 
 if __name__ == "__main__":
