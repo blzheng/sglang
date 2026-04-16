@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, fields
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -63,3 +63,24 @@ class ForwardInputBuffers:
                 ), f"Field {name} is expected to be a torch.Tensor, a dict of torch.Tensor, or a dataclass of torch.Tensor, but got {type(buffer)}."
                 new_buffer = self._share_one_buffer(name, buffer)
                 setattr(self, name, new_buffer)
+
+
+@dataclass
+class GraphInputBuffers:
+    """Simple container for CPU graph input tensors."""
+
+    input_ids: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    out_cache_loc: torch.Tensor
+    positions: torch.Tensor
+    mrope_positions: torch.Tensor
+    num_token_non_padded: torch.Tensor
+    custom_mask: torch.Tensor
+    input_embeds: Optional[torch.Tensor]
+    seq_lens_cpu: Optional[torch.Tensor]
+    next_token_logits_buffer: Optional[torch.Tensor]
+    global_num_tokens_gpu: Optional[torch.Tensor]
+    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    encoder_lens: Optional[torch.Tensor]
+    pp_proxy_tensors: Optional[dict]
