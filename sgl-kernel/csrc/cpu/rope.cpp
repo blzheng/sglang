@@ -71,8 +71,10 @@ void rotary_embedding_3D_kernel_impl(
 template <typename scalar_t>
 void rotary_embedding_neox_4D_kernel_impl(
     int64_t* __restrict__ positions,
-    scalar_t* __restrict__ query,
-    scalar_t* __restrict__ key,
+    scalar_t* query,
+    scalar_t* query_out,
+    scalar_t* key,
+    scalar_t* key_out,
     scalar_t* __restrict__ cos_sin_cache,
     int64_t rotary_dim,
     int64_t query_stride_b,
@@ -94,7 +96,7 @@ void rotary_embedding_neox_4D_kernel_impl(
   bool flag = (embed_dim % bVecSize == 0);
   int64_t loop_upper = flag ? embed_dim : embed_dim - bVecSize;
 
-  auto compute_loop = [&](int64_t token_head, scalar_t* cache_ptr, scalar_t* qk) {
+  auto compute_loop = [&](int64_t token_head, scalar_t* cache_ptr, scalar_t* qk, scalar_t* qk_out) {
     int64_t j = 0;
     for (; j < loop_upper; j += bVecSize) {
       int64_t rot_offset = j;
@@ -121,12 +123,12 @@ void rotary_embedding_neox_4D_kernel_impl(
       auto out1_0 = _q_x_0 * _cos_0 - _q_y_0 * _sin_0;
       auto out1_1 = _q_x_1 * _cos_1 - _q_y_1 * _sin_1;
       auto out1 = convert_from_float_ext<scalar_t>(out1_0, out1_1);
-      out1.store(qk + out_x);
+      out1.store(qk_out + out_x);
 
       auto out2_0 = _q_y_0 * _cos_0 + _q_x_0 * _sin_0;
       auto out2_1 = _q_y_1 * _cos_1 + _q_x_1 * _sin_1;
       auto out2 = convert_from_float_ext<scalar_t>(out2_0, out2_1);
-      out2.store(qk + out_y);
+      out2.store(qk_out + out_y);
     }
     if (!flag) {
       for (; j < embed_dim; ++j) {
@@ -142,9 +144,13 @@ void rotary_embedding_neox_4D_kernel_impl(
         float _q_x = qk[out_x];
         float _q_y = qk[out_y];
 
-        qk[out_x] = _q_x * _cos - _q_y * _sin;
-        qk[out_y] = _q_y * _cos + _q_x * _sin;
+        qk_out[out_x] = _q_x * _cos - _q_y * _sin;
+        qk_out[out_y] = _q_y * _cos + _q_x * _sin;
       }
+    }
+    // Copy non-rotary elements from input to output
+    for (int64_t j = rotary_dim; j < head_size; ++j) {
+      qk_out[token_head + j] = qk[token_head + j];
     }
   };
 
@@ -157,13 +163,13 @@ void rotary_embedding_neox_4D_kernel_impl(
       for (int64_t i = 0; i < num_heads; ++i) {
         int64_t head_idx = i;
         int64_t token_head = bs * query_stride_b + seq * query_stride_s + head_idx * query_stride_h;
-        compute_loop(token_head, cache_ptr, query);
+        compute_loop(token_head, cache_ptr, query, query_out);
       }
 
       for (int64_t i = 0; i < num_kv_heads; ++i) {
         int64_t head_idx = i;
         int64_t token_head = bs * key_stride_b + seq * key_stride_s + head_idx * key_stride_h;
-        compute_loop(token_head, cache_ptr, key);
+        compute_loop(token_head, cache_ptr, key, key_out);
       }
     }
   }
@@ -474,8 +480,10 @@ void multimodal_rotary_embedding_neox_2D_kernel_impl(
 template <typename scalar_t>
 void rotary_embedding_4D_kernel_impl(
     int64_t* __restrict__ positions,
-    scalar_t* __restrict__ query,
-    scalar_t* __restrict__ key,
+    scalar_t* query,
+    scalar_t* query_out,
+    scalar_t* key,
+    scalar_t* key_out,
     scalar_t* __restrict__ cos_sin_cache,
     int64_t rotary_dim,
     int64_t query_stride_b,
@@ -502,6 +510,7 @@ void rotary_embedding_4D_kernel_impl(
       int64_t head_idx = i;
       int64_t token_head = bs * query_stride_b + seq * query_stride_s + head_idx * query_stride_h;
       scalar_t* head_query = token_head + query;
+      scalar_t* head_query_out = token_head + query_out;
       for (int64_t j = 0; j < embed_dim; j += 1) {
         int64_t rot_offset = j;
         int64_t x_index = 2 * rot_offset;
@@ -513,8 +522,12 @@ void rotary_embedding_4D_kernel_impl(
         float x = head_query[x_index];
         float y = head_query[y_index];
 
-        head_query[x_index] = x * cos - y * sin;
-        head_query[y_index] = y * cos + x * sin;
+        head_query_out[x_index] = x * cos - y * sin;
+        head_query_out[y_index] = y * cos + x * sin;
+      }
+      // Copy non-rotary elements from input to output
+      for (int64_t j = rotary_dim; j < head_size; ++j) {
+        head_query_out[j] = head_query[j];
       }
       data_index_step(bs, batch_size, seq, seq_len, i, num_heads);
     }
@@ -531,6 +544,7 @@ void rotary_embedding_4D_kernel_impl(
       int64_t head_idx = i;
       int64_t token_head = bs * key_stride_b + seq * key_stride_s + head_idx * head_size;
       scalar_t* head_key = key + token_head;
+      scalar_t* head_key_out = key_out + token_head;
       for (int64_t j = 0; j < embed_dim; j += 1) {
         int64_t rot_offset = j;
         int64_t x_index = 2 * rot_offset;
@@ -542,8 +556,12 @@ void rotary_embedding_4D_kernel_impl(
         float x = head_key[x_index];
         float y = head_key[y_index];
 
-        head_key[x_index] = x * cos - y * sin;
-        head_key[y_index] = y * cos + x * sin;
+        head_key_out[x_index] = x * cos - y * sin;
+        head_key_out[y_index] = y * cos + x * sin;
+      }
+      // Copy non-rotary elements from input to output
+      for (int64_t j = rotary_dim; j < head_size; ++j) {
+        head_key_out[j] = head_key[j];
       }
       data_index_step(bs, batch_size, seq, seq_len, i, num_kv_heads);
     }
@@ -891,12 +909,12 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
     if (input_dim == 2 || input_dim == 4) {
-      query_out.copy_(query);
-      key_out.copy_(key);
       if (is_neox) {
         rotary_embedding_neox_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
+            query.data_ptr<scalar_t>(),
             query_out.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
             key_out.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
@@ -914,7 +932,9 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
       } else {
         rotary_embedding_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
+            query.data_ptr<scalar_t>(),
             query_out.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
             key_out.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
@@ -1109,6 +1129,8 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
         rotary_embedding_neox_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
+            query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
@@ -1127,6 +1149,8 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
         rotary_embedding_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
             query.data_ptr<scalar_t>(),
+            query.data_ptr<scalar_t>(),
+            key.data_ptr<scalar_t>(),
             key.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
