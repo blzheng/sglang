@@ -633,6 +633,7 @@ class ServerArgs:
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
     enable_torch_compile: bool = False
+    enable_prefill_cpu_graph: bool = False
     disable_piecewise_cuda_graph: bool = False
     enforce_piecewise_cuda_graph: bool = False
     enable_torch_compile_debug_mode: bool = False
@@ -5462,6 +5463,11 @@ class ServerArgs:
             "--enable-torch-compile",
             action="store_true",
             help="Optimize the model with torch.compile. Experimental feature.",
+        )
+        parser.add_argument(
+            "--enable-prefill-cpu-graph",
+            action="store_true",
+            help="Optimize the model with torch.compile for extend/prefill only on CPU. Experimental feature.",
         )
         parser.add_argument(
             "--enable-torch-compile-debug-mode",

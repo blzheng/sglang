@@ -31,7 +31,7 @@ from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, get_bool_env_var, is_cpu, is_cuda, is_hip, is_npu
 
 Qwen3Config = None
 
@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
@@ -166,15 +167,36 @@ class Qwen3Attention(nn.Module):
 
     def forward_prepare_native(self, positions, hidden_states):
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
+        if _is_cpu:
+            # Performing view operations first and then slice ensures that
+            # the last dimension is continuous, allowing torch.compile to
+            # generate vectorized kernels as much as possible.
+            batch_dims = qkv.shape[:-1]
+            qkv_view = qkv.view(*batch_dims, -1, self.head_dim)
+            q_view = qkv_view[..., : self.num_heads, :]
+            k_view = qkv_view[
+                ..., self.num_heads : self.num_heads + self.num_kv_heads, :
+            ]
+            v_view = qkv_view[..., self.num_heads + self.num_kv_heads :, :]
+            q_reshape = q_view.reshape(-1, self.head_dim)
+            k_reshape = k_view.reshape(-1, self.head_dim)
+
+            q_by_head = self.q_norm(q_reshape)
+            k_by_head = self.k_norm(k_reshape)
+            q = q_by_head.view(*batch_dims, self.q_size)
+            k = k_by_head.view(*batch_dims, self.kv_size)
+            v = v_view.view(*batch_dims, self.kv_size)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+                alt_stream=self.alt_stream,
+            )
+
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v
 
