@@ -681,7 +681,7 @@ class CPUGraphRunner:
             with patch_model(
                 self.model_runner.model,
                 True,
-                num_tokens=bs * self.num_tokens_per_bs,
+                num_tokens=self.num_tokens_per_bs,
                 tp_group=self.model_runner.tp_group,
                 dynamic=True,
             ) as forward:
