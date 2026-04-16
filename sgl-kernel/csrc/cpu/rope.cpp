@@ -891,11 +891,13 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input_dtype, "rotary_embedding_cpu", [&] {
     if (input_dim == 2 || input_dim == 4) {
+      query_out.copy_(query);
+      key_out.copy_(key);
       if (is_neox) {
         rotary_embedding_neox_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
-            query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(),
+            query_out.data_ptr<scalar_t>(),
+            key_out.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
             query_stride_b,
@@ -912,8 +914,8 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
       } else {
         rotary_embedding_4D_kernel_impl<scalar_t>(
             positions.data_ptr<int64_t>(),
-            query.data_ptr<scalar_t>(),
-            key.data_ptr<scalar_t>(),
+            query_out.data_ptr<scalar_t>(),
+            key_out.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
             query_stride_b,
@@ -928,8 +930,6 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
             batch_size,
             seq_len);
       }
-      query_out = query;
-      key_out = key;
 
     } else {
       TORCH_CHECK(
