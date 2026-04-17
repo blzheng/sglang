@@ -1176,15 +1176,19 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
             key.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
+            // query input strides (batch, seq, head)
             0,
             query_stride_s,
             head_size,
+            // query output strides (same as input: in-place)
             0,
             query_stride_s,
             head_size,
+            // key input strides (batch, seq, head)
             0,
             key_stride_s,
             head_size,
+            // key output strides (same as input: in-place)
             0,
             key_stride_s,
             head_size,
@@ -1202,15 +1206,19 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
             key.data_ptr<scalar_t>(),
             cos_sin_cache.data_ptr<scalar_t>(),
             rotary_dim,
+            // query input strides (batch, seq, head)
             0,
             query_stride_s,
             head_size,
+            // query output strides (same as input: in-place)
             0,
             query_stride_s,
             head_size,
+            // key input strides (batch, seq, head)
             0,
             key_stride_s,
             head_size,
+            // key output strides (same as input: in-place)
             0,
             key_stride_s,
             head_size,

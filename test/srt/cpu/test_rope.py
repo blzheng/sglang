@@ -356,9 +356,7 @@ class TestROPE(CustomTestCase):
         """
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
-        # Test configs: (head_size, rotary_dim, max_pos, base, is_neox, dtype, device,
-        #                batch_size, seq_len, num_q_heads, num_kv_heads,
-        #                full_head_dim, nope_dim, rope_dim, dims)
+        # Test configs for non-contiguous query/key slicing scenarios
         test_configs = [
             # 2D non-neox: slice q from [seq, num_heads * full_head_dim]
             {
