@@ -16,12 +16,6 @@ execute_process(
 
 message(STATUS ${TORCH_PY_PREFIX})
 list(APPEND CMAKE_PREFIX_PATH ${TORCH_PY_PREFIX}/Torch)
-# Create dummy CUDA targets for CPU-only builds with CUDA-enabled PyTorch
-if(NOT TARGET torch::cudart)
-    add_library(torch_cudart_dummy INTERFACE)
-    add_library(torch::cudart ALIAS torch_cudart_dummy)
-endif()
-
 find_package(Torch REQUIRED)
 
 include_directories(

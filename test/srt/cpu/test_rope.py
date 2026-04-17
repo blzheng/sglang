@@ -347,6 +347,242 @@ class TestROPE(CustomTestCase):
                 torch.testing.assert_close(q_out, q_expected, atol=atol, rtol=rtol)
                 torch.testing.assert_close(k_out, k_expected, atol=atol, rtol=rtol)
 
+    def test_noncontiguous_rope(self):
+        """Test rotary_embedding_cpu with non-contiguous query/key tensors.
+
+        This simulates the DeepSeek-V2 pattern where q_pe and k_pe are slices
+        of larger tensors, making them non-contiguous with strides that differ
+        from the output tensors created by at::empty_like().
+        """
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+
+        # Test configs: (head_size, rotary_dim, max_pos, base, is_neox, dtype, device,
+        #                batch_size, seq_len, num_q_heads, num_kv_heads,
+        #                full_head_dim, nope_dim, rope_dim, dims)
+        test_configs = [
+            # 2D non-neox: slice q from [seq, num_heads * full_head_dim]
+            {
+                "head_size": 64,
+                "rotary_dim": 64,
+                "max_pos": 256,
+                "base": 10000,
+                "is_neox": False,
+                "batch_size": 1,
+                "seq_len": 32,
+                "num_q_heads": 8,
+                "num_kv_heads": 2,
+                "full_q_head_dim": 192,
+                "nope_dim": 128,
+                "rope_dim": 64,
+                "dims": 2,
+            },
+            # 2D neox: slice q from [seq, num_heads * full_head_dim]
+            {
+                "head_size": 64,
+                "rotary_dim": 64,
+                "max_pos": 256,
+                "base": 10000,
+                "is_neox": True,
+                "batch_size": 1,
+                "seq_len": 32,
+                "num_q_heads": 8,
+                "num_kv_heads": 2,
+                "full_q_head_dim": 192,
+                "nope_dim": 128,
+                "rope_dim": 64,
+                "dims": 2,
+            },
+            # 4D non-neox: slice from [batch, seq, heads, full_head_dim]
+            {
+                "head_size": 64,
+                "rotary_dim": 64,
+                "max_pos": 256,
+                "base": 10000,
+                "is_neox": False,
+                "batch_size": 2,
+                "seq_len": 16,
+                "num_q_heads": 4,
+                "num_kv_heads": 2,
+                "full_q_head_dim": 192,
+                "nope_dim": 128,
+                "rope_dim": 64,
+                "dims": 4,
+            },
+            # 4D neox: slice from [batch, seq, heads, full_head_dim]
+            {
+                "head_size": 64,
+                "rotary_dim": 64,
+                "max_pos": 256,
+                "base": 10000,
+                "is_neox": True,
+                "batch_size": 2,
+                "seq_len": 16,
+                "num_q_heads": 4,
+                "num_kv_heads": 2,
+                "full_q_head_dim": 192,
+                "nope_dim": 128,
+                "rope_dim": 64,
+                "dims": 4,
+            },
+            # head_size > rotary_dim (non-neox, 2D)
+            {
+                "head_size": 128,
+                "rotary_dim": 64,
+                "max_pos": 256,
+                "base": 10000,
+                "is_neox": False,
+                "batch_size": 1,
+                "seq_len": 32,
+                "num_q_heads": 4,
+                "num_kv_heads": 2,
+                "full_q_head_dim": 256,
+                "nope_dim": 128,
+                "rope_dim": 128,
+                "dims": 2,
+            },
+            # head_size > rotary_dim (neox, 4D)
+            {
+                "head_size": 128,
+                "rotary_dim": 64,
+                "max_pos": 256,
+                "base": 10000,
+                "is_neox": True,
+                "batch_size": 2,
+                "seq_len": 16,
+                "num_q_heads": 4,
+                "num_kv_heads": 2,
+                "full_q_head_dim": 256,
+                "nope_dim": 128,
+                "rope_dim": 128,
+                "dims": 4,
+            },
+        ]
+
+        for cfg in test_configs:
+            with self.subTest(**cfg):
+                torch.manual_seed(42)
+                head_size = cfg["head_size"]
+                rotary_dim = cfg["rotary_dim"]
+                max_pos = cfg["max_pos"]
+                base = cfg["base"]
+                is_neox = cfg["is_neox"]
+                batch_size = cfg["batch_size"]
+                seq_len = cfg["seq_len"]
+                num_q_heads = cfg["num_q_heads"]
+                num_kv_heads = cfg["num_kv_heads"]
+                full_q_head_dim = cfg["full_q_head_dim"]
+                nope_dim = cfg["nope_dim"]
+                rope_dim = cfg["rope_dim"]
+                dims = cfg["dims"]
+                dtype = torch.bfloat16
+
+                # Build cos_sin_cache
+                freqs = torch.rand(max_pos, rotary_dim // 2)
+                cos = freqs.cos() * 0.7
+                sin = freqs.sin() * 0.7
+                cos_sin_cache = torch.cat((cos, sin), dim=-1).to(dtype)
+
+                num_tokens = batch_size * seq_len
+                positions = torch.randint(0, max_pos, (num_tokens,))
+
+                if dims == 2:
+                    # Create 2D tensors and slice to get non-contiguous
+                    q_full = torch.randn(
+                        num_tokens,
+                        num_q_heads * full_q_head_dim,
+                        dtype=dtype,
+                    )
+                    k_full = torch.randn(
+                        num_tokens,
+                        num_kv_heads * full_q_head_dim,
+                        dtype=dtype,
+                    )
+                    # Slice off the rope portion (last rope_dim * num_heads elements per head)
+                    # For 2D, the slicing is per-head; we need to reshape
+                    q_full_3d = q_full.view(
+                        num_tokens, num_q_heads, full_q_head_dim
+                    )
+                    k_full_3d = k_full.view(
+                        num_tokens, num_kv_heads, full_q_head_dim
+                    )
+                    # Slice to get the rope portion (non-contiguous)
+                    q_pe_3d = q_full_3d[:, :, nope_dim : nope_dim + rope_dim]
+                    k_pe_3d = k_full_3d[:, :, nope_dim : nope_dim + rope_dim]
+                    # Reshape back to 2D (still non-contiguous)
+                    q_pe = q_pe_3d.reshape(num_tokens, num_q_heads * rope_dim)
+                    k_pe = k_pe_3d.reshape(num_tokens, num_kv_heads * rope_dim)
+                    # Make contiguous copies for reference
+                    q_pe_ref = q_pe.contiguous().clone()
+                    k_pe_ref = k_pe.contiguous().clone()
+                    q_pe_cpu = q_pe.contiguous().clone()
+                    k_pe_cpu = k_pe.contiguous().clone()
+                else:  # dims == 4
+                    q_full = torch.randn(
+                        batch_size,
+                        seq_len,
+                        num_q_heads,
+                        full_q_head_dim,
+                        dtype=dtype,
+                    )
+                    k_full = torch.randn(
+                        batch_size,
+                        seq_len,
+                        num_kv_heads,
+                        full_q_head_dim,
+                        dtype=dtype,
+                    )
+                    # Slice to get non-contiguous rope portion
+                    q_pe = q_full[
+                        :, :, :, nope_dim : nope_dim + rope_dim
+                    ]
+                    k_pe = k_full[
+                        :, :, :, nope_dim : nope_dim + rope_dim
+                    ]
+                    # Make contiguous copies for reference
+                    q_pe_ref = q_pe.contiguous().clone()
+                    k_pe_ref = k_pe.contiguous().clone()
+                    q_pe_cpu = q_pe.contiguous().clone()
+                    k_pe_cpu = k_pe.contiguous().clone()
+
+                # Verify inputs are contiguous (our test targets contiguous copies)
+                assert q_pe_ref.is_contiguous()
+                assert k_pe_ref.is_contiguous()
+
+                # Reference: apply on contiguous copies
+                rope_ref = RotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_pos,
+                    base,
+                    is_neox,
+                    dtype,
+                ).to("cpu")
+                rope_ref.register_buffer("cos_sin_cache", cos_sin_cache)
+
+                q_ref_out, k_ref_out = rope_ref.forward_native(
+                    positions, q_pe_ref, k_pe_ref
+                )
+
+                # Kernel under test: apply on contiguous copies
+                q_cpu_out, k_cpu_out = (
+                    torch.ops.sgl_kernel.rotary_embedding_cpu(
+                        positions,
+                        q_pe_cpu,
+                        k_pe_cpu,
+                        head_size,
+                        cos_sin_cache,
+                        is_neox,
+                    )
+                )
+
+                atol = rtol = precision[dtype]
+                torch.testing.assert_close(
+                    q_ref_out, q_cpu_out, atol=atol, rtol=rtol
+                )
+                torch.testing.assert_close(
+                    k_ref_out, k_cpu_out, atol=atol, rtol=rtol
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
