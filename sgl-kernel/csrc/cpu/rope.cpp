@@ -149,8 +149,11 @@ void rotary_embedding_neox_4D_kernel_impl(
       }
     }
     // Copy non-rotary elements from input to output
-    for (int64_t j = rotary_dim; j < head_size; ++j) {
-      qk_out[token_head + j] = qk[token_head + j];
+    if (rotary_dim < head_size) {
+      std::memcpy(
+          qk_out + token_head + rotary_dim,
+          qk + token_head + rotary_dim,
+          (head_size - rotary_dim) * sizeof(scalar_t));
     }
   };
 
@@ -526,8 +529,11 @@ void rotary_embedding_4D_kernel_impl(
         head_query_out[y_index] = y * cos + x * sin;
       }
       // Copy non-rotary elements from input to output
-      for (int64_t j = rotary_dim; j < head_size; ++j) {
-        head_query_out[j] = head_query[j];
+      if (rotary_dim < head_size) {
+        std::memcpy(
+            head_query_out + rotary_dim,
+            head_query + rotary_dim,
+            (head_size - rotary_dim) * sizeof(scalar_t));
       }
       data_index_step(bs, batch_size, seq, seq_len, i, num_heads);
     }
@@ -560,8 +566,11 @@ void rotary_embedding_4D_kernel_impl(
         head_key_out[y_index] = y * cos + x * sin;
       }
       // Copy non-rotary elements from input to output
-      for (int64_t j = rotary_dim; j < head_size; ++j) {
-        head_key_out[j] = head_key[j];
+      if (rotary_dim < head_size) {
+        std::memcpy(
+            head_key_out + rotary_dim,
+            head_key + rotary_dim,
+            (head_size - rotary_dim) * sizeof(scalar_t));
       }
       data_index_step(bs, batch_size, seq, seq_len, i, num_kv_heads);
     }
