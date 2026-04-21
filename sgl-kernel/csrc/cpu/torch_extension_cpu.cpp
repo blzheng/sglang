@@ -23,6 +23,9 @@ limitations under the License.
 // clamp_position
 at::Tensor clamp_position_cpu(const at::Tensor& seq_lens);
 
+// clamp
+at::Tensor clamp_cpu(const at::Tensor& input, double min_val, double max_val);
+
 // silu_and_mul
 at::Tensor silu_and_mul_cpu(at::Tensor& input);
 
@@ -418,6 +421,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // clamp
   m.def("clamp_position_cpu(Tensor seq_lens) -> Tensor");
   m.impl("clamp_position_cpu", torch::kCPU, &clamp_position_cpu);
+  m.def("clamp_cpu(Tensor input, float min_val, float max_val) -> Tensor");
+  m.impl("clamp_cpu", torch::kCPU, &clamp_cpu);
 
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
