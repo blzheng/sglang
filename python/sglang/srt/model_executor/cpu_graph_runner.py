@@ -119,6 +119,7 @@ def register_fake_ops():
     none_return_ops = [
         "shm_allreduce",
         "bmm_cpu",
+        "clamp_cpu",
         "fused_add_rmsnorm_cpu",
         "decode_attention_cpu",
         "extend_attention_cpu",

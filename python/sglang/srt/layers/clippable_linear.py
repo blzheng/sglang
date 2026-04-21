@@ -35,9 +35,26 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, cpu_has_amx_support, is_cpu
 
 _INF = float("inf")
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
+
+
+def _clamp(
+    x: torch.Tensor, min_val: torch.Tensor, max_val: torch.Tensor
+) -> torch.Tensor:
+    """Clamp *x* element-wise between scalar-tensor bounds.
+
+    *min_val* and *max_val* are 0-d (scalar) tensors.
+    On CPU, dispatches to the vectorised sgl-kernel implementation when
+    available; otherwise falls back to ``torch.clamp``.
+    """
+    if _is_cpu and _is_cpu_amx_available:
+        torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
+        return x
+    return torch.clamp(x, min_val, max_val)
 
 
 class ClippableRowParallelLinear(nn.Module):
@@ -70,9 +87,9 @@ class ClippableRowParallelLinear(nn.Module):
         self.output_max = nn.parameter.Buffer(torch.tensor(_INF), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.clamp(x, self.input_min, self.input_max)
+        x = _clamp(x, self.input_min, self.input_max)
         x, _ = self.linear(x)
-        x = torch.clamp(x, self.output_min, self.output_max)
+        x = _clamp(x, self.output_min, self.output_max)
         return x
 
 
@@ -102,9 +119,9 @@ class ClippableColumnParallelLinear(nn.Module):
         self.output_max = nn.parameter.Buffer(torch.tensor(_INF), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.clamp(x, self.input_min, self.input_max)
+        x = _clamp(x, self.input_min, self.input_max)
         x, _ = self.linear(x)
-        x = torch.clamp(x, self.output_min, self.output_max)
+        x = _clamp(x, self.output_min, self.output_max)
         return x
 
 
@@ -153,12 +170,12 @@ class ClippableQKVParallelLinear(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x = torch.clamp(hidden_states, self.input_min, self.input_max)
+        x = _clamp(hidden_states, self.input_min, self.input_max)
         qkv, _ = self.qkv_proj(x)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q = torch.clamp(q, self.q_output_min, self.q_output_max)
-        k = torch.clamp(k, self.k_output_min, self.k_output_max)
-        v = torch.clamp(v, self.v_output_min, self.v_output_max)
+        q = _clamp(q, self.q_output_min, self.q_output_max)
+        k = _clamp(k, self.k_output_min, self.k_output_max)
+        v = _clamp(v, self.v_output_min, self.v_output_max)
         return q, k, v
 
 
@@ -224,11 +241,11 @@ class ClippableGLUParallelLinear(nn.Module):
         self.output_max = nn.parameter.Buffer(torch.tensor(_INF), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.clamp(x, self.input_min, self.input_max)
+        x = _clamp(x, self.input_min, self.input_max)
         merged, _ = self.linear(x)
         value, gate = merged.split([self.proj_size, self.proj_size], dim=-1)
         x = value * torch.sigmoid(gate)
-        x = torch.clamp(x, self.output_min, self.output_max)
+        x = _clamp(x, self.output_min, self.output_max)
         return x
 
 
@@ -275,9 +292,9 @@ class ClippableGateUpParallelLinear(nn.Module):
         self.up_output_max = nn.parameter.Buffer(torch.tensor(_INF), persistent=False)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        x = torch.clamp(x, self.input_min, self.input_max)
+        x = _clamp(x, self.input_min, self.input_max)
         gate_up, _ = self.gate_up_proj(x)
         gate, up = gate_up.split([self.proj_size, self.proj_size], dim=-1)
-        gate = torch.clamp(gate, self.gate_output_min, self.gate_output_max)
-        up = torch.clamp(up, self.up_output_min, self.up_output_max)
+        gate = _clamp(gate, self.gate_output_min, self.gate_output_max)
+        up = _clamp(up, self.up_output_min, self.up_output_max)
         return gate, up
