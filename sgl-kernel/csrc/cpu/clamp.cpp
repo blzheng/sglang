@@ -3,10 +3,6 @@
 
 namespace {
 
-// ============================================================================
-// clamp_position: clamp(seq_lens - 1, min=0) for integer types
-// ============================================================================
-
 template <typename scalar_t>
 void clamp_position_kernel_impl(
     scalar_t* __restrict__ output,
@@ -94,10 +90,8 @@ void clamp_kernel_float_impl(
 
 }  // anonymous namespace
 
-// ============================================================================
-// clamp_position_cpu: positions = clamp(seq_lens - 1, min=0)
-// ============================================================================
-
+// seq_lens : {n}
+// output   : {n}
 at::Tensor clamp_position_cpu(const at::Tensor& seq_lens) {
   RECORD_FUNCTION("sgl-kernel::clamp_position_cpu", std::vector<c10::IValue>({seq_lens}));
   TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must be a 1D tensor");
