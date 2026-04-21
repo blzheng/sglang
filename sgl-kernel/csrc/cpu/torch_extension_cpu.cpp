@@ -20,6 +20,9 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 #include "shm.h"
 
+// clamp_position
+at::Tensor clamp_position_cpu(const at::Tensor& seq_lens);
+
 // silu_and_mul
 at::Tensor silu_and_mul_cpu(at::Tensor& input);
 
@@ -412,6 +415,10 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  // clamp
+  m.def("clamp_position_cpu(Tensor seq_lens) -> Tensor");
+  m.impl("clamp_position_cpu", torch::kCPU, &clamp_position_cpu);
+
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
   m.impl("silu_and_mul_cpu", torch::kCPU, &silu_and_mul_cpu);
