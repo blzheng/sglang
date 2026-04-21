@@ -41,8 +41,9 @@ _INF = float("inf")
 
 
 def _clamp(x: torch.Tensor, min_val: torch.Tensor, max_val: torch.Tensor) -> torch.Tensor:
-    """Clamp *x* element-wise between scalar bounds.
+    """Clamp *x* element-wise between scalar-tensor bounds.
 
+    *min_val* and *max_val* are 0-d (scalar) tensors.
     On CPU, dispatches to the vectorised sgl-kernel implementation when
     available; otherwise falls back to ``torch.clamp``.
     """
