@@ -208,6 +208,15 @@ def register_fake_ops():
     ):
         return query, key
 
+    @torch.library.register_fake("sgl_kernel::position_embeddings_cpu")
+    def _(patch_positions, padding_positions, position_embedding_table):
+        batch_size = patch_positions.shape[0]
+        seq_len = patch_positions.shape[1]
+        embedding_dim = position_embedding_table.shape[1]
+        return torch.empty(
+            batch_size, seq_len, embedding_dim, device=patch_positions.device
+        )
+
     @torch.library.register_fake("sgl_kernel::qkv_proj_with_rope_fused_weight")
     def _(
         hidden_states,

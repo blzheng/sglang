@@ -431,6 +431,10 @@ class Gemma4VisionPatchEmbedder(nn.Module):
     def _position_embeddings(
         self, patch_positions: torch.Tensor, padding_positions: torch.Tensor
     ) -> torch.Tensor:
+        if _is_cpu and _cpu_has_amx_support:
+            return torch.ops.sgl_kernel.position_embeddings_cpu(
+                patch_positions, padding_positions, self.position_embedding_table
+            )
         clamped_positions = patch_positions.clamp(min=0)
         one_hot = F.one_hot(clamped_positions, num_classes=self.position_embedding_size)
         one_hot = one_hot.permute(0, 2, 1, 3).to(self.position_embedding_table)

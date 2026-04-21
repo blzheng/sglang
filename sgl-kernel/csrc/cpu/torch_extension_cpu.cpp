@@ -392,6 +392,10 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
     int64_t head_qk,
     int64_t head_v);
 
+// position embeddings for vision patch embedding
+at::Tensor position_embeddings_cpu(
+    at::Tensor& patch_positions, at::Tensor& padding_positions, at::Tensor& position_embedding_table);
+
 // image preprocessor
 std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     at::TensorList images,
@@ -661,6 +665,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
       "out_dtype) -> (Tensor, Tensor)");
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
+
+  // position embeddings
+  m.def(
+      "position_embeddings_cpu(Tensor patch_positions, Tensor padding_positions, Tensor position_embedding_table) -> "
+      "Tensor");
+  m.impl("position_embeddings_cpu", torch::kCPU, &position_embeddings_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
