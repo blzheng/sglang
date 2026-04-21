@@ -48,9 +48,8 @@ def _clamp(x: torch.Tensor, min_val: torch.Tensor, max_val: torch.Tensor) -> tor
     """
     if x.device.type == "cpu":
         try:
-            return torch.ops.sgl_kernel.clamp_cpu(
-                x, min_val.item(), max_val.item()
-            )
+            torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
+            return x
         except (AttributeError, RuntimeError):
             pass
     return torch.clamp(x, min_val, max_val)

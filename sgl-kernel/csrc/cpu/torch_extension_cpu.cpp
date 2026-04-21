@@ -21,7 +21,7 @@ limitations under the License.
 #include "shm.h"
 
 // clamp
-at::Tensor clamp_cpu(const at::Tensor& input, double min_val, double max_val);
+void clamp_cpu(at::Tensor& input, const at::Tensor& min_val, const at::Tensor& max_val);
 
 // silu_and_mul
 at::Tensor silu_and_mul_cpu(at::Tensor& input);
@@ -416,7 +416,7 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // clamp
-  m.def("clamp_cpu(Tensor input, float min_val, float max_val) -> Tensor");
+  m.def("clamp_cpu(Tensor(a!) input, Tensor min_val, Tensor max_val) -> ()");
   m.impl("clamp_cpu", torch::kCPU, &clamp_cpu);
 
   // activation

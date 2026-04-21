@@ -39,40 +39,48 @@ requires_sgl_kernel_cpu = pytest.mark.skipif(
 class TestClampCPU:
     def test_basic(self, shape, dtype):
         x = torch.randn(shape, dtype=dtype, device="cpu")
-        min_val, max_val = -0.5, 0.5
+        min_val, max_val = torch.tensor(-0.5), torch.tensor(0.5)
         expected = _reference_clamp(x, min_val, max_val)
-        result = torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
-        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
+        torch.testing.assert_close(x, expected, rtol=0, atol=0)
 
     def test_no_clamp(self, shape, dtype):
         """When bounds are ±inf, clamp should be a no-op."""
         x = torch.randn(shape, dtype=dtype, device="cpu")
-        min_val, max_val = float("-inf"), float("inf")
+        min_val, max_val = torch.tensor(float("-inf")), torch.tensor(float("inf"))
         expected = _reference_clamp(x, min_val, max_val)
-        result = torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
-        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
+        torch.testing.assert_close(x, expected, rtol=0, atol=0)
 
     def test_clamp_min_only(self, shape, dtype):
         x = torch.randn(shape, dtype=dtype, device="cpu")
-        min_val, max_val = -0.3, float("inf")
+        min_val, max_val = torch.tensor(-0.3), torch.tensor(float("inf"))
         expected = _reference_clamp(x, min_val, max_val)
-        result = torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
-        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
+        torch.testing.assert_close(x, expected, rtol=0, atol=0)
 
     def test_clamp_max_only(self, shape, dtype):
         x = torch.randn(shape, dtype=dtype, device="cpu")
-        min_val, max_val = float("-inf"), 0.3
+        min_val, max_val = torch.tensor(float("-inf")), torch.tensor(0.3)
         expected = _reference_clamp(x, min_val, max_val)
-        result = torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
-        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
+        torch.testing.assert_close(x, expected, rtol=0, atol=0)
 
     def test_tight_bounds(self, shape, dtype):
         """Clamp to a single value."""
         x = torch.randn(shape, dtype=dtype, device="cpu")
-        min_val, max_val = 0.0, 0.0
+        min_val, max_val = torch.tensor(0.0), torch.tensor(0.0)
         expected = _reference_clamp(x, min_val, max_val)
-        result = torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
-        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
+        torch.testing.assert_close(x, expected, rtol=0, atol=0)
+
+    def test_inplace(self, shape, dtype):
+        """Verify clamp_cpu modifies the tensor in-place."""
+        x = torch.randn(shape, dtype=dtype, device="cpu")
+        original_data_ptr = x.data_ptr()
+        min_val, max_val = torch.tensor(-0.5), torch.tensor(0.5)
+        torch.ops.sgl_kernel.clamp_cpu(x, min_val, max_val)
+        assert x.data_ptr() == original_data_ptr, "clamp_cpu should modify tensor in-place"
 
 
 if __name__ == "__main__":
