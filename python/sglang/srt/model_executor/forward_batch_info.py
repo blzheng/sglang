@@ -1196,17 +1196,9 @@ def _clamp_position_native(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
-def _clamp_position_cpu(seq_lens):
-    return torch.ops.sgl_kernel.clamp_position_cpu(seq_lens)
-
-
 if is_cuda() or is_hip():
     from sglang.jit_kernel.clamp_position import clamp_position_cuda
 
     clamp_position = clamp_position_cuda
 else:
-    try:
-        torch.ops.sgl_kernel.clamp_position_cpu
-        clamp_position = _clamp_position_cpu
-    except AttributeError:
-        clamp_position = _clamp_position_native
+    clamp_position = _clamp_position_native
