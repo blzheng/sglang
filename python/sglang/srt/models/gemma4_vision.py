@@ -29,6 +29,7 @@ from sglang.srt.layers.clippable_linear import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.utils import (
     add_prefix,
@@ -415,14 +416,17 @@ class Gemma4VisionTransformer(nn.Module):
 
 
 class Gemma4VisionPatchEmbedder(nn.Module):
-    def __init__(self, config: Gemma4VisionConfig):
+    def __init__(self, config: Gemma4VisionConfig, quant_config=None):
         super().__init__()
         self.patch_size = config.patch_size
         self.hidden_size = config.hidden_size
         self.position_embedding_size = config.position_embedding_size
 
-        self.input_proj = nn.Linear(
-            3 * self.patch_size**2, self.hidden_size, bias=False
+        self.input_proj = ReplicatedLinear(
+            3 * self.patch_size**2,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
         )
         self.position_embedding_table = nn.Parameter(
             torch.ones(2, self.position_embedding_size, self.hidden_size)
@@ -453,7 +457,7 @@ class Gemma4VisionPatchEmbedder(nn.Module):
                           by the image processor, values in [0, 1].
         """
         patches = 2 * (pixel_values - 0.5)
-        return self.input_proj(patches.to(self.input_proj.weight.dtype))
+        return self.input_proj(patches.to(self.input_proj.weight.dtype))[0]
 
     def forward(
         self,
@@ -557,7 +561,7 @@ class Gemma4VisionEncoder(nn.Module):
         self.patch_size = config.patch_size
         self.pooling_kernel_size = config.pooling_kernel_size
 
-        self.patch_embedder = Gemma4VisionPatchEmbedder(config)
+        self.patch_embedder = Gemma4VisionPatchEmbedder(config, quant_config)
         self.encoder = Gemma4VisionTransformer(
             config,
             quant_config=quant_config,
