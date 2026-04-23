@@ -112,6 +112,8 @@ def register_fake_ops():
         "shm_allreduce",
         "bmm_cpu",
         "fused_add_rmsnorm_cpu",
+        "gemma_fused_add_rmsnorm_cpu",
+        "fused_add_layernorm_cpu",
         "decode_attention_cpu",
         "extend_attention_cpu",
     ]
@@ -175,7 +177,7 @@ def register_fake_ops():
 
     @torch.library.register_fake("sgl_kernel::rotary_embedding_cpu")
     def _(positions, query, key, head_size, cos_sin_cache, is_neox):
-        if query.ndim == 2:
+        if query.ndim == 2 or query.ndim == 4:
             return query, key
         else:
             return torch.empty_like(query), torch.empty_like(key)
@@ -597,6 +599,11 @@ class CPUGraphRunner:
         ), "PPProxyTensors is not supported in CPUGraphRunner yet."
         self.recapture_if_needed(forward_batch)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+        # Normalize input_ids dtype to match the capture buffer (int64).
+        # The sampler may produce int32 (top-k/p) or int64 (greedy); casting here
+        # avoids dtype-specialization recompiles in the compiled graph.
+        if forward_batch.input_ids.dtype != self.input_ids.dtype:
+            forward_batch.input_ids = forward_batch.input_ids.to(self.input_ids.dtype)
         output = self.graphs[forward_batch.batch_size](
             forward_batch.input_ids,
             forward_batch.positions,
