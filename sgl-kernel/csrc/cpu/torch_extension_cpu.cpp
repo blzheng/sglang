@@ -396,6 +396,42 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
 at::Tensor position_embeddings_cpu(
     at::Tensor& patch_positions, at::Tensor& padding_positions, at::Tensor& position_embedding_table);
 
+// gemma4 audio softcap attention
+at::Tensor gemma4_audio_softcap_attn_cpu(
+    at::Tensor& logits,
+    at::Tensor& validity_mask,
+    at::Tensor& causal_mask,
+    at::Tensor& value_blocks,
+    double softcap,
+    double invalid_logits_value,
+    int64_t q_time);
+
+// gemma4 audio qkv preprocess
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> gemma4_audio_qkv_preprocess_cpu(
+    at::Tensor& q,
+    at::Tensor& k,
+    at::Tensor& v,
+    at::Tensor& mask,
+    at::Tensor& per_dim_scale,
+    double q_scale,
+    double k_scale,
+    int64_t num_heads,
+    int64_t head_dim,
+    int64_t chunk_size,
+    int64_t max_past_horizon,
+    int64_t max_future_horizon);
+
+// gemma4 audio relative position logits (fully-fused)
+at::Tensor gemma4_audio_rel_pos_logits_cpu(
+    at::Tensor& queries,
+    at::Tensor& keys,
+    at::Tensor& inv_timescales,
+    at::Tensor& pos_proj_weight,
+    int64_t max_backward,
+    int64_t max_forward,
+    int64_t num_heads,
+    int64_t head_dim);
+
 // image preprocessor
 std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     at::TensorList images,
@@ -671,6 +707,25 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "position_embeddings_cpu(Tensor patch_positions, Tensor padding_positions, Tensor position_embedding_table) -> "
       "Tensor");
   m.impl("position_embeddings_cpu", torch::kCPU, &position_embeddings_cpu);
+
+  // gemma4 audio softcap attention
+  m.def(
+      "gemma4_audio_softcap_attn_cpu(Tensor logits, Tensor validity_mask, Tensor causal_mask, "
+      "Tensor value_blocks, float softcap, float invalid_logits_value, int q_time) -> Tensor");
+  m.impl("gemma4_audio_softcap_attn_cpu", torch::kCPU, &gemma4_audio_softcap_attn_cpu);
+
+  // gemma4 audio qkv preprocess
+  m.def(
+      "gemma4_audio_qkv_preprocess_cpu(Tensor q, Tensor k, Tensor v, Tensor mask, "
+      "Tensor per_dim_scale, float q_scale, float k_scale, int num_heads, int head_dim, "
+      "int chunk_size, int max_past_horizon, int max_future_horizon) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.impl("gemma4_audio_qkv_preprocess_cpu", torch::kCPU, &gemma4_audio_qkv_preprocess_cpu);
+
+  // gemma4 audio relative position logits (fully-fused)
+  m.def(
+      "gemma4_audio_rel_pos_logits_cpu(Tensor queries, Tensor keys, Tensor inv_timescales, Tensor pos_proj_weight, int "
+      "max_backward, int max_forward, int num_heads, int head_dim) -> Tensor");
+  m.impl("gemma4_audio_rel_pos_logits_cpu", torch::kCPU, &gemma4_audio_rel_pos_logits_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {

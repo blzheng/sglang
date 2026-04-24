@@ -48,12 +48,21 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
+from sglang.srt.utils import (
+    add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
+    make_layers,
+    set_weight_attrs,
+)
 
 # SSCP convolution constants (no longer in config.json, never varied across models)
 _SSCP_INPUT_FEAT_SIZE = 128
 _SSCP_CONV_KERNEL_SIZES = ((3, 3), (3, 3))
 _SSCP_CONV_STRIDE_SIZES = ((2, 2), (2, 2))
+
+_is_cpu = is_cpu()
+_cpu_has_amx_support = _is_cpu and cpu_has_amx_support()
 
 # ---------------------------------------------------------------------------
 # Relative Position Embedding
@@ -157,11 +166,22 @@ class Gemma4AudioRelativePositionEmbedding(nn.Module):
         return term_bd_shifted
 
     def forward(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        if _is_cpu and _cpu_has_amx_support:
+            return torch.ops.sgl_kernel.gemma4_audio_rel_pos_logits_cpu(
+                queries,
+                keys,
+                self.inv_timescales,
+                self.pos_proj.weight,
+                self.max_backward,
+                self.max_forward,
+                self.num_heads,
+                self.head_dim,
+            )
+
         batch_size, num_query_blocks, query_block_size, num_heads, head_dim = (
             queries.shape
         )
         _, _, key_context_size, _, _ = keys.shape
-
         pos_indices = torch.arange(
             self.max_backward, -self.max_forward - 1, -1, device=queries.device
         ).unsqueeze(0)
@@ -312,85 +332,120 @@ class Gemma4AudioAttention(nn.Module):
         causal_valid_mask: torch.BoolTensor,
     ) -> torch.Tensor:
         q, k, v = self.qkv(x)
-        qkv_shape = (*x.shape[:-1], self.num_heads, self.head_dim)
-        query_states = q.float().reshape(qkv_shape).contiguous()
-        key_states = k.float().reshape(qkv_shape).contiguous()
-        value_states = v.float().reshape(qkv_shape).contiguous()
 
-        per_dim_scale_sp = F.softplus(self.per_dim_scale)
-        broadcast_shape = (1, 1, 1, self.head_dim)
-        query_states = (
-            query_states * self.q_scale * per_dim_scale_sp.view(broadcast_shape)
-        )
+        if _is_cpu and _cpu_has_amx_support:
+            batch_size = q.shape[0]
+            q_time = q.shape[1]
+            query_blocks, key_blocks, value_blocks, extracted_valid_mask_blocks = (
+                torch.ops.sgl_kernel.gemma4_audio_qkv_preprocess_cpu(
+                    q,
+                    k,
+                    v,
+                    mask,
+                    self.per_dim_scale,
+                    self.q_scale,
+                    self.k_scale,
+                    self.num_heads,
+                    self.head_dim,
+                    self.chunk_size,
+                    self.max_past_horizon,
+                    self.max_future_horizon,
+                )
+            )
+        else:
+            qkv_shape = (*x.shape[:-1], self.num_heads, self.head_dim)
+            query_states = q.float().reshape(qkv_shape).contiguous()
+            key_states = k.float().reshape(qkv_shape).contiguous()
+            value_states = v.float().reshape(qkv_shape).contiguous()
 
-        key_states = key_states * self.k_scale
-
-        batch_size, q_time = query_states.shape[:2]
-
-        query_blocks = self._convert_to_block(query_states)
-        key_blocks = self._extract_block_context(key_states)
-        value_blocks = self._extract_block_context(value_states)
-        num_query_blocks = query_blocks.shape[1]
-
-        original_valid_mask = ~mask
-        extracted_valid_mask_blocks = self._extract_block_context(original_valid_mask)
-
-        if (
-            extracted_valid_mask_blocks.ndim == 4
-            and extracted_valid_mask_blocks.shape[0] == batch_size
-            and extracted_valid_mask_blocks.shape[1] == num_query_blocks
-            and extracted_valid_mask_blocks.shape[2]
-            * extracted_valid_mask_blocks.shape[3]
-            == self.context_size
-        ):
-            extracted_valid_mask_blocks = extracted_valid_mask_blocks.reshape(
-                batch_size, num_query_blocks, self.context_size
+            per_dim_scale_sp = F.softplus(self.per_dim_scale)
+            broadcast_shape = (1, 1, 1, self.head_dim)
+            query_states = (
+                query_states * self.q_scale * per_dim_scale_sp.view(broadcast_shape)
             )
 
-        condition_from_input_validity = extracted_valid_mask_blocks.unsqueeze(
-            1
-        ).unsqueeze(-2)
-        condition_from_causality = (
-            causal_valid_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-        )
+            key_states = key_states * self.k_scale
 
-        final_condition_for_where = torch.logical_and(
-            condition_from_input_validity,
-            condition_from_causality.to(condition_from_input_validity.device),
-        )
+            batch_size, q_time = query_states.shape[:2]
+
+            query_blocks = self._convert_to_block(query_states)
+            key_blocks = self._extract_block_context(key_states)
+            value_blocks = self._extract_block_context(value_states)
+            num_query_blocks = query_blocks.shape[1]
+
+            original_valid_mask = ~mask
+            extracted_valid_mask_blocks = self._extract_block_context(
+                original_valid_mask
+            )
+
+            if (
+                extracted_valid_mask_blocks.ndim == 4
+                and extracted_valid_mask_blocks.shape[0] == batch_size
+                and extracted_valid_mask_blocks.shape[1] == num_query_blocks
+                and extracted_valid_mask_blocks.shape[2]
+                * extracted_valid_mask_blocks.shape[3]
+                == self.context_size
+            ):
+                extracted_valid_mask_blocks = extracted_valid_mask_blocks.reshape(
+                    batch_size, num_query_blocks, self.context_size
+                )
 
         logits = self.relative_position_embedding(query_blocks, key_blocks)
 
-        softcap_val = self.softcap.to(logits.device)
-        logits = logits / softcap_val
-        logits = torch.tanh(logits)
-        logits = logits * softcap_val
+        if _is_cpu and _cpu_has_amx_support:
+            # Fused softcap + mask + softmax + BMM kernel
+            context_vectors = torch.ops.sgl_kernel.gemma4_audio_softcap_attn_cpu(
+                logits,
+                extracted_valid_mask_blocks,
+                causal_valid_mask,
+                value_blocks,
+                float(self.softcap.item()),
+                float(self.config.attention_invalid_logits_value),
+                q_time,
+            )
+        else:
+            condition_from_input_validity = extracted_valid_mask_blocks.unsqueeze(
+                1
+            ).unsqueeze(-2)
+            condition_from_causality = (
+                causal_valid_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+            )
 
-        logits = torch.where(
-            final_condition_for_where,
-            logits,
-            self.config.attention_invalid_logits_value,
-        )
+            final_condition_for_where = torch.logical_and(
+                condition_from_input_validity,
+                condition_from_causality.to(condition_from_input_validity.device),
+            )
 
-        probabilities = F.softmax(logits, dim=-1, dtype=torch.float32).to(
-            dtype=value_blocks.dtype
-        )
+            softcap_val = self.softcap.to(logits.device)
+            logits = logits / softcap_val
+            logits = torch.tanh(logits)
+            logits = logits * softcap_val
 
-        b_dim, n_dim, u_dim, w_dim, c_dim = probabilities.shape
-        h_dim = value_blocks.shape[-1]
-        prob_bun = probabilities.permute(0, 2, 1, 3, 4).reshape(-1, w_dim, c_dim)
-        v_bun = value_blocks.permute(0, 1, 3, 2, 4).reshape(-1, c_dim, h_dim)
-        result_bmm = torch.bmm(prob_bun, v_bun)
-        context_vectors = result_bmm.reshape(b_dim, u_dim, n_dim, w_dim, h_dim).permute(
-            0, 1, 3, 2, 4
-        )
-        context_vectors = context_vectors.reshape(
-            batch_size,
-            num_query_blocks * self.chunk_size,
-            self.num_heads,
-            self.head_dim,
-        )
-        context_vectors = context_vectors[:, :q_time]
+            logits = torch.where(
+                final_condition_for_where,
+                logits,
+                self.config.attention_invalid_logits_value,
+            )
+
+            probabilities = F.softmax(logits, dim=-1, dtype=torch.float32).to(
+                dtype=value_blocks.dtype
+            )
+
+            b_dim, n_dim, u_dim, w_dim, c_dim = probabilities.shape
+            h_dim = value_blocks.shape[-1]
+            prob_bun = probabilities.permute(0, 2, 1, 3, 4).reshape(-1, w_dim, c_dim)
+            v_bun = value_blocks.permute(0, 1, 3, 2, 4).reshape(-1, c_dim, h_dim)
+            result_bmm = torch.bmm(prob_bun, v_bun)
+            context_vectors = result_bmm.reshape(
+                b_dim, u_dim, n_dim, w_dim, h_dim
+            ).permute(0, 1, 3, 2, 4)
+            context_vectors = context_vectors.reshape(
+                batch_size,
+                num_query_blocks * self.chunk_size,
+                self.num_heads,
+                self.head_dim,
+            )
+            context_vectors = context_vectors[:, :q_time]
         return context_vectors
 
 
