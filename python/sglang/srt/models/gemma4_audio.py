@@ -36,6 +36,7 @@ from sglang.srt.layers.clippable_linear import (
     ClippableGLUParallelLinear,
     ClippableQKVParallelLinear,
     ClippableRowParallelLinear,
+    _clamp,
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
@@ -601,7 +602,7 @@ class Gemma4AudioConformerAttention(nn.Module):
         causal_valid_mask: torch.BoolTensor,
     ) -> torch.Tensor:
         audio_encodings_input_to_attn = audio_encodings
-        audio_encodings = torch.clamp(
+        audio_encodings = _clamp(
             audio_encodings, -self.gradient_clipping, self.gradient_clipping
         )
         audio_encodings_norm = self.pre_attn_norm(audio_encodings)
@@ -615,7 +616,7 @@ class Gemma4AudioConformerAttention(nn.Module):
         ).to(dtype=audio_encodings_input_to_attn.dtype)
 
         audio_encodings = self.post(audio_encodings_reshaped)
-        audio_encodings = torch.clamp(
+        audio_encodings = _clamp(
             audio_encodings, -self.gradient_clipping, self.gradient_clipping
         )
         return audio_encodings_input_to_attn + self.post_norm(audio_encodings)
@@ -665,14 +666,14 @@ class Gemma4AudioConformerFeedForward(nn.Module):
 
     def forward(self, audio_encodings: torch.Tensor) -> torch.Tensor:
         residual = audio_encodings
-        audio_encodings = torch.clamp(
+        audio_encodings = _clamp(
             audio_encodings, -self.gradient_clipping, self.gradient_clipping
         )
         audio_encodings = self.pre_layer_norm(audio_encodings)
         audio_encodings = self.ffw_layer_1(audio_encodings)
         audio_encodings = F.silu(audio_encodings)
         audio_encodings = self.ffw_layer_2(audio_encodings)
-        audio_encodings = torch.clamp(
+        audio_encodings = _clamp(
             audio_encodings, -self.gradient_clipping, self.gradient_clipping
         )
         audio_encodings = self.post_layer_norm(audio_encodings)
@@ -770,7 +771,7 @@ class Gemma4AudioConformerLightConv1d(nn.Module):
         )
         audio_encodings = self.depthwise_conv1d(audio_encodings_permuted_padded)
         audio_encodings = audio_encodings.permute(0, 2, 1)
-        audio_encodings = torch.clamp(
+        audio_encodings = _clamp(
             audio_encodings, -self.gradient_clipping, self.gradient_clipping
         )
         audio_encodings = self.conv_norm(audio_encodings)
@@ -826,7 +827,7 @@ class Gemma4AudioConformerBlock(nn.Module):
         audio_encodings = self.lconv1d(audio_encodings_for_lconv_input)
 
         audio_encodings = self.ffw_layer_end(audio_encodings)
-        audio_encodings = torch.clamp(
+        audio_encodings = _clamp(
             audio_encodings, -self.gradient_clipping, self.gradient_clipping
         )
         return self.norm(audio_encodings)
