@@ -907,6 +907,40 @@ class MQALayer(nn.Module):
         return o
 
 
+def _hc_split_sinkhorn_torch(
+    mixes: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+):
+    """Pure-torch implementation of hc_split_sinkhorn (tilelang-free fallback)."""
+    b, s, _ = mixes.shape
+    hc = hc_mult
+    flat = mixes.reshape(b * s, (2 + hc) * hc)
+
+    pre = torch.sigmoid(flat[:, :hc] * hc_scale[0] + hc_base[:hc]) + eps
+    post = 2.0 * torch.sigmoid(
+        flat[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
+    )
+    comb = (
+        flat[:, 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]
+    ).reshape(b * s, hc, hc)
+
+    comb = torch.softmax(comb, dim=-1) + eps
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(sinkhorn_iters - 1):
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+
+    return (
+        pre.view(b, s, hc),
+        post.view(b, s, hc),
+        comb.view(b, s, hc, hc),
+    )
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -1043,16 +1077,26 @@ class DeepseekV4DecoderLayer(nn.Module):
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
-        from sglang.srt.layers.mhc import hc_split_sinkhorn
+        if _is_cuda:
+            from sglang.srt.layers.mhc import hc_split_sinkhorn
 
-        pre, post, comb = hc_split_sinkhorn(
-            mixes,
-            hc_scale,
-            hc_base,
-            self.hc_mult,
-            self.hc_sinkhorn_iters,
-            self.hc_eps,
-        )
+            pre, post, comb = hc_split_sinkhorn(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
+        else:
+            pre, post, comb = _hc_split_sinkhorn_torch(
+                mixes,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
         return y.to(dtype), post.squeeze(1), comb.squeeze(1)
 
