@@ -16,20 +16,16 @@ from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-try:
-    import tvm_ffi  # noqa: F401
-
-    _HAS_TVM_FFI = True
-except ImportError:
-    # tvm_ffi is unavailable on some platforms (e.g. XPU). JIT-compiled
-    # CUDA kernels in this module require it; consumers should fall back
-    # to triton/torch implementations when this flag is False.
-    _HAS_TVM_FFI = False
+# JIT-compiled CUDA kernels in this module require tvm_ffi and a working CUDA
+# toolchain. On non-CUDA backends (e.g. XPU) those entrypoints fall back to
+# triton/torch implementations.
+_is_cuda = is_cuda()
 
 
 def make_name(name: str) -> str:
@@ -444,7 +440,7 @@ class CompressorPrefillPlan(NamedTuple):
             pin_memory=seq_lens.is_cpu,
         )
         is_overlap = compress_ratio == 4
-        if _HAS_TVM_FFI:
+        if _is_cuda:
             module = _jit_common_module()
             plan_lens = module.plan_compress_prefill(
                 extend_lens,
@@ -456,9 +452,8 @@ class CompressorPrefillPlan(NamedTuple):
                 use_cuda_graph,
             )
         else:
-            # Pure-torch fallback (e.g. when tvm_ffi / CUDA toolchain is
-            # unavailable, such as on XPU). Mirrors plan_prefill_host in
-            # jit_kernel/csrc/deepseek_v4/common.cuh.
+            # Pure-torch fallback on non-CUDA backends (e.g. XPU). Mirrors
+            # plan_prefill_host in jit_kernel/csrc/deepseek_v4/common.cuh.
             plan_lens = _torch_plan_compress_prefill(
                 extend_lens,
                 seq_lens,
@@ -687,9 +682,21 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-    module = _jit_fused_rope_module()
-    module.forward(q, k, freqs_real, positions, inverse)
+    if _is_cuda:
+        freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+        module = _jit_fused_rope_module()
+        module.forward(q, k, freqs_real, positions, inverse)
+    else:
+        # Triton fallback for non-CUDA backends (e.g. XPU). Mirrors
+        # FusedQKRopeKernel: apply rotary embedding in-place to q and
+        # (when provided) k.
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None:
+            apply_rotary_emb_triton(
+                k, freqs_cis, positions=positions, inverse=inverse
+            )
 
 
 @cache_once
