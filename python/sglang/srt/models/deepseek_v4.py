@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Set, Tuple
 
@@ -56,7 +57,11 @@ from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_qua
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.mem_cache.compress_state import CompressStatePool
+from sglang.srt.mem_cache.compress_state import (
+    CompressStatePool,
+    KVAndScore,
+    KVAndScoreOld,
+)
 from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import RadixAttention
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -221,16 +226,36 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[orders[0]], ape[orders[1]]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-    def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
+    def _get_states(
+        self, forward_batch: ForwardBatch
+    ) -> "KVAndScore | KVAndScoreOld | CompressStatePool":
+        """Return the per-layer compress-state for this Compressor.
+
+        When the radix path is on this is a paged ``CompressStatePool``;
+        otherwise it is a ``KVAndScore`` / ``KVAndScoreOld`` view of the
+        per-request non-paged buffer (used by the old-compressor fallback).
+        """
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
-            ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
-        else:
-            ret = token_to_kv_pool.get_attention_compress_states(self.layer_id)
+            return token_to_kv_pool.get_indexer_compress_states(self.layer_id)
+        return token_to_kv_pool.get_attention_compress_states(self.layer_id)
 
+    @cached_property
+    def use_fused_compress(self) -> bool:
+        if (
+            envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get()
+            and envs.SGLANG_OPT_DPSK_V4_RADIX.get()
+        ):
+            return True
+        return (
+            envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
+            and not envs.SGLANG_OPT_DPSK_V4_RADIX.get()
+        )
+
+    def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
+        ret = self._get_states(forward_batch)
         assert isinstance(ret, CompressStatePool)
-
         return ret
 
     def overlap_transform(self, tensor: torch.Tensor, fill_value: Any) -> torch.Tensor:
@@ -258,6 +283,225 @@ class Compressor(nn.Module):
     def compute_state_len_indices(seq_len: int, ratio: int):
         state_len = seq_len % ratio + (ratio == 4) * ratio
         return torch.arange(seq_len - state_len, seq_len).clamp(min=-1)
+
+    def compress_decode_old(
+        self,
+        kv_and_scores: "KVAndScoreOld",
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Pure-torch decode-mode compressor, ported from PR23608.
+
+        Used when the fused CUDA compress kernel is unavailable (e.g. XPU).
+        Reads from non-paged ``DeepSeekV4CompressState`` buffers.
+        """
+        assert self.ape_converted
+        seq_lens = forward_batch.seq_lens
+        pool = self._get_states(forward_batch)
+        assert isinstance(pool, KVAndScoreOld)
+        req_pool_indices = forward_batch.req_pool_indices
+
+        bs = kv_and_scores.kv.size(0)
+        write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
+        pool[req_pool_indices, write_pos] = kv_and_scores
+
+        # NOTE: copy out before modifying overlap states
+        kv_and_score_to_compress = pool[req_pool_indices]
+
+        if self.overlap:
+            should_shift = (seq_lens % self.ratio == 0)[:, None, None]
+            pool[req_pool_indices, : self.ratio] = KVAndScoreOld(
+                kv=torch.where(
+                    should_shift,
+                    kv_and_score_to_compress.kv[:, self.ratio :],
+                    kv_and_score_to_compress.kv[:, : self.ratio],
+                ),
+                score=torch.where(
+                    should_shift,
+                    kv_and_score_to_compress.score[:, self.ratio :],
+                    kv_and_score_to_compress.score[:, : self.ratio],
+                ),
+            )
+
+        # shape: [bs * coff, ratio, coff * head_dim]
+        kv_and_score_to_compress = kv_and_score_to_compress.view(
+            -1, self.ratio, self.coff * self.head_dim
+        )
+        kv_and_score_to_compress.score = (
+            kv_and_score_to_compress.score + self.ape.unsqueeze(0)
+        )
+
+        if self.overlap:
+            # shape: [bs, coff * ratio, coff * head_dim]
+            kv_and_score_to_compress = kv_and_score_to_compress.view(
+                bs, self.coff * self.ratio, self.coff * self.head_dim
+            )
+            kv_and_score_to_compress.kv = self.overlap_transform_decode(
+                kv_and_score_to_compress.kv
+            )
+            kv_and_score_to_compress.score = self.overlap_transform_decode(
+                kv_and_score_to_compress.score
+            )
+
+        # kv_to_compress: [bs, ratio * coff, head_dim]
+        kv_and_score_to_compress = kv_and_score_to_compress.view(
+            bs, self.ratio * self.coff, self.head_dim
+        )
+        kv_compressed = (
+            kv_and_score_to_compress.kv
+            * kv_and_score_to_compress.score.softmax(dim=1)
+        ).sum(dim=1)
+        kv_compressed = self.norm(kv_compressed)
+        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+        apply_rotary_emb_triton(
+            kv_compressed[..., -self.rope_head_dim :], freqs_cis
+        )
+        if self.rotate:
+            kv_compressed = rotate_activation(kv_compressed)
+        return kv_compressed
+
+    def compress_extend_old(
+        self,
+        kv_and_scores: "KVAndScoreOld",
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Pure-torch extend-mode compressor, ported from PR23608."""
+        assert self.ape_converted
+
+        kv_and_score_states = self._get_states(forward_batch)
+        assert isinstance(kv_and_score_states, KVAndScoreOld)
+        _, _, head_dim_times_coff = kv_and_score_states.kv.shape
+
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        req_pool_indices = forward_batch.req_pool_indices
+        assert extend_lens is not None and prefix_lens is not None
+
+        max_buffer_size = (
+            2 * kv_and_score_states.shape[1] + kv_and_scores.shape[0]
+        )
+        temp_buffer_shape = [max_buffer_size, head_dim_times_coff]
+        temp_buffer = KVAndScoreOld.empty_like(temp_buffer_shape, old=kv_and_scores)
+
+        assert kv_and_scores.kv.shape[-1] == self.head_dim * self.coff
+        compressed_kv_output = torch.full(
+            (kv_and_scores.kv.size(0), self.head_dim),
+            fill_value=10000.0,
+            dtype=kv_and_scores.kv.dtype,
+            device=kv_and_scores.kv.device,
+        )
+
+        bs = forward_batch.batch_size
+        pt = 0
+        for i in range(bs):
+            kv_and_score = kv_and_scores[pt : pt + extend_lens[i]]
+            kv_and_score_state = kv_and_score_states[req_pool_indices[i]]
+            if prefix_lens[i] == 0:
+                # Pad with default values for overlap.
+                kv_and_score_state.clear()
+
+            pre_state_len = self.compute_state_len(
+                seq_len=prefix_lens[i], ratio=self.ratio
+            )
+            valid_kv_len = pre_state_len + extend_lens[i]
+            kv_and_score_buffer = temp_buffer[:valid_kv_len]
+            kv_and_score_buffer[:pre_state_len] = kv_and_score_state[:pre_state_len]
+            kv_and_score_buffer[pre_state_len:valid_kv_len] = kv_and_score
+
+            post_state_len = self.compute_state_len(
+                seq_len=valid_kv_len, ratio=self.ratio
+            )
+            kv_and_score_state[:post_state_len] = kv_and_score_buffer[
+                valid_kv_len - post_state_len : valid_kv_len
+            ]
+
+            compress_len = valid_kv_len // self.ratio * self.ratio
+            if compress_len == 0:
+                pt += extend_lens[i]
+                continue
+
+            kv_and_score_to_compress = kv_and_score_buffer[:compress_len].view(
+                compress_len // self.ratio, self.ratio, -1
+            )
+            kv_and_score_to_compress.score = (
+                kv_and_score_to_compress.score + self.ape.unsqueeze(0)
+            )
+
+            if self.overlap:
+                kv_and_score_to_compress.kv = self.overlap_transform(
+                    kv_and_score_to_compress.kv, 0
+                )
+                kv_and_score_to_compress.score = self.overlap_transform(
+                    kv_and_score_to_compress.score, float("-inf")
+                )
+                # Drop the leading window before compression.
+                kv_and_score_to_compress = kv_and_score_to_compress[1:]
+                if kv_and_score_to_compress.kv.size(0) == 0:
+                    pt += extend_lens[i]
+                    continue
+
+            kv_compressed = (
+                kv_and_score_to_compress.kv
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
+            assert kv_compressed.dtype == torch.float32
+            kv_compressed = self.norm(kv_compressed)
+
+            beg_idx = prefix_lens[i] // self.ratio * self.ratio
+            end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
+            freqs_cis = self.freqs_cis[beg_idx : end_idx : self.ratio]
+            assert freqs_cis.size(0) == kv_compressed.size(0), (
+                f"{freqs_cis.shape=} {kv_compressed.shape=}"
+            )
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
+
+            if self.rotate:
+                kv_compressed = rotate_activation(kv_compressed)
+
+            start = prefix_lens[i]
+            start = start + self.ratio - 1 - start % self.ratio
+            indices_in_seq = torch.arange(
+                start,
+                prefix_lens[i] + extend_lens[i],
+                self.ratio,
+                device=kv_and_scores.kv.device,
+            )
+            assert indices_in_seq.size(0) == kv_compressed.size(0)
+            compressed_kv_output[indices_in_seq - prefix_lens[i] + pt] = (
+                kv_compressed
+            )
+
+            pt += extend_lens[i]
+
+        return compressed_kv_output
+
+    def compress_dispatch(
+        self,
+        kv_score: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        # On first call rewire ``self.compress_decode`` / ``self.compress_extend``
+        # so subsequent dispatch is a single attribute lookup. Mirrors the
+        # pattern used in PR23608.
+        if self.use_fused_compress:
+            return self.compress_fused(kv_score, forward_batch)
+        assert envs.SGLANG_OPT_USE_OLD_COMPRESSOR.get(), (
+            "Compressor: non-fused path requires SGLANG_OPT_USE_OLD_COMPRESSOR=1"
+        )
+        self.compress_decode = self.compress_decode_old
+        self.compress_extend = self.compress_extend_old
+        kv = kv_score[:, : self.coff * self.head_dim]
+        score = kv_score[:, self.coff * self.head_dim :]
+        kv_and_scores = KVAndScoreOld(kv=kv, score=score)
+        forward_mode = forward_batch.forward_mode
+        if forward_mode.is_decode() or forward_mode.is_target_verify():
+            return self.compress_decode(kv_and_scores, forward_batch)
+        if forward_mode.is_extend():
+            return self.compress_extend(kv_and_scores, forward_batch)
+        raise NotImplementedError(
+            f"Forward mode {forward_mode} not supported in old compressor."
+        )
 
     def compress_fused(
         self,
@@ -297,7 +541,7 @@ class Compressor(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        return self.compress_fused(kv_score, forward_batch)
+        return self.compress_dispatch(kv_score, forward_batch)
 
 
 class C4Indexer(nn.Module):
