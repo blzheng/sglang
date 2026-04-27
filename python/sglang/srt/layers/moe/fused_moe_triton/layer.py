@@ -216,7 +216,11 @@ class FusedMoE(torch.nn.Module):
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        self.use_triton_kernels = (
+            get_moe_runner_backend().is_triton_kernels()
+            if not (_is_cpu and _is_cpu_amx_available)
+            else False
+        )
         self.use_flashinfer_trtllm_moe = get_moe_runner_backend().is_flashinfer_trtllm()
 
         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
@@ -449,6 +453,9 @@ class FusedMoE(torch.nn.Module):
 
     def _load_w2(
         self,
+            if _is_cpu:
+                if is_bias:
+                    shard_dim = 1
         expert_data: torch.Tensor,
         shard_dim: int,
         shard_id: str,
@@ -518,6 +525,9 @@ class FusedMoE(torch.nn.Module):
                 )
 
         # w2, down_proj: Load into only logical weight of w2.
+            if _is_cpu:
+                if is_bias:
+                    shard_dim = 1
         expert_data.copy_(loaded_weight)
 
     def _load_single_value(

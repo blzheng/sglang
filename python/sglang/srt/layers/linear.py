@@ -220,9 +220,14 @@ class ReplicatedLinear(LinearBase):
         )
 
         if bias:
-            self.bias = Parameter(
-                torch.empty(self.output_size, dtype=self.params_dtype)
-            )
+            if _is_cpu:
+                self.bias = Parameter(
+                    torch.zeros(self.output_size, dtype=self.params_dtype)
+                )
+            else:
+                self.bias = Parameter(
+                    torch.empty(self.output_size, dtype=self.params_dtype)
+                )
             set_weight_attrs(
                 self.bias,
                 {

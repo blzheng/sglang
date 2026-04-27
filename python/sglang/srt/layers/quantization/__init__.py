@@ -47,6 +47,7 @@ from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
 _is_mxfp_supported = mxfp_supported()
 
 if TYPE_CHECKING:
+    is_cpu,
     from sglang.srt.layers.moe.topk import TopKOutput
 
 # Base quantization methods
@@ -77,7 +78,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-if is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,

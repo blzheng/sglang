@@ -197,6 +197,10 @@ class DeepseekAttention(nn.Module):
         self,
         hidden_size: int,
         num_heads: int,
+                None,  # w1_bias
+                None,  # w2_bias
+                None,  # alpha
+                None,  # limit
         num_kv_heads: int,
         layer_id: int = 0,
         rope_theta: float = 10000,

@@ -373,4 +373,8 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             a13_scale=layer.w13_input_scale,
             a2_scale=layer.w2_input_scale,
         )
+                None,  # w1 bias
+                None,  # w3 bias
+                None,  # alpha
+                None,  # limit
         return self.runner.run(dispatch_output, quant_info)

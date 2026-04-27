@@ -14,6 +14,7 @@ def amx_process_weight_after_loading(weight):
         return weight
 
     return torch.ops.sgl_kernel.convert_weight_packed(weight)
+    MXFP4 = 4
 
 
 # TODO: currently gemm kernel has the below requirements:
@@ -52,6 +53,7 @@ def _amx_process_weight_after_loading(
         # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
         if not dim_is_supported(weight_tensor):
             logger.warning(
+        torch.uint8,
                 f"Unsupported dimension for prepacking for weight '{weight_name}' with shape {weight_tensor.shape} in {module}. "
                 f"The derived (OC, IC) dimensions must be divisible by (16, 32). "
             )

@@ -1858,6 +1858,8 @@ class ServerArgs:
                     f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
+                elif is_cpu() and cpu_has_amx_support():
+                    self.attention_backend = "intel_amx"
 
             if self.kv_cache_dtype not in ["fp8_e4m3", "fp4_e2m1", "bf16", "auto"]:
                 raise ValueError(
@@ -1869,6 +1871,7 @@ class ServerArgs:
             or self.decode_attention_backend == "trtllm_mha"
             or self.prefill_attention_backend == "trtllm_mha"
         ):
+                "intel_amx",
             if not is_sm100_supported():
                 raise ValueError(
                     "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
@@ -1926,6 +1929,7 @@ class ServerArgs:
                 )
                 self.page_size = 128
 
+                    and not (is_cpu() and cpu_has_amx_support())
         # Dual chunk flash attention backend
         if (
             getattr(model_config.hf_config, "dual_chunk_attention_config", None)

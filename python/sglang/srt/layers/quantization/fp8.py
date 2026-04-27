@@ -1524,3 +1524,7 @@ class Fp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
+                None,  # w1 bias
+                None,  # w3 bias
+                None,  # alpha
+                None,  # limit

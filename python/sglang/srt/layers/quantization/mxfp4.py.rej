@@ -1,0 +1,14 @@
+--- /tmp/pr_files/base/python/sglang/srt/layers/quantization/mxfp4.py	2026-04-27 03:13:15.293180501 +0000
++++ /tmp/pr_files/head/python/sglang/srt/layers/quantization/mxfp4.py	2026-04-27 03:13:15.289180502 +0000
+@@ -116,9 +123,11 @@
+         StandardDispatchOutput,
+     )
+ 
++_is_cpu = is_cpu()
+ _is_hip = is_hip()
+ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
++_is_cpu_amx_available = cpu_has_amx_support()
+ 
+ if _is_hip:
+     # import aiter

@@ -1,0 +1,21 @@
+--- /tmp/pr_files/base/sgl-kernel/csrc/cpu/gemm.h	2026-04-27 03:13:15.398180467 +0000
++++ /tmp/pr_files/head/sgl-kernel/csrc/cpu/gemm.h	2026-04-27 03:13:15.394180468 +0000
+@@ -67,7 +67,17 @@
+   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
+ }
+ 
+-enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3 };
++enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1 };
++
++constexpr bool operator==(CPUAcTMethod a, int b) {
++  return static_cast<int>(a) == b;
++}
++
++constexpr bool operator==(int a, CPUAcTMethod b) {
++  return a == static_cast<int>(b);
++}
++
++enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4 };
+ 
+ constexpr bool operator==(CPUQuantMethod a, int64_t b) {
+   return static_cast<int64_t>(a) == b;

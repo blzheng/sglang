@@ -43,6 +43,23 @@ inline void copy_add_stub(
   }
 }
 
+template <>
+inline void
+copy_add_stub(float* __restrict__ out, const float* __restrict__ input, const float* __restrict__ bias, int64_t size) {
+  using fVec = at::vec::Vectorized<float>;
+  constexpr int kVecSize = fVec::size();
+
+  int64_t d;
+#pragma GCC unroll 4
+  for (d = 0; d <= size - kVecSize; d += kVecSize) {
+    fVec data = fVec::loadu(input + d) + fVec::loadu(bias + d);
+    data.store(out + d);
+  }
+  for (; d < size; ++d) {
+    out[d] = input[d] + bias[d];
+  }
+}
+
 inline void unpack_B(
     at::BFloat16* __restrict__ Btmp,
     const at::Float8_e4m3fn* __restrict__ packed_B,
@@ -324,7 +341,6 @@ void tinygemm_kernel(
         A, B, C, Btmp, Ctmp, bias, scale, M, N, K, lda, ldb, ldc, do_unpack);
     return;
   }
-
   // pattern: 1-4-16
   constexpr int64_t BLOCK_M = 4;
   constexpr int64_t BLOCK_N = 64;
@@ -437,6 +453,7 @@ void tinygemm_kernel(
     scalar_t* __restrict__ C,
     scalar_t* __restrict__ Btmp,
     float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
     const float* __restrict__ scale,
     int64_t M,
     int64_t N,
@@ -447,6 +464,11 @@ void tinygemm_kernel(
     bool brg,
     int64_t block_size_K,
     bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, true>(
+        A, B, C, Btmp, Ctmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
   tinygemm_kernel<scalar_t, false>(
       A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
@@ -468,7 +490,6 @@ void tinygemm_kernel(
       bool brg,                                \
       int64_t block_size_K,                    \
       bool do_unpack)
-
 INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
 INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
 
@@ -476,6 +497,7 @@ at::Tensor fp8_scaled_mm_cpu(
     at::Tensor& mat1,
     at::Tensor& mat2,
     at::Tensor& scales2,
+    const float* __restrict__ Bbias,
     std::vector<int64_t> block_size,
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
@@ -497,6 +519,7 @@ at::Tensor fp8_scaled_mm_cpu(
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
 
+      const float* __restrict__ Bbias,                        \
   TORCH_CHECK(block_size.size() == 2, "fp8_scaled_mm_cpu: expect block_size.size() to be 2.");
 
   int64_t block_size_N = block_size[0];
@@ -532,7 +555,6 @@ at::Tensor fp8_scaled_mm_cpu(
   int num_threads = at::get_num_threads();
   int64_t size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * K + BLOCK_M * BLOCK_N * 2;
   auto buffer = at::empty({num_threads, size_per_thread}, mat1.options());
-
   AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "fp8_scaled_mm_kernel_impl", [&] {
     fp8_scaled_mm_kernel_impl<scalar_t>(
         out.data_ptr<scalar_t>(),
