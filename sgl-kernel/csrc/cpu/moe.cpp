@@ -554,13 +554,15 @@ void fused_experts_kernel_impl(
       const float* __restrict__ B0_bias = w1_bias + expert_id * 2 * N + nb_upper * BLOCK_N;
       const float* __restrict__ B1_bias = w1_bias + expert_id * 2 * N + nb_lower * BLOCK_N;
 
-      // 1.a load A
-      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
       int64_t m_size = offsets[mb + 1] - offsets[mb];
 
-      for (int64_t m = 0; m < m_size; ++m) {
-        int32_t index = A_ids[m] / topk;
-        copy_stub(A + m * K, input + index * K, K);
+      // 1.a load A
+      if (nb_offset == 0) {
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, input + index * K, K);
+        }
       }
 
       if (use_brgemm) {
@@ -1316,6 +1318,7 @@ at::Tensor shared_expert_cpu(
     bool inplace,
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
+    bool use_mxfp4,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size,
@@ -1351,8 +1354,8 @@ at::Tensor shared_expert_cpu(
   int64_t N = w1.size(0) / 2;
 
   // we use int32_t compensation for int8 w8a8
-  int64_t packed_K = get_row_size(K, use_int8_w8a8);
-  int64_t packed_N = get_row_size(N, use_int8_w8a8);
+  int64_t packed_K = use_mxfp4 ? get_row_size<uint8_t>(K) : get_row_size(K, use_int8_w8a8);
+  int64_t packed_N = use_mxfp4 ? get_row_size<uint8_t>(N) : get_row_size(N, use_int8_w8a8);
 
   // check weight shapes
   CHECK_EQ(w2.size(0), K);
@@ -1360,7 +1363,7 @@ at::Tensor shared_expert_cpu(
   CHECK_EQ(packed_w2.size(1), packed_N);
 
   // check scales
-  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, false, w1_scale, w2_scale, block_size);
+  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, use_mxfp4, w1_scale, w2_scale, block_size);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
@@ -1372,7 +1375,7 @@ at::Tensor shared_expert_cpu(
   //   3. Aq_tmp : [M, K] or [M, N]
   //   4. As_tmp : [M]
   //
-  // for fp8 w8a16:
+  // for fp8 w8a16 and mxfp4:
   //   5. intermediate_cache0 : [M, 2N]
   //   6. B_tmp: [T, MAX_CACHE_BLOCK_SIZE, BLOCK_M, max(K, N)]
   //
@@ -1382,7 +1385,7 @@ at::Tensor shared_expert_cpu(
   if (use_int8_w8a8) {
     buffer_size_nbytes += std::max(M * K, M * N) + M * sizeof(float);
   }
-  if (use_fp8_w8a16) {
+  if (use_fp8_w8a16 || use_mxfp4) {
     buffer_size_nbytes += M * 2 * N * 2 + num_threads * MAX_CACHE_BLOCK_SIZE * BLOCK_M * std::max(K, N) * 2;
   }
 
@@ -1421,7 +1424,7 @@ at::Tensor shared_expert_cpu(
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * 2 * N));
 
       CHECK_MOE_SCALES_FP8(0, 1);
-      shared_expert_fp8_kernel_impl<scalar_t>(
+      shared_expert_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
           out_hidden_states.data_ptr<scalar_t>(),
           intermediate_cache0,
           intermediate_cache1,
@@ -1434,6 +1437,34 @@ at::Tensor shared_expert_cpu(
           w2s.data_ptr<float>(),
           block_size_N,
           block_size_K,
+          conditional_data_ptr<scalar_t>(fused_experts_out),
+          routed_scaling_factor_value,
+          M,
+          N,
+          K);
+    } else if (use_mxfp4) {
+      scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
+      scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * 2 * N));
+
+      // mxfp4 supports only group size of 32 (2^5)
+      constexpr int64_t group_size = 32;
+      auto w1s = w1_scale.value();
+      auto w2s = w2_scale.value();
+      TORCH_CHECK(w1s.numel(), 2 * N * K >> 5);
+      TORCH_CHECK(w2s.numel(), K * N >> 5);
+      shared_expert_fp_kernel_impl<scalar_t, uint8_t, uint8_t, true>(
+          out_hidden_states.data_ptr<scalar_t>(),
+          intermediate_cache0,
+          intermediate_cache1,
+          B_tmp,
+          C_tmp,
+          hidden_states.data_ptr<scalar_t>(),
+          packed_w1.data_ptr<uint8_t>(),
+          packed_w2.data_ptr<uint8_t>(),
+          w1s.data_ptr<uint8_t>(),
+          w2s.data_ptr<uint8_t>(),
+          /*block_size_N*/ 1,
+          /*block_size_K*/ group_size,
           conditional_data_ptr<scalar_t>(fused_experts_out),
           routed_scaling_factor_value,
           M,

@@ -531,6 +531,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
+        self.shared_experts_is_mxfp4 = False
         self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -563,6 +564,10 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+            )
+            self.shared_experts_is_mxfp4 = (
+                not is_packed_weight
+                and self.shared_experts.gate_up_proj.weight.dtype == torch.uint8
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
@@ -844,6 +849,7 @@ class DeepseekV2MoE(nn.Module):
             True,  # inplace
             self.shared_experts_is_int8,  # use_int8_w8a8
             self.shared_experts_is_fp8,  # use_fp8_w8a16
+            self.shared_experts_is_mxfp4, # use_mxfp4
             (
                 self.shared_experts.gate_up_proj.weight_scale
                 if self.shared_experts_is_int8
