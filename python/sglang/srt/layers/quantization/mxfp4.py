@@ -81,8 +81,10 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+_is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 if _is_hip:
     # import aiter

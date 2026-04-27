@@ -469,41 +469,176 @@ void tinygemm_kernel(
         A, B, C, Btmp, Ctmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
     return;
   }
-  tinygemm_kernel<scalar_t, false>(
+  tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, false>(
       A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
 }
 
-#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE)    \
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const at::Float8_e4m3fn* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    float scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg) {
+  tinygemm_kernel2<scalar_t>(A, B, C, Btmp, Ctmp, scale, M, N, K, lda, ldb, ldc, brg);
+}
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    scalar_t* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    float* __restrict__ Ctmp,
+    const float* __restrict__ Bbias,
+    const uint8_t* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, uint8_t, uint8_t, true>(
+        A, B, C, Btmp, Ctmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
+  tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
+      A, B, C, Btmp, Ctmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+}
+
+// tinygemm interface
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const at::Float8_e4m3fn* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
+    const float* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, true>(
+        A, B, C, Btmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
+  tinygemm_kernel<scalar_t, at::Float8_e4m3fn, float, false>(
+      A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+}
+
+template <typename scalar_t>
+void tinygemm_kernel(
+    const scalar_t* __restrict__ A,
+    const uint8_t* __restrict__ B,
+    float* __restrict__ C,
+    scalar_t* __restrict__ Btmp,
+    const float* __restrict__ Bbias,
+    const uint8_t* __restrict__ scale,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc,
+    bool brg,
+    int64_t block_size_K,
+    bool do_unpack) {
+  if (Bbias != nullptr) {
+    tinygemm_kernel<scalar_t, uint8_t, uint8_t, true>(
+        A, B, C, Btmp, scale, Bbias, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+    return;
+  }
+  tinygemm_kernel<scalar_t, uint8_t, uint8_t, false>(
+      A, B, C, Btmp, scale, nullptr, M, N, K, lda, ldb, ldc, brg, block_size_K, do_unpack);
+}
+
+#define INSTANTIATE_TINYGEMM_TEMPLATE(TYPE_A, TYPE_B, TYPE_S) \
+  template void tinygemm_kernel<TYPE_A>(                      \
+      const TYPE_A* __restrict__ A,                           \
+      const TYPE_B* __restrict__ B,                           \
+      TYPE_A* __restrict__ C,                                 \
+      TYPE_A* __restrict__ Btmp,                              \
+      float* __restrict__ Ctmp,                               \
+      const float* __restrict__ Bbias,                        \
+      const TYPE_S* __restrict__ scale,                       \
+      int64_t M,                                              \
+      int64_t N,                                              \
+      int64_t K,                                              \
+      int64_t lda,                                            \
+      int64_t ldb,                                            \
+      int64_t ldc,                                            \
+      bool brg,                                               \
+      int64_t block_size_K,                                   \
+      bool do_unpack)
+
+INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, at::Float8_e4m3fn, float);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16, uint8_t, uint8_t);
+INSTANTIATE_TINYGEMM_TEMPLATE(at::Half, uint8_t, uint8_t);
+
+#define INSTANTIATE_TINYGEMM_TEMPLATE2(TYPE)   \
   template void tinygemm_kernel<TYPE>(         \
       const TYPE* __restrict__ A,              \
       const at::Float8_e4m3fn* __restrict__ B, \
       TYPE* __restrict__ C,                    \
       TYPE* __restrict__ Btmp,                 \
       float* __restrict__ Ctmp,                \
-      const float* __restrict__ scale,         \
+      float scale,                             \
       int64_t M,                               \
       int64_t N,                               \
       int64_t K,                               \
       int64_t lda,                             \
       int64_t ldb,                             \
       int64_t ldc,                             \
-      bool brg,                                \
-      int64_t block_size_K,                    \
-      bool do_unpack)
-INSTANTIATE_TINYGEMM_TEMPLATE(at::BFloat16);
-INSTANTIATE_TINYGEMM_TEMPLATE(at::Half);
+      bool brg)
+
+INSTANTIATE_TINYGEMM_TEMPLATE2(at::BFloat16);
+
+inline const float* get_bias_data(const std::optional<at::Tensor>& bias, int64_t N) {
+  if (bias.has_value()) {
+    const auto& bias_ref = bias.value();
+    CHECK_EQ(bias_ref.size(0), N);
+    return bias_ref.data_ptr<float>();
+  }
+  return nullptr;
+}
+// FP8 and MXFP4 WoQ uses the same pattern:
+//   Btmp : [T, BLOCK_N * K]
+//   Ctmp : [T, BLOCK_M * BLOCK_N]
+inline at::Tensor alloc_thread_buffer(const at::TensorOptions& options, int64_t K) {
+  constexpr int64_t BLOCK_M = block_size_m();
+  constexpr int64_t BLOCK_N = block_size_n();
+  int num_threads = at::get_num_threads();
+  int64_t size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * K + BLOCK_M * BLOCK_N * 2;
+  return at::empty({num_threads, size_per_thread}, options);
+}
 
 at::Tensor fp8_scaled_mm_cpu(
     at::Tensor& mat1,
     at::Tensor& mat2,
     at::Tensor& scales2,
-    const float* __restrict__ Bbias,
     std::vector<int64_t> block_size,
     const std::optional<at::Tensor>& bias,
     at::ScalarType out_dtype,
     bool is_vnni) {
-  RECORD_FUNCTION("sgl-kernel::fp8_scaled_mm_cpu", std::vector<c10::IValue>({mat1, mat2, scales2, block_size, bias}));
-
   auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
 
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(mat1);
@@ -519,13 +654,10 @@ at::Tensor fp8_scaled_mm_cpu(
   CHECK_DIM(2, mat1);
   CHECK_DIM(2, mat2);
 
-      const float* __restrict__ Bbias,                        \
   TORCH_CHECK(block_size.size() == 2, "fp8_scaled_mm_cpu: expect block_size.size() to be 2.");
-
   int64_t block_size_N = block_size[0];
   int64_t block_size_K = block_size[1];
 
-  constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   TORCH_CHECK(block_size_N % BLOCK_N == 0, "fp8_scaled_mm_cpu: expect block_size_N to be multiples of BLOCK_N");
   TORCH_CHECK(block_size_K == BLOCK_K, "fp8_scaled_mm_cpu: expect block_size_K equals to BLOCK_K");
@@ -539,38 +671,88 @@ at::Tensor fp8_scaled_mm_cpu(
   TORCH_CHECK(scales2.scalar_type() == at::kFloat, "fp8_scaled_mm_cpu: expect scales to be float32.");
   auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
 
-  // strides
-  int64_t mat1_strideM = mat1.stride(0);
-  int64_t out_strideM = out.stride(0);
+  auto buffer = alloc_thread_buffer(mat1.options(), K);
 
-  const bool has_bias = bias.has_value();
-  const float* bias_data = nullptr;
-  if (has_bias) {
-    CHECK_EQ(bias.value().size(0), N);
-    bias_data = bias.value().data_ptr<float>();
-  }
-
-  // Btmp : [T, BLOCK_N * K]
-  // Ctmp : [T, BLOCK_M * BLOCK_N]
-  int num_threads = at::get_num_threads();
-  int64_t size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * K + BLOCK_M * BLOCK_N * 2;
-  auto buffer = at::empty({num_threads, size_per_thread}, mat1.options());
   AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "fp8_scaled_mm_kernel_impl", [&] {
-    fp8_scaled_mm_kernel_impl<scalar_t>(
+    // used for lambda computing scale offset for each block
+    //   fp8 block gemm sale shape: [N/128, K/128]
+    //   for each block: [1, K/128]
+    const int64_t scale_size_K = div_up(K, block_size_K);
+    const int64_t blocks_n_per_group = block_size_N / BLOCK_N;
+
+    fp_scaled_mm_kernel_impl<scalar_t, at::Float8_e4m3fn, float>(
         out.data_ptr<scalar_t>(),
         mat1.data_ptr<scalar_t>(),
         packed_w.data_ptr<at::Float8_e4m3fn>(),
         scales2.data_ptr<float>(),
-        bias_data,
+        get_bias_data(bias, N),
         buffer.data_ptr<scalar_t>(),
         M,
         N,
         K,
-        mat1_strideM,
-        out_strideM,
+        mat1.stride(0),
+        out.stride(0),
         block_size_N,
         block_size_K,
-        size_per_thread);
+        buffer.size(-1),
+        [&](int64_t nb) { return (nb / blocks_n_per_group) * scale_size_K; });
+  });
+
+  return out;
+}
+
+// mat1 : [M, K] bfloat16
+// mat2 : [N, K / 2] uint8, actual layout: [N / BLOCK_N, K / 2, BLOCK_N, 2]
+// scales2: [N, K / G], actual layout: [N / BLOCK_N, K / G, BLOCK_N]
+at::Tensor mxfp4_scaled_mm_cpu(
+    at::Tensor& mat1, at::Tensor& mat2, at::Tensor& scales2, const std::optional<at::Tensor>& bias, bool is_vnni) {
+  auto packed_w = is_vnni ? mat2 : convert_weight_packed(mat2);
+
+  CHECK_INPUT(mat1);
+  CHECK_INPUT(mat2);
+  CHECK_INPUT(scales2);
+
+  int64_t M = mat1.size(0);
+  int64_t N = mat2.size(0);
+  int64_t K = mat2.size(1) * 2;
+
+  // mxfp4 supports only group size of 32 (2^5)
+  constexpr int64_t group_size = 32;
+  constexpr int64_t BLOCK_N = block_size_n();
+
+  CHECK_EQ(mat1.size(1), K);
+  CHECK_EQ(scales2.numel(), N * K >> 5);
+
+  const auto st = mat1.scalar_type();
+  TORCH_CHECK(st == at::kBFloat16 || st == at::kHalf, "mxfp4_scaled_mm_cpu: expect A to be bfloat16 or half.");
+  TORCH_CHECK(mat2.scalar_type() == at::kByte, "mxfp4_scaled_mm_cpu: expect mat2 to be uint8.");
+  TORCH_CHECK(scales2.scalar_type() == at::kByte, "mxfp4_scaled_mm_cpu: expect scales to be uint8.");
+  auto out = at::empty({M, N}, mat1.options());
+
+  auto buffer = alloc_thread_buffer(mat1.options(), K);
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(st, "mxfp4_scaled_mm_kernel_impl", [&] {
+    // used for lambda computing scale offset for each block
+    //   mxfp4 block gemm sale shape: [N/BLOCK_N, K/32, BLOCK_N]
+    //   for each block: [K/32, BLOCK_N]
+    const int64_t s_strideN = (K >> 5) * BLOCK_N;
+
+    fp_scaled_mm_kernel_impl<scalar_t, uint8_t, uint8_t>(
+        out.data_ptr<scalar_t>(),
+        mat1.data_ptr<scalar_t>(),
+        packed_w.data_ptr<uint8_t>(),
+        scales2.data_ptr<uint8_t>(),
+        get_bias_data(bias, N),
+        buffer.data_ptr<scalar_t>(),
+        M,
+        N,
+        K,
+        mat1.stride(0),
+        out.stride(0),
+        /* block_size_N */ 1,
+        /* block_size_K */ group_size,
+        buffer.size(-1),
+        [&](int64_t nb) { return nb * s_strideN; });
   });
 
   return out;

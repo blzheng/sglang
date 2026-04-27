@@ -178,29 +178,60 @@ class TestExtendAttention(CustomTestCase):
             start_q, start_kv = end_q, end_kv
         return output
 
-    def _test_extend_attention_once(self, B, N_CTX, H_Q, H_KV, D, DV, mla=False):
+    def _test_extend_attention_once(
+        self,
+        B,
+        N_CTX,
+        H_Q,
+        H_KV,
+        D,
+        DV,
+        sliding_window=None,
+        has_sink=False,
+        mla=False,
+        is_cross_attn=False,
+        *,
+        b_seq_len_prefix=None,
+        b_seq_len_extend=None,
+    ):
         dtype = torch.bfloat16
 
-        b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+        if b_seq_len_prefix is None:
+            b_seq_len_prefix = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+        else:
+            b_seq_len_prefix = torch.as_tensor(b_seq_len_prefix, dtype=torch.int32)
+
+        encoder_lens = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int64)
+        scale = 20
         if mla:
             b_seq_len_prefix.zero_()
-        b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+            encoder_lens.zero_()
+        if has_sink:
+            encoder_lens.zero_()
+            scale = 1
+
+        if b_seq_len_extend is None:
+            b_seq_len_extend = torch.randint(1, N_CTX // 2, (B,), dtype=torch.int32)
+        else:
+            b_seq_len_extend = torch.as_tensor(b_seq_len_extend, dtype=torch.int32)
         b_seq_len = b_seq_len_prefix + b_seq_len_extend
-        max_len_in_batch = torch.max(b_seq_len, 0)[0].item()
+        max_len_in_batch = (
+            torch.max(b_seq_len, 0)[0].item() + torch.max(encoder_lens, 0)[0].item()
+        )
 
         b_req_idx = torch.arange(B, dtype=torch.int32)
         req_to_tokens = torch.empty((B, max_len_in_batch), dtype=torch.int32)
         b_start_loc = torch.zeros((B,), dtype=torch.int32)
-        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1], 0)
+        b_start_loc[1:] = torch.cumsum(b_seq_len[:-1] + encoder_lens[:-1], 0)
         b_start_loc_extend = torch.zeros((B,), dtype=torch.int32)
         b_start_loc_extend[1:] = torch.cumsum(b_seq_len_extend[:-1], 0)
 
         for i in range(B):
-            req_to_tokens[i, : b_seq_len[i]] = torch.arange(
-                b_start_loc[i], b_start_loc[i] + b_seq_len[i]
+            req_to_tokens[i, : b_seq_len[i] + encoder_lens[i]] = torch.arange(
+                b_start_loc[i], b_start_loc[i] + b_seq_len[i] + encoder_lens[i]
             )
 
-        total_token_num = torch.sum(b_seq_len).item()
+        total_token_num = torch.sum(b_seq_len).item() + torch.sum(encoder_lens).item()
         extend_token_num = torch.sum(b_seq_len_extend).item()
 
         H_BUF = 1 if mla else H_KV
@@ -225,8 +256,8 @@ class TestExtendAttention(CustomTestCase):
             v_extend[extend_start:extend_end] = v_buffer[
                 extend_start_in_buffer:extend_end_in_buffer
             ]
-            q_extend[extend_start:extend_end] = torch.randn(
-                (b_seq_len_extend[i], H_Q, D), dtype=dtype
+            q_extend[extend_start:extend_end] = (
+                torch.randn((b_seq_len_extend[i], H_Q, D), dtype=dtype) * scale
             )
 
         # q_extend, k_extend, v_extend, k_buffer and v_buffer supports non-contiguous tensors
@@ -301,15 +332,56 @@ class TestExtendAttention(CustomTestCase):
             max_len_extend,
             sm_scale,
             logit_cap,
+            is_cross_attn,
+            sliding_window if sliding_window is not None else 0,
+            encoder_lens,
+            sinks if has_sink else None,
         )
 
         torch.testing.assert_close(o_ref, o_extend, atol=1e-2, rtol=1e-2)
 
     def test_extend_attention(self):
         for is_mla in [True, False]:
-            self._test_extend_attention_once(1, 123, 1, 1, 128, 96, is_mla)
-            self._test_extend_attention_once(1, 123, 16, 1, 128, 96, is_mla)
-            self._test_extend_attention_once(4, 1230, 16, 4, 128, 96, is_mla)
+            for is_cross_attn in [True, False]:
+                if is_mla and is_cross_attn:
+                    continue
+                self._test_extend_attention_once(
+                    1, 123, 1, 1, 128, 96, None, False, is_mla, is_cross_attn
+                )
+                self._test_extend_attention_once(
+                    1, 123, 16, 1, 128, 96, None, False, is_mla, is_cross_attn
+                )
+                self._test_extend_attention_once(
+                    4, 1230, 16, 4, 128, 96, None, False, is_mla, is_cross_attn
+                )
+                self._test_extend_attention_once(
+                    1, 9000, 16, 1, 32, 32, None, False, is_mla, is_cross_attn
+                )
+        for has_sink in [True, False]:
+            for sliding_window in [None, 10, 128]:
+                if not has_sink and sliding_window is not None:
+                    continue
+                self._test_extend_attention_once(
+                    1, 123, 16, 4, 64, 64, sliding_window, has_sink, False, False
+                )
+                self._test_extend_attention_once(
+                    1, 20, 16, 1, 64, 64, sliding_window, has_sink, False, False
+                )
+                self._test_extend_attention_once(
+                    1, 20, 1, 1, 64, 64, sliding_window, has_sink, False, False
+                )
+
+    def test_extend_attention_large_seq_causal_mask(self):
+        self._test_extend_attention_once(
+            B=1,
+            N_CTX=5001,
+            H_Q=8,
+            H_KV=2,
+            D=64,
+            DV=64,
+            b_seq_len_prefix=[0],
+            b_seq_len_extend=[5000],
+        )
 
 
 if __name__ == "__main__":
