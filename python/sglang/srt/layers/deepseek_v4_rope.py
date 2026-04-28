@@ -2,19 +2,22 @@ import math
 from functools import lru_cache
 from typing import Optional
 
-import tilelang
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.utils.common import maybe_torch_compile
 
-tilelang.set_log_level("WARNING")
+try:
+    import tilelang
 
-pass_configs = {
-    tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-    tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-}
+    tilelang.set_log_level("WARNING")
+    pass_configs = {
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+except ImportError:
+    pass
 
 FP8 = "float8_e4m3"
 BF16 = "bfloat16"
@@ -131,7 +134,7 @@ def apply_rotary_emb_triton_kernel(
     tl.store(x_ptr + offs_x_imag, out_imag, mask=mask)
 
 
-def apply_rotary_emb_triton(
+def apply_rotary_emb_triton_old(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
     positions: Optional[torch.Tensor] = None,
@@ -192,5 +195,58 @@ def apply_rotary_emb_triton(
             IS_3D=is_3d,
             BLOCK_SIZE=BLOCK_SIZE,
         )
+
+    return x
+
+def apply_rotary_emb_triton(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+    inverse: bool = False,
+) -> torch.Tensor:
+    is_3d = x.ndim == 3
+
+    if is_3d:
+        batch_size, n_heads, rope_dim = x.shape
+    else:
+        batch_size, rope_dim = x.shape
+        n_heads = 1
+
+    # freqs_cis is complex; convert to interleaved real/imag then split
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)  # (..., rope_dim)
+
+    # Select frequencies based on positions
+    if positions is not None:
+        assert positions.shape == (batch_size,)
+        freqs_real = freqs_real[positions]  # (batch_size, rope_dim)
+    else:
+        assert freqs_real.shape[0] == batch_size
+
+    # Split x into even (real) and odd (imag) indices along the last dim
+    x_real = x[..., 0::2].float()  # (..., rope_dim // 2)
+    x_imag = x[..., 1::2].float()  # (..., rope_dim // 2)
+
+    # Split freqs into real and imag parts the same way
+    # freqs_real shape: (batch_size, rope_dim)
+    # For 3D input, add a head dimension for broadcasting
+    freq_r = freqs_real[..., 0::2]  # (batch_size, rope_dim // 2)
+    freq_i = freqs_real[..., 1::2]  # (batch_size, rope_dim // 2)
+
+    if is_3d:
+        freq_r = freq_r.unsqueeze(1)  # (batch_size, 1, rope_dim // 2)
+        freq_i = freq_i.unsqueeze(1)
+
+    # Complex multiplication: (x_real + j*x_imag) * (freq_r + j*freq_i)
+    if inverse:
+        # Multiply by conjugate: (freq_r - j*freq_i)
+        out_real = x_real * freq_r + x_imag * freq_i
+        out_imag = x_imag * freq_r - x_real * freq_i
+    else:
+        out_real = x_real * freq_r - x_imag * freq_i
+        out_imag = x_real * freq_i + x_imag * freq_r
+
+    # Interleave real and imag back into x (in-place)
+    x[..., 0::2] = out_real.to(x.dtype)
+    x[..., 1::2] = out_imag.to(x.dtype)
 
     return x

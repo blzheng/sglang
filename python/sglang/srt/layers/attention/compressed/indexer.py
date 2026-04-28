@@ -386,14 +386,11 @@ class C4IndexerBackend:
             else:
                 from deep_gemm import fp8_paged_mqa_logits as fn
 
-        _c4sl = indexer_metadata.c4_seq_lens
-        if _c4sl.dim() == 1:
-            _c4sl = _c4sl.unsqueeze(-1)
         logits = fn(
             q_fp8,
             c4_indexer_kv_cache,
             weights,
-            _c4sl,
+            indexer_metadata.c4_seq_lens,
             indexer_metadata.page_table,
             indexer_metadata.deep_gemm_metadata,
             indexer_metadata.max_c4_seq_len,

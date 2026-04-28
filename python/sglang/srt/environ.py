@@ -535,6 +535,16 @@ class Envs:
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
 
+    # Compressor fallback (used on backends without the fused CUDA compress JIT
+    # kernel, e.g. Intel XPU). When SGLANG_OPT_USE_OLD_COMPRESSOR is set, the
+    # Compressor module dispatches to pure-torch compress_decode_old /
+    # compress_extend_old which read non-paged DeepSeekV4CompressState buffers
+    # instead of calling the CUDA-only fused compress path.
+    SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_PAGED_COMPRESS = EnvBool(True)
+    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
 
