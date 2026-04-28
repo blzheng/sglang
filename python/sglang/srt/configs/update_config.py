@@ -55,8 +55,6 @@ def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
 
 
 def _set_padded_attr(model_config, attr_name, value):
-    """Mirror a (possibly padded) attribute onto hf_config, hf_text_config,
-    and model_config itself when the latter exposes the attribute."""
     if hasattr(model_config, attr_name):
         setattr(model_config, attr_name, value)
     setattr(model_config.hf_config, attr_name, value)
