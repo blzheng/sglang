@@ -68,7 +68,20 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
-enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1 };
+enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1, clamped_silu_and_mul = 2 };
+
+// Select activation based on which clamp/scale parameters the caller provided:
+//   limit + alpha ⇒ gpt-oss swiglu.
+//   limit only    ⇒ DSV4-2604B clamped silu_and_mul.
+//   neither       ⇒ plain silu_and_mul.
+inline CPUAcTMethod select_act_func(
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit) {
+  if (!limit.has_value()) {
+    return CPUAcTMethod::silu_and_mul;
+  }
+  return alpha.has_value() ? CPUAcTMethod::swiglu : CPUAcTMethod::clamped_silu_and_mul;
+}
 
 constexpr bool operator==(CPUAcTMethod a, int b) {
   return static_cast<int>(a) == b;

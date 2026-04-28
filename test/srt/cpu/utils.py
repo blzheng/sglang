@@ -38,6 +38,14 @@ def GeluAndMul(x: torch.Tensor, approximate="tanh") -> torch.Tensor:
     d = x.shape[-1] // 2
     return F.gelu(x[..., :d], approximate=approximate) * x[..., d:]
 
+# Reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/fd53f944496234770ba80e15004f9b6d269a71f5/inference/model.py#L600-L603
+def ClampedSiluAndMul(x: torch.Tensor, limit: float) -> torch.Tensor:
+    """DSV4-2604B activation: clamp gate upper, clamp up symmetric, silu(gate)*up."""
+    d = x.shape[-1] // 2
+    gate = x[..., :d].clamp(max=limit)
+    up = x[..., d:].clamp(min=-limit, max=limit)
+    return F.silu(gate) * up
+
 
 def per_token_quant_int8(x):
     x = x.float()
@@ -372,6 +380,17 @@ def torch_w8a8_per_column_fused_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids
 
 
 def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk):
+    return _native_fused_moe_with_act(a, w1, w2, topk_weight, topk_ids, topk, SiluAndMul)
+
+
+def native_clamped_silu_fused_moe(a, w1, w2, topk_weight, topk_ids, topk, limit):
+    return _native_fused_moe_with_act(
+        a, w1, w2, topk_weight, topk_ids, topk,
+        lambda x: ClampedSiluAndMul(x, limit),
+    )
+
+
+def _native_fused_moe_with_act(a, w1, w2, topk_weight, topk_ids, topk, act_fn):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D).float()
     out = torch.zeros(B * topk, w2.shape[1], dtype=torch.float32, device=a.device)
@@ -384,7 +403,7 @@ def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk):
         mask = topk_ids == i
         if mask.sum():
             ic0 = torch.matmul(a[mask], w1[i].transpose(0, 1))
-            ic1 = SiluAndMul(ic0)
+            ic1 = act_fn(ic0)
             out[mask] = torch.matmul(ic1, w2[i].transpose(0, 1))
 
     return (
