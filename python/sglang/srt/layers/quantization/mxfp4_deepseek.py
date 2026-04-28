@@ -348,6 +348,14 @@ class DeepSeekMxfp4MoEMethod:
             else None
         )
 
+        # Mirror the GPU path's 2604B-path checker so the per-layer assertion
+        # at deepseek_v4.py:1461 (observed == 1) passes on CPU too.
+        if (
+            envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
+            and gemm1_clamp_limit is not None
+        ):
+            deepseek_v4_moe_code_path_checker.observed += 1
+
         return torch.ops.sgl_kernel.fused_experts_cpu(
             x,
             layer.w13_weight,
