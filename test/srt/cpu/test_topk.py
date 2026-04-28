@@ -323,5 +323,122 @@ class TestBiasedTopK(CustomTestCase):
                         )
 
 
+def hash_topk_native(
+    gating_output,
+    tid2eid,
+    topk,
+    scoring_func,
+    num_fused_shared_experts,
+    routed_scaling_factor,
+):
+    M = gating_output.size(0)
+    g = gating_output.float()
+    if scoring_func == "softmax":
+        scores = g.softmax(dim=-1)
+    elif scoring_func == "sigmoid":
+        scores = g.sigmoid()
+    else:
+        scores = torch.nn.functional.softplus(g).sqrt()
+
+    topk_ids = torch.zeros(M, topk, dtype=torch.int32)
+    topk_weights = torch.zeros(M, topk, dtype=torch.float32)
+
+    if num_fused_shared_experts == 1:
+        topk_ids[:, :-1] = tid2eid
+        topk_weights[:, :-1] = scores.gather(1, tid2eid.long())
+        if scoring_func != "softmax":
+            topk_weights[:, :-1] /= topk_weights[:, :-1].sum(dim=-1, keepdim=True)
+        # shared expert weight = sum of routed weights / scaling_factor
+        topk_weights[:, -1] = topk_weights[:, :-1].sum(dim=-1) / routed_scaling_factor
+    else:
+        topk_ids[:, :] = tid2eid
+        topk_weights[:, :] = scores.gather(1, tid2eid.long())
+        if scoring_func != "softmax":
+            topk_weights[:, :] /= topk_weights[:, :].sum(dim=-1, keepdim=True)
+
+    return topk_weights, topk_ids
+
+
+# HashTopK for DeepSeek V4 (expert IDs from precomputed lookup table)
+class TestHashTopK(CustomTestCase):
+    def _run_single_test(
+        self,
+        M,
+        E,
+        topk,
+        scoring_func,
+        num_fused_shared_experts,
+        routed_scaling_factor,
+        gating_dtype,
+    ):
+        torch.manual_seed(2026)
+
+        routed_topk = topk - num_fused_shared_experts
+        # Simulate tid2eid: random expert assignments for each token
+        tid2eid = torch.randint(0, E, (M, routed_topk), dtype=torch.int32)
+        gating_output = torch.randn(M, E, dtype=gating_dtype) * 2 * M
+
+        ref_topk_weights, ref_topk_ids = hash_topk_native(
+            gating_output,
+            tid2eid,
+            topk,
+            scoring_func,
+            num_fused_shared_experts,
+            routed_scaling_factor,
+        )
+
+        # Fused kernel
+        fused_w, fused_ids = torch.ops.sgl_kernel.hash_topk_cpu(
+            gating_output,
+            tid2eid,
+            topk,
+            scoring_func,
+            num_fused_shared_experts,
+            E,
+            routed_scaling_factor,
+        )
+
+        # Compare routed expert IDs (all slots for no-fused, or :-1 for fused)
+        if num_fused_shared_experts == 1:
+            torch.testing.assert_close(
+                fused_ids[:, :-1], ref_topk_ids[:, :-1], atol=0, rtol=0
+            )
+            # Shared expert ID should be in [E, E + num_fused_shared_experts)
+            self.assertTrue((fused_ids[:, -1] >= E).all())
+            self.assertTrue((fused_ids[:, -1] < E + num_fused_shared_experts).all())
+            # Compare routed weights (use allclose to avoid NaN relative diff from underflow)
+            self.assertTrue(
+                torch.allclose(
+                    fused_w[:, :-1], ref_topk_weights[:, :-1], atol=2e-4, rtol=0
+                ),
+                f"routed weights mismatch: max abs diff = {(fused_w[:, :-1] - ref_topk_weights[:, :-1]).abs().max()}",
+            )
+            # Compare shared expert weights
+            self.assertTrue(
+                torch.allclose(
+                    fused_w[:, -1], ref_topk_weights[:, -1], atol=2e-4, rtol=0
+                ),
+                f"shared weights mismatch: max abs diff = {(fused_w[:, -1] - ref_topk_weights[:, -1]).abs().max()}",
+            )
+        else:
+            torch.testing.assert_close(fused_ids, ref_topk_ids, atol=0, rtol=0)
+            self.assertTrue(
+                torch.allclose(fused_w, ref_topk_weights, atol=2e-4, rtol=0),
+                f"weights mismatch: max abs diff = {(fused_w - ref_topk_weights).abs().max()}",
+            )
+
+    def test_hash_topk_no_fused(self):
+        for scoring_func in ["softmax", "sigmoid", "sqrtsoftplus"]:
+            for gating_dtype in [torch.float32, torch.bfloat16]:
+                for E in [64, 128, 256]:
+                    self._run_single_test(34, E, 8, scoring_func, 0, 1.5, gating_dtype)
+
+    def test_hash_topk_with_fused(self):
+        for scoring_func in ["sigmoid", "sqrtsoftplus"]:
+            for gating_dtype in [torch.float32, torch.bfloat16]:
+                for E in [64, 128, 256]:
+                    self._run_single_test(34, E, 8, scoring_func, 1, 1.5, gating_dtype)
+
+
 if __name__ == "__main__":
     unittest.main()

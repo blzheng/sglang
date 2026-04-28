@@ -88,6 +88,15 @@ std::tuple<at::Tensor, at::Tensor> biased_topk_cpu(
     std::optional<double> routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output);
 
+std::tuple<at::Tensor, at::Tensor> hash_topk_cpu(
+    at::Tensor& gating_output,
+    at::Tensor& tid2eid,
+    int64_t topk,
+    std::string scoring_func,
+    int64_t num_fused_shared_experts,
+    int64_t num_experts,
+    double routed_scaling_factor);
+
 // attention
 void decode_attention_cpu(
     at::Tensor& query,
@@ -402,6 +411,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "renormalize, str scoring_func, int num_fused_shared_experts, float? routed_scaling_factor, "
       "bool apply_routed_scaling_factor_on_output) -> (Tensor, Tensor)");
   m.impl("biased_topk_cpu", torch::kCPU, &biased_topk_cpu);
+
+  // hash topk (expert IDs from lookup table)
+  m.def(
+      "hash_topk_cpu(Tensor gating_output, Tensor tid2eid, int topk, str scoring_func, "
+      "int num_fused_shared_experts, int num_experts, float routed_scaling_factor) -> (Tensor, Tensor)");
+  m.impl("hash_topk_cpu", torch::kCPU, &hash_topk_cpu);
 
   // decode
   m.def(

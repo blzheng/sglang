@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from typing import Optional, Tuple
 
@@ -139,6 +138,18 @@ class HashTopK(nn.Module):
                 num_fused_shared_experts=self.num_fused_shared_experts,
                 routed_scaling_factor=self.routed_scaling_factor,
                 scoring_func=self.score_func,
+            )
+        elif _is_cpu and _is_cpu_amx_available:
+            # CPU SGL kernel path: tid2eid lookup done in Python, kernel does scoring + gather
+            tid2eid_for_tokens = self.tid2eid[input_ids]  # [num_tokens, routed_topk]
+            topk_weights, topk_ids = torch.ops.sgl_kernel.hash_topk_cpu(
+                router_logits,
+                tid2eid_for_tokens,
+                self.topk,
+                self.score_func,
+                self.num_fused_shared_experts,
+                self.num_experts,
+                self.routed_scaling_factor,
             )
         else:
             topk_weights, topk_ids = self._forward_torch(router_logits, input_ids)

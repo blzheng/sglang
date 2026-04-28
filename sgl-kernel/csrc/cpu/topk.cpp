@@ -3,7 +3,7 @@
 
 namespace {
 
-template <typename scalar_t, int SIZE>
+template <typename scalar_t, int SIZE, std::enable_if_t<!std::is_same_v<scalar_t, float>, int> = 0>
 inline void softmax(float* __restrict__ out, const scalar_t* __restrict__ input) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
@@ -63,6 +63,39 @@ inline void softmax(float* __restrict__ out, const scalar_t* __restrict__ input)
       fVec out_fvec = fVec::loadu(out + d) * sum_fvec;
       out_fvec.store(out + d);
     }
+  }
+}
+
+template <typename scalar_t, int SIZE, std::enable_if_t<std::is_same_v<scalar_t, float>, int> = 0>
+inline void softmax(float* __restrict__ out, const float* __restrict__ input) {
+  using fVec = at::vec::Vectorized<float>;
+
+  constexpr int kVecSize = fVec::size();
+
+  // step 1: get max
+  fVec max_fvec = fVec(-std::numeric_limits<float>::infinity());
+  for (int d = 0; d < SIZE; d += kVecSize) {
+    fVec x_fvec = fVec::loadu(input + d);
+    max_fvec = at::vec::maximum(max_fvec, x_fvec);
+    x_fvec.store(out + d);
+  }
+  float max_val = vec_reduce_max(max_fvec);
+  max_fvec = fVec(max_val);
+
+  // step 2: sum of (x - max).exp()
+  fVec sum_fvec = fVec(float(0));
+  for (int d = 0; d < SIZE; d += kVecSize) {
+    fVec x_fvec = (fVec::loadu(out + d) - max_fvec).exp_u20();
+    sum_fvec += x_fvec;
+    x_fvec.store(out + d);
+  }
+  float sum_val = vec_reduce_sum(sum_fvec);
+
+  // step 3: x * (1 / sum)
+  sum_fvec = fVec(1.f / sum_val);
+  for (int d = 0; d < SIZE; d += kVecSize) {
+    fVec out_fvec = fVec::loadu(out + d) * sum_fvec;
+    out_fvec.store(out + d);
   }
 }
 
@@ -405,13 +438,17 @@ void biased_grouped_topk_kernel_impl(
 }
 
 // sqrtsoftplus: sqrt(softplus(x)) = sqrt(log(1 + exp(x)))
+// For numerical stability: when x > threshold, softplus(x) ≈ x
+// When x < -threshold, softplus(x) ≈ exp(x), so sqrt(softplus(x)) ≈ sqrt(exp(x)) = exp(x/2)
 template <typename scalar_t, int SIZE, std::enable_if_t<!std::is_same_v<scalar_t, float>, int> = 0>
 inline void sqrtsoftplus(float* __restrict__ out, const scalar_t* __restrict__ input) {
   using bVec = at::vec::Vectorized<scalar_t>;
   using fVec = at::vec::Vectorized<float>;
 
   const fVec one = fVec(1.f);
-  const fVec threshold = fVec(20.f);  // softplus threshold
+  const fVec half = fVec(0.5f);
+  const fVec threshold = fVec(20.f);
+  const fVec neg_threshold = fVec(-15.f);  // below this, 1+exp(x) loses precision in float32
 
   constexpr int kVecSize = bVec::size();
   for (int d = 0; d < SIZE; d += kVecSize) {
@@ -419,15 +456,17 @@ inline void sqrtsoftplus(float* __restrict__ out, const scalar_t* __restrict__ i
     fVec x_fvec0, x_fvec1;
     std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
-    // softplus(x) = log(1 + exp(x)), for large x just use x
+    // default: softplus(x) = log(1 + exp(x))
     fVec sp0 = (one + x_fvec0.exp_u20()).log();
     fVec sp1 = (one + x_fvec1.exp_u20()).log();
-    // use x directly when x > threshold to avoid overflow
+    // x > 20: softplus(x) ≈ x
     sp0 = fVec::blendv(sp0, x_fvec0, x_fvec0 > threshold);
     sp1 = fVec::blendv(sp1, x_fvec1, x_fvec1 > threshold);
-    // sqrt
-    sp0 = sp0.sqrt();
-    sp1 = sp1.sqrt();
+    // x < -15: softplus(x) ≈ exp(x), sqrt(exp(x)) = exp(x/2)
+    fVec exp_half0 = (x_fvec0 * half).exp_u20();
+    fVec exp_half1 = (x_fvec1 * half).exp_u20();
+    sp0 = fVec::blendv(sp0.sqrt(), exp_half0, x_fvec0 < neg_threshold);
+    sp1 = fVec::blendv(sp1.sqrt(), exp_half1, x_fvec1 < neg_threshold);
 
     sp0.store(out + d);
     sp1.store(out + d + fVec::size());
@@ -438,13 +477,16 @@ template <typename scalar_t, int SIZE, std::enable_if_t<std::is_same_v<scalar_t,
 inline void sqrtsoftplus(float* __restrict__ out, const float* __restrict__ input) {
   using fVec = at::vec::Vectorized<float>;
   const fVec one = fVec(1.f);
+  const fVec half = fVec(0.5f);
   const fVec threshold = fVec(20.f);
+  const fVec neg_threshold = fVec(-15.f);
   constexpr int kVecSize = fVec::size();
   for (int d = 0; d < SIZE; d += kVecSize) {
     fVec x = fVec::loadu(input + d);
     fVec sp = (one + x.exp_u20()).log();
     sp = fVec::blendv(sp, x, x > threshold);
-    sp = sp.sqrt();
+    fVec exp_half = (x * half).exp_u20();
+    sp = fVec::blendv(sp.sqrt(), exp_half, x < neg_threshold);
     sp.store(out + d);
   }
 }
@@ -553,6 +595,93 @@ void biased_topk_kernel_impl(
     }
   });
 }
+
+// hash_topk: expert IDs come from a precomputed lookup table tid2eid[input_ids]
+// scoring_func: 0 = softmax, 1 = sigmoid, 2 = sqrtsoftplus
+template <typename scalar_t, int NUM_EXPERTS, int TOPK>
+void hash_topk_kernel_impl(
+    float* __restrict__ topk_weights,
+    int32_t* __restrict__ topk_ids,
+    const scalar_t* __restrict__ gating_output,
+    const int32_t* __restrict__ tid2eid,  // [num_tokens, routed_topk]
+    int64_t num_tokens,
+    int scoring_func,
+    int64_t num_fused_shared_experts,
+    int64_t num_experts,
+    float routed_scaling_factor,
+    int64_t topk) {
+  const int64_t routed_topk = topk - num_fused_shared_experts;
+  const bool need_renormalize = (scoring_func != 0);  // renormalize for non-softmax
+
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    alignas(64) float scores[NUM_EXPERTS];
+
+    // simple RNG for fused shared expert random ID
+    uint64_t rng_state = begin * 6364136223846793005ULL + 1442695040888963407ULL;
+
+    for (int64_t i = begin; i < end; ++i) {
+      // compute scores over all experts
+      if (scoring_func == 0) {
+        softmax<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
+      } else if (scoring_func == 1) {
+        sigmoid<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
+      } else {
+        sqrtsoftplus<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
+      }
+
+      // gather expert IDs from lookup table
+      const int32_t* eid_row = tid2eid + i * routed_topk;
+      for (int64_t j = 0; j < routed_topk; ++j) {
+        int32_t eid = eid_row[j];
+        topk_ids[i * topk + j] = eid;
+        topk_weights[i * topk + j] = scores[eid];
+      }
+
+      // renormalize routed weights (for non-softmax scoring)
+      if (need_renormalize) {
+        float sum = 0.f;
+        for (int64_t j = 0; j < routed_topk; ++j) {
+          sum += topk_weights[i * topk + j];
+        }
+        if (sum > 0.f) {
+          float scale = 1.f / sum;
+          for (int64_t j = 0; j < routed_topk; ++j) {
+            topk_weights[i * topk + j] *= scale;
+          }
+        }
+      }
+
+      // handle fused shared expert
+      if (num_fused_shared_experts > 0) {
+        // random shared expert ID in [num_experts, num_experts + num_fused_shared_experts)
+        rng_state = rng_state * 6364136223846793005ULL + 1442695040888963407ULL;
+        int32_t shared_id =
+            num_experts + static_cast<int32_t>((rng_state >> 33) % static_cast<uint64_t>(num_fused_shared_experts));
+        topk_ids[i * topk + topk - 1] = shared_id;
+
+        // shared expert weight = sum of routed weights / scaling_factor
+        float routed_sum = 0.f;
+        for (int64_t j = 0; j < routed_topk; ++j) {
+          routed_sum += topk_weights[i * topk + j];
+        }
+        topk_weights[i * topk + topk - 1] = routed_sum / routed_scaling_factor;
+      }
+    }
+  });
+}
+
+#define LAUNCH_HASH_TOPK_KERNEL(NE, NTOPK)    \
+  hash_topk_kernel_impl<scalar_t, NE, NTOPK>( \
+      topk_weights.data_ptr<float>(),         \
+      topk_ids.data_ptr<int32_t>(),           \
+      gating_output.data_ptr<scalar_t>(),     \
+      tid2eid_flat.data_ptr<int32_t>(),       \
+      num_tokens,                             \
+      scoring_func_id,                        \
+      num_fused_shared_experts,               \
+      num_experts,                            \
+      routed_scaling_factor_value,            \
+      topk);
 
 #define LAUNCH_BIASED_TOPK_KERNEL(NE, NTOPK)             \
   biased_topk_kernel_impl<scalar_t, param_t, NE, NTOPK>( \
@@ -707,6 +836,116 @@ std::tuple<at::Tensor, at::Tensor> biased_topk_cpu(
         TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
     }
   });
+  return std::make_tuple(topk_weights, topk_ids);
+}
+
+// hash topk for DeepSeek V4 (expert IDs from precomputed lookup table)
+std::tuple<at::Tensor, at::Tensor> hash_topk_cpu(
+    at::Tensor& gating_output,
+    at::Tensor& tid2eid,
+    int64_t topk,
+    std::string scoring_func,
+    int64_t num_fused_shared_experts,
+    int64_t num_experts,
+    double routed_scaling_factor) {
+  RECORD_FUNCTION("sgl-kernel::hash_topk_cpu", std::vector<c10::IValue>({gating_output, tid2eid}));
+
+  CHECK_INPUT(gating_output);
+  CHECK_INPUT(tid2eid);
+
+  const auto st = gating_output.scalar_type();
+  int64_t num_tokens = gating_output.size(0);
+  int64_t num_experts_gating = gating_output.size(1);
+  int64_t routed_topk = topk - num_fused_shared_experts;
+
+  TORCH_CHECK(tid2eid.size(0) == num_tokens, "tid2eid row count must match num_tokens");
+  TORCH_CHECK(tid2eid.size(1) == routed_topk, "tid2eid column count must match routed_topk");
+  TORCH_CHECK(tid2eid.scalar_type() == at::kInt, "tid2eid must be int32");
+  TORCH_CHECK(num_experts_gating == num_experts, "num_experts mismatch");
+
+  int scoring_func_id = 0;
+  if (scoring_func == "softmax") {
+    scoring_func_id = 0;
+  } else if (scoring_func == "sigmoid") {
+    scoring_func_id = 1;
+  } else if (scoring_func == "sqrtsoftplus") {
+    scoring_func_id = 2;
+  } else {
+    TORCH_CHECK(false, "Unsupported scoring_func: ", scoring_func);
+  }
+
+  float routed_scaling_factor_value = static_cast<float>(routed_scaling_factor);
+
+  at::Tensor topk_weights = at::empty({num_tokens, topk}, gating_output.options().dtype(at::kFloat));
+  at::Tensor topk_ids = at::empty({num_tokens, topk}, gating_output.options().dtype(at::kInt));
+
+  // tid2eid is [num_tokens, routed_topk], already indexed by input_ids in Python
+  at::Tensor tid2eid_flat = tid2eid.contiguous();
+
+  // Dispatch for bf16, fp16, and float32
+  // Note: cannot use AT_DISPATCH_FLOATING_TYPES_AND2 since it includes double which lacks convert_to_float
+  auto dispatch_fn = [&]<typename scalar_t>() {
+    switch (num_experts) {
+      case 64:
+        switch (routed_topk) {
+          case 6:
+            LAUNCH_HASH_TOPK_KERNEL(64, 6);
+            break;
+          case 7:
+            LAUNCH_HASH_TOPK_KERNEL(64, 7);
+            break;
+          case 8:
+            LAUNCH_HASH_TOPK_KERNEL(64, 8);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected routed_topk: ", routed_topk, " for num_experts=64");
+        }
+        break;
+      case 128:
+        switch (routed_topk) {
+          case 6:
+            LAUNCH_HASH_TOPK_KERNEL(128, 6);
+            break;
+          case 7:
+            LAUNCH_HASH_TOPK_KERNEL(128, 7);
+            break;
+          case 8:
+            LAUNCH_HASH_TOPK_KERNEL(128, 8);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected routed_topk: ", routed_topk, " for num_experts=128");
+        }
+        break;
+      case 256:
+        switch (routed_topk) {
+          case 6:
+            LAUNCH_HASH_TOPK_KERNEL(256, 6);
+            break;
+          case 7:
+            LAUNCH_HASH_TOPK_KERNEL(256, 7);
+            break;
+          case 8:
+            LAUNCH_HASH_TOPK_KERNEL(256, 8);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected routed_topk: ", routed_topk, " for num_experts=256");
+        }
+        break;
+      default:
+        TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+    }
+  };
+
+  if (st == at::ScalarType::BFloat16) {
+    dispatch_fn.template operator()<at::BFloat16>();
+  } else if (st == at::ScalarType::Half) {
+    dispatch_fn.template operator()<at::Half>();
+  } else if (st == at::ScalarType::Float) {
+    dispatch_fn.template operator()<float>();
+  } else {
+    TORCH_CHECK(false, "Unsupported dtype for hash_topk_cpu: ", st);
+  }
+
   return std::make_tuple(topk_weights, topk_ids);
 }
 
