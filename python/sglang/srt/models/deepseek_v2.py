@@ -740,7 +740,7 @@ class DeepseekV2MoE(nn.Module):
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states, should_allreduce_fusion)
+            return self.forward_cpu(hidden_states, should_allreduce_fusion, input_ids_global)
 
         if hidden_states.shape[0] > 0:
             if (
@@ -826,10 +826,12 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         should_allreduce_fusion: bool = False,
+        input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
+        topk_output = self.topk(hidden_states, router_logits, **topk_kwargs)
         fused_experts_out = self.experts(
             hidden_states=hidden_states, topk_output=topk_output
         )
