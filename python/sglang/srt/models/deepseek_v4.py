@@ -110,7 +110,9 @@ class DeepseekRefRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
-        out = rms_normalize_triton(x, self.eps, self.weight)
+        out = rms_normalize(x, self.eps)
+        out = out * self.weight
+        # out = rms_normalize_triton(x, self.eps, self.weight)
         return out
 
 
@@ -886,7 +888,8 @@ class MQALayer(nn.Module):
         if self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
-            q = rms_normalize_triton(q, self.eps)
+            # q = rms_normalize_triton(q, self.eps)
+            q = rms_normalize(q, self.eps)
         if positions is not None:
             fused_rope(
                 q[..., -self.qk_rope_head_dim :],
@@ -1014,7 +1017,8 @@ class MQALayer(nn.Module):
         if self.use_jit_norm:
             q = rmsnorm_self(q, self.eps)
         else:
-            q = rms_normalize_triton(q, self.eps)
+            # q = rms_normalize_triton(q, self.eps)
+            q = rms_normalize(q, self.eps)
 
         kv = self.kv_norm(kv)
 
@@ -1147,7 +1151,7 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-
+        print("Attening done...")
         return o
 
 

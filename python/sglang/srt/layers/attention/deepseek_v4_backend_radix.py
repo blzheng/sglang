@@ -37,6 +37,7 @@ from sglang.srt.layers.attention.debug_flash_mla_adapter import (
 )
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
+    quant_to_nope_fp8_rope_bf16_pack
 )
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.attention.triton_ops.compressed_metadata import (
@@ -970,7 +971,8 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 cache_k=swa_k,
             )
         else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
+            # swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
+            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack(swa_k)
             self.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=layer_id,
                 raw_loc=raw_loc,

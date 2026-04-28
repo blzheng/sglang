@@ -14,6 +14,7 @@ from sglang.jit_kernel.deepseek_v4 import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
+    quant_to_nope_fp8_rope_bf16_pack
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.nsa.utils import (
@@ -26,6 +27,74 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v4 import Compressor, DeepseekRefRMSNorm
 
+
+def act_quant_pytorch(
+    x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Quantizes the input tensor `x` using block-wise quantization (PyTorch native).
+    This is a pure PyTorch implementation equivalent to the Triton kernel version.
+    It performs per-block FP8 quantization along the last dimension.
+    Args:
+        x (torch.Tensor): The input tensor to be quantized. Must be contiguous and
+            its last dimension size must be divisible by `block_size`.
+        block_size (int, optional): The size of the blocks used for quantization.
+            Default is 128.
+        scale_fmt (Optional[str], optional): If not None, scales are rounded to
+            powers of 2. Default is None.
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - The quantized tensor with dtype `torch.float8_e4m3fn`.
+            - A tensor of scaling factors with dtype `torch.float32`.
+    """
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert (
+        x.size(-1) % block_size == 0
+    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
+
+    # FP8 e4m3fn constants
+    fp8_max = 448.0
+    fp8_min = -448.0
+
+    # Flatten all dims except last
+    orig_shape = x.shape
+    N = x.size(-1)
+    x_flat = x.view(-1, N).float()  # (M, N)
+    M = x_flat.size(0)
+    num_groups = N // block_size
+
+    # Reshape into blocks: (M, num_groups, block_size)
+    x_blocked = x_flat.view(M, num_groups, block_size)
+
+    # Compute per-block absolute max -> (M, num_groups)
+    amax = x_blocked.abs().amax(dim=2)
+
+    # Clamp to avoid division by zero
+    amax = amax.clamp(min=1e-4)
+
+    # Compute scale
+    round_scale = scale_fmt is not None
+    if round_scale:
+        # Round scale to nearest power of 2 (ceiling in log2 space)
+        scale = torch.exp2(torch.ceil(torch.log2(amax / fp8_max)))
+    else:
+        scale = amax / fp8_max
+
+    # Quantize: y = clamp(x / scale, fp8_min, fp8_max)
+    # scale shape: (M, num_groups) -> broadcast to (M, num_groups, block_size)
+    y = x_blocked / scale.unsqueeze(2)
+    y = y.clamp(fp8_min, fp8_max)
+
+    # Reshape output back to original shape and cast to fp8
+    y = y.view(orig_shape).to(torch.float8_e4m3fn)
+
+    # Reshape scale to match expected output shape: (*orig_shape[:-1], num_groups)
+    s = scale.view(*orig_shape[:-1], num_groups)
+
+    return y, s
+
+
+act_quant = act_quant_pytorch
 
 class FusedCompressMetadata(NamedTuple):
     write_loc: torch.Tensor
@@ -136,7 +205,8 @@ class CompressorBackend:
                 cache_k=new_compressed_kv,
             )
         else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
+            #pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
+            pack = quant_to_nope_fp8_rope_bf16_pack(new_compressed_kv.bfloat16())
             token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(
@@ -207,6 +277,59 @@ def make_compressor_plan(
         raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
 
+from typing import Tuple
+import torch
+
+
+def pytorch_create_paged_compress_data(
+    *,
+    compress_ratio: int,
+    is_overlap: bool,
+    swa_page_size: int,
+    ring_size: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extend_seq_lens: torch.Tensor,
+    req_to_token: torch.Tensor,
+    full_to_swa_index_mapping: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size = req_pool_indices.shape[0]
+    device = req_pool_indices.device
+
+    rid = req_pool_indices.to(torch.int32)
+    seq_len = seq_lens[:batch_size].to(torch.int32)
+    extend_len = extend_seq_lens[:batch_size].to(torch.int32)
+    prefix_len = seq_len - extend_len
+
+    cr = compress_ratio
+    write_pos = ((seq_len - 1) // cr) * cr
+    load_pos = ((prefix_len - 1) // cr) * cr
+    write_overlap_pos = write_pos - cr
+    load_overlap_pos = load_pos - cr
+
+    def compute_state_loc(pos: torch.Tensor) -> torch.Tensor:
+        pos = pos.clamp(min=0)
+        loc = req_to_token[rid, pos].to(torch.int32)
+        swa_loc = full_to_swa_index_mapping[loc].to(torch.int32)
+        swa_page = swa_loc // swa_page_size
+        state_loc = swa_page * ring_size + (swa_loc % ring_size)
+        state_loc = state_loc // cr
+        return state_loc
+
+    v0 = compute_state_loc(load_pos)           # i == 0
+    v1 = compute_state_loc(write_pos)          # i == 1
+    v2 = compute_state_loc(load_overlap_pos)   # i == 2
+    v3 = compute_state_loc(write_overlap_pos)  # i == 3
+
+    out_0 = v1.clone()
+
+    if is_overlap:
+        out_1 = torch.stack([v2, v0, v3, write_pos.to(torch.int32)], dim=1)
+    else:
+        out_1 = v0.clone()
+
+    return out_0, out_1
+
 def create_paged_compressor_data(
     compress_ratio: Literal[4, 128],
     *,
@@ -240,7 +363,8 @@ def create_paged_compressor_data(
 
     if is_prefill:
         assert extend_lens is not None
-        write_loc, extra_data = triton_create_paged_compress_data(
+        # write_loc, extra_data = triton_create_paged_compress_data(
+        write_loc, extra_data = pytorch_create_paged_compress_data(
             compress_ratio=compress_ratio,
             is_overlap=is_overlap,
             swa_page_size=swa_page_size,

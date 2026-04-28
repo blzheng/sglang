@@ -18,6 +18,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
+    is_cpu,
 )
 
 global _use_multi_stream
@@ -26,6 +27,7 @@ _is_hip = is_hip()
 _is_sm103 = _is_cuda and get_device_sm() == 103
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 if _is_cuda:
     try:
@@ -147,7 +149,7 @@ def _torch_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip or _is_sm103:
         from fast_hadamard_transform import hadamard_transform
-    elif _is_xpu:
+    elif _is_xpu or _is_cpu:
         hadamard_transform = _torch_hadamard_transform
     else:
         try:

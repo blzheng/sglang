@@ -437,7 +437,7 @@ class CompressorPrefillPlan(NamedTuple):
             (2, num_q_tokens, 16),
             dtype=torch.uint8,
             device=seq_lens.device,
-            pin_memory=seq_lens.is_cpu,
+            # pin_memory=seq_lens.is_cpu,
         )
         is_overlap = compress_ratio == 4
         if _is_cuda:
