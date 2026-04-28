@@ -77,6 +77,17 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
     std::optional<double> routed_scaling_factor,
     std::optional<at::Tensor> num_token_non_padded);
 
+std::tuple<at::Tensor, at::Tensor> biased_topk_cpu(
+    at::Tensor& hidden_states,
+    at::Tensor& gating_output,
+    at::Tensor& correction_bias,
+    int64_t topk,
+    bool renormalize,
+    std::string scoring_func,
+    int64_t num_fused_shared_experts,
+    std::optional<double> routed_scaling_factor,
+    bool apply_routed_scaling_factor_on_output);
+
 // attention
 void decode_attention_cpu(
     at::Tensor& query,
@@ -385,6 +396,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor? num_token_non_padded) -> (Tensor, Tensor)");
   m.impl("biased_grouped_topk_cpu", torch::kCPU, &biased_grouped_topk_cpu);
 
+  // biased topk (flat, non-grouped)
+  m.def(
+      "biased_topk_cpu(Tensor hidden_states, Tensor gating_output, Tensor correction_bias, int topk, bool "
+      "renormalize, str scoring_func, int num_fused_shared_experts, float? routed_scaling_factor, "
+      "bool apply_routed_scaling_factor_on_output) -> (Tensor, Tensor)");
+  m.impl("biased_topk_cpu", torch::kCPU, &biased_topk_cpu);
+
   // decode
   m.def(
       "decode_attention_cpu(Tensor query, Tensor k_cache, Tensor v_cahce, Tensor(a!) output, Tensor key, Tensor value, "
@@ -491,7 +509,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // shared expert
   m.def(
       "shared_expert_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor? fused_experts_out, float? "
-      "routed_scaling_factor, bool inplace, bool use_int8_w8a8, bool use_fp8_w8a16, bool use_mxfp4, Tensor? w1_scale, Tensor? "
+      "routed_scaling_factor, bool inplace, bool use_int8_w8a8, bool use_fp8_w8a16, bool use_mxfp4, Tensor? w1_scale, "
+      "Tensor? "
       "w2_scale, int[]? block_size, bool is_vnni) -> Tensor");
   m.impl("shared_expert_cpu", torch::kCPU, &shared_expert_cpu);
 
