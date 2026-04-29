@@ -8,31 +8,47 @@ FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
-    if is_hip():
-        # backend == "torch"
-        import os
+    # if is_hip():
+    #     # backend == "torch"
+    #     import os
 
-        backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "kernel")
+    #     backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "kernel")
 
-    if backend == "comparison":
-        pack_ref, pack_fast_via_tester = flash_mla_with_kvcache_entrypoint(
-            backend="torch", **kwargs
-        )
-        pack_fast_via_api = flash_mla_with_kvcache_entrypoint(
-            backend="kernel", **kwargs
-        )
-        _assert_close(pack_ref=pack_fast_via_tester, pack_fast=pack_fast_via_api)
-        _assert_close(pack_ref=pack_ref, pack_fast=pack_fast_via_tester)
-        _assert_close(pack_ref=pack_ref, pack_fast=pack_fast_via_api)
-        return pack_ref
+    # if backend == "comparison":
+    #     pack_ref, pack_fast_via_tester = flash_mla_with_kvcache_entrypoint(
+    #         backend="torch", **kwargs
+    #     )
+    #     pack_fast_via_api = flash_mla_with_kvcache_entrypoint(
+    #         backend="kernel", **kwargs
+    #     )
+    #     _assert_close(pack_ref=pack_fast_via_tester, pack_fast=pack_fast_via_api)
+    #     _assert_close(pack_ref=pack_ref, pack_fast=pack_fast_via_tester)
+    #     _assert_close(pack_ref=pack_ref, pack_fast=pack_fast_via_api)
+    #     return pack_ref
 
     if backend == "torch":
         return flash_mla_with_kvcache_torch(**kwargs)
 
-    if backend == "kernel":
-        import flash_mla
+    # if backend == "kernel":
+    #     import flash_mla
 
-        return flash_mla.flash_mla_with_kvcache(**kwargs)
+    #     return flash_mla.flash_mla_with_kvcache(**kwargs)
+
+    if backend == "cpu_amx":
+    #     # Intel CPU AMX implementation of FlashMLA's sparse FP8 decode path.
+    #     # See sgl-kernel/csrc/cpu/flash_mla.cpp.
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
+        return flash_mla_with_kvcache_cpu(**kwargs)
+    # #     return flash_mla_with_kvcache_cpu(**kwargs)
+
+    # breakpoint()
+    # 
+    if backend == "comparison":
+        pack_ref  = flash_mla_with_kvcache_torch(**kwargs)
+        pack_fast = flash_mla_with_kvcache_cpu(**kwargs)
+        _assert_close(pack_ref, pack_fast)
+        return pack_ref
+
 
     raise NotImplementedError
 
@@ -186,5 +202,9 @@ def _assert_close(pack_ref, pack_fast):
     is_lse_correct = kk.check_is_allclose(
         "lse", lse_fast, lse_ref, abs_tol=1e-6, rel_tol=8.01 / 65536
     )
+    if not (is_out_correct and is_lse_correct):
+        breakpoint()
+    else:
+        print("pass!...")
 
     assert is_out_correct and is_lse_correct, f"{is_out_correct=} {is_lse_correct=}"

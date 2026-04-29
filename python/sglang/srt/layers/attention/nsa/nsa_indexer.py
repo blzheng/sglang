@@ -135,7 +135,7 @@ def _torch_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
     """
     n = x.size(-1)
     leading = x.shape[:-1]
-    out = x.reshape(-1, n).clone()
+    out = x.reshape(-1, n).float().clone()
     h = 1
     while h < n:
         out = out.view(-1, n // (2 * h), 2, h)
@@ -143,7 +143,7 @@ def _torch_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
         b = out[:, :, 1, :]
         out = torch.stack((a + b, a - b), dim=2).view(-1, n)
         h *= 2
-    return out.view(*leading, n) * scale
+    return (out.view(*leading, n) * scale).to(x.dtype)
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
