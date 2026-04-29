@@ -687,7 +687,7 @@ def alloc_decode_kernel_pytorch(
 
     # Requests that don't need a new page: next slot is last_loc + 1
     no_new_page_mask = num_new_pages == 0
-    out_indices[no_new_page_mask] = last_loc[no_new_page_mask] + 1
+    out_indices[no_new_page_mask] = last_loc[no_new_page_mask].to(out_indices.dtype) + 1
 
     # Requests that need a new page: start of the allocated free page
     new_page_mask = num_new_pages > 0
