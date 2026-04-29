@@ -1446,6 +1446,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        print(f"MoE layer {self.layer_id} done, observed={deepseek_v4_moe_code_path_checker.observed}", flush=True)
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
