@@ -100,6 +100,18 @@ if TYPE_CHECKING:
         PPProxyTensors,
     )
 
+def rms_normalize_native(
+    x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    x_f32 = x.to(torch.float32)
+    variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
+    normalized = x_f32 * torch.rsqrt(variance + eps)
+
+    if weight is not None:
+        normalized = normalized * weight.to(dtype=normalized.dtype)
+
+    x.copy_(normalized.to(dtype=x.dtype))
+    return x
 
 class DeepseekRefRMSNorm(nn.Module):
 
@@ -110,9 +122,10 @@ class DeepseekRefRMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
-        out = rms_normalize(x, self.eps)
-        out = out * self.weight
+        # out = rms_normalize(x, self.eps)
+        # out = out * self.weight
         # out = rms_normalize_triton(x, self.eps, self.weight)
+        out = rms_normalize_native(x, self.eps, self.weight)
         return out
 
 
@@ -889,7 +902,7 @@ class MQALayer(nn.Module):
             q = rmsnorm_self(q, self.eps)
         else:
             # q = rms_normalize_triton(q, self.eps)
-            q = rms_normalize(q, self.eps)
+            q = rms_normalize_native(q, self.eps)
         if positions is not None:
             fused_rope(
                 q[..., -self.qk_rope_head_dim :],
@@ -1018,7 +1031,7 @@ class MQALayer(nn.Module):
             q = rmsnorm_self(q, self.eps)
         else:
             # q = rms_normalize_triton(q, self.eps)
-            q = rms_normalize(q, self.eps)
+            q = rms_normalize_native(q, self.eps)
 
         kv = self.kv_norm(kv)
 
@@ -2131,6 +2144,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     wgate = loaded_weight if is_wgate else cached_weight
                                     fused_weight = torch.cat([kv, wgate], dim=0)
                                     param_name = key + ".wkv_gate.weight"
+                                    # if param_name in params_dict:
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
                                     maybe_executor_submit(
