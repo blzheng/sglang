@@ -241,6 +241,8 @@ at::Tensor shared_expert_cpu(
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size,
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit,
     bool is_vnni);
 
 // weight absorption
@@ -526,7 +528,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "shared_expert_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor? fused_experts_out, float? "
       "routed_scaling_factor, bool inplace, bool use_int8_w8a8, bool use_fp8_w8a16, bool use_mxfp4, Tensor? w1_scale, "
       "Tensor? "
-      "w2_scale, int[]? block_size, bool is_vnni) -> Tensor");
+      "w2_scale, int[]? block_size, float? alpha, float? limit, bool is_vnni) -> Tensor");
   m.impl("shared_expert_cpu", torch::kCPU, &shared_expert_cpu);
 
   // causal conv1d

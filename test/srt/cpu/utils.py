@@ -38,6 +38,7 @@ def GeluAndMul(x: torch.Tensor, approximate="tanh") -> torch.Tensor:
     d = x.shape[-1] // 2
     return F.gelu(x[..., :d], approximate=approximate) * x[..., d:]
 
+
 # Reference: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/fd53f944496234770ba80e15004f9b6d269a71f5/inference/model.py#L600-L603
 def ClampedSiluAndMul(x: torch.Tensor, limit: float) -> torch.Tensor:
     """DSV4-2604B activation: clamp gate upper, clamp up symmetric, silu(gate)*up."""
@@ -134,7 +135,9 @@ def native_w8a8_per_token_matmul(A, B, As, Bs, bias, output_dtype=torch.bfloat16
     return C.reshape(origin_C_shape).to(output_dtype)
 
 
-def torch_naive_moe(a, w1, w2, b, routed_scaling_factor, output_dtype=torch.bfloat16):
+def _torch_naive_moe_with_act(
+    a, w1, w2, b, routed_scaling_factor, output_dtype=torch.bfloat16, act_fn=SiluAndMul
+):
 
     a = a.to(torch.float32)
     w1 = w1.to(torch.float32)
@@ -142,12 +145,32 @@ def torch_naive_moe(a, w1, w2, b, routed_scaling_factor, output_dtype=torch.bflo
     b = b.to(torch.float32) if b is not None else None
 
     ic1 = torch.matmul(a, w1.transpose(0, 1))
-    ic2 = SiluAndMul(ic1)
+    ic2 = act_fn(ic1)
     ic3 = torch.matmul(ic2, w2.transpose(0, 1))
 
     out = ic3 if b is None else ic3 + b * routed_scaling_factor
 
     return out.to(output_dtype)
+
+
+def torch_naive_moe(a, w1, w2, b, routed_scaling_factor, output_dtype=torch.bfloat16):
+    return _torch_naive_moe_with_act(
+        a, w1, w2, b, routed_scaling_factor, output_dtype, act_fn=SiluAndMul
+    )
+
+
+def torch_naive_clamped_silu_moe(
+    a, w1, w2, b, routed_scaling_factor, limit, output_dtype=torch.bfloat16
+):
+    return _torch_naive_moe_with_act(
+        a,
+        w1,
+        w2,
+        b,
+        routed_scaling_factor,
+        output_dtype,
+        act_fn=lambda x: ClampedSiluAndMul(x, limit),
+    )
 
 
 def torch_w8a8_per_column_moe(
@@ -329,6 +352,7 @@ def torch_naive_fused_moe_gptoss(
         len_experts,
     )
 
+
 def torch_w8a8_per_column_fused_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, topk):
     """This function performs fused moe with per-column int8 quantization using native torch."""
 
@@ -380,12 +404,19 @@ def torch_w8a8_per_column_fused_moe(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids
 
 
 def native_fp8_fused_moe(a, w1, w2, topk_weight, topk_ids, topk):
-    return _native_fused_moe_with_act(a, w1, w2, topk_weight, topk_ids, topk, SiluAndMul)
+    return _native_fused_moe_with_act(
+        a, w1, w2, topk_weight, topk_ids, topk, SiluAndMul
+    )
 
 
 def native_clamped_silu_fused_moe(a, w1, w2, topk_weight, topk_ids, topk, limit):
     return _native_fused_moe_with_act(
-        a, w1, w2, topk_weight, topk_ids, topk,
+        a,
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        topk,
         lambda x: ClampedSiluAndMul(x, limit),
     )
 
@@ -411,6 +442,7 @@ def _native_fused_moe_with_act(a, w1, w2, topk_weight, topk_ids, topk, act_fn):
         .sum(dim=1)
         .to(a.dtype)
     )
+
 
 # https://github.com/NVIDIA/TensorRT-Model-Optimizer/blob/main/modelopt/torch/quantization/qtensor/mxfp4_tensor.py
 class MXFP4QuantizeUtil:
@@ -525,6 +557,7 @@ class MXFP4QuantizeUtil:
 
         # Reshape back to the original shape
         return x_float.reshape(original_shape).to(dtype)
+
 
 def make_non_contiguous(x: torch.Tensor) -> torch.Tensor:
     """

@@ -201,7 +201,6 @@ inline void clamped_silu_and_mul(
   }
 }
 
-
 template <typename scalar_t, int BLOCK_N>
 inline void clamp_sigmoid_and_mul(
     scalar_t* __restrict__ output,
@@ -251,7 +250,6 @@ inline void clamp_sigmoid_and_mul(
     }
   }
 }
-
 
 template <typename scalar_t, int BLOCK_M, int BLOCK_N>
 struct tinygemm_kernel_nn2 {
@@ -685,8 +683,7 @@ void fused_experts_kernel_impl(
       if (act_func == CPUAcTMethod::silu_and_mul && use_brgemm) {
         silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
       } else if (act_func == CPUAcTMethod::clamped_silu_and_mul && use_brgemm) {
-        clamped_silu_and_mul<scalar_t, BLOCK_N>(
-            ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N, limit);
+        clamped_silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N, limit);
       } else if (act_func == CPUAcTMethod::swiglu) {
         clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N, C0, m_size, N, alpha, limit, 0 + nb * BLOCK_N / 2);
         clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(
@@ -1007,7 +1004,7 @@ at::Tensor fused_experts_cpu(
     const std::optional<at::Tensor>& w1_zero,
     const std::optional<at::Tensor>& w2_zero,
     const std::optional<std::vector<int64_t>> block_size,
-     const std::optional<at::Tensor>& w1_bias,
+    const std::optional<at::Tensor>& w1_bias,
     const std::optional<at::Tensor>& w2_bias,
     const std::optional<double>& alpha,
     const std::optional<double>& limit,
@@ -1369,6 +1366,8 @@ at::Tensor shared_expert_cpu(
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size,
+    const std::optional<double>& alpha,
+    const std::optional<double>& limit,
     bool is_vnni) {
   RECORD_FUNCTION("sgl-kernel::shared_expert_cpu", std::vector<c10::IValue>({hidden_states, w1, w2}));
 
@@ -1469,6 +1468,7 @@ at::Tensor shared_expert_cpu(
     } else if (use_fp8_w8a16) {
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * 2 * N));
+      auto act_func = select_act_func(alpha, limit);
 
       CHECK_MOE_SCALES_FP8(0, 1);
       shared_expert_fp_kernel_impl<scalar_t, at::Float8_e4m3fn, float, false>(
@@ -1488,10 +1488,14 @@ at::Tensor shared_expert_cpu(
           routed_scaling_factor_value,
           M,
           N,
-          K);
+          K,
+          alpha.has_value() ? float(alpha.value()) : 0,
+          limit.has_value() ? float(limit.value()) : 0,
+          act_func);
     } else if (use_mxfp4) {
       scalar_t* __restrict__ intermediate_cache0 = (scalar_t*)((void*)(C_tmp + num_threads * 2 * BLOCK_M * BLOCK_N));
       scalar_t* __restrict__ B_tmp = (scalar_t*)((void*)(intermediate_cache0 + M * 2 * N));
+      auto act_func = select_act_func(alpha, limit);
 
       // mxfp4 supports only group size of 32 (2^5)
       constexpr int64_t group_size = 32;
@@ -1516,7 +1520,10 @@ at::Tensor shared_expert_cpu(
           routed_scaling_factor_value,
           M,
           N,
-          K);
+          K,
+          alpha.has_value() ? float(alpha.value()) : 0,
+          limit.has_value() ? float(limit.value()) : 0,
+          act_func);
     } else {
       shared_expert_kernel_impl<scalar_t>(
           out_hidden_states.data_ptr<scalar_t>(),
