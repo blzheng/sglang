@@ -44,6 +44,7 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     # breakpoint()
     # 
     if backend == "comparison":
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache_cpu
         pack_ref  = flash_mla_with_kvcache_torch(**kwargs)
         pack_fast = flash_mla_with_kvcache_cpu(**kwargs)
         _assert_close(pack_ref, pack_fast)

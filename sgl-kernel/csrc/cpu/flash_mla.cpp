@@ -1,5 +1,5 @@
 // Intel CPU AMX implementation of FlashMLA's `flash_mla_with_kvcache` for the
-// FP8 sparse decode path used by DeepSeek-V3.2 / DSv4 reference.
+// sparse decode path used by DeepSeek-V3.2 / DSv4 reference.
 //
 // This kernel mirrors the interface of:
 //   - flash_mla.flash_mla_with_kvcache (DeepSeek FlashMLA upstream)
@@ -28,6 +28,9 @@
 #include "common.h"
 #include "gemm.h"
 #include "vec.h"
+
+#include <algorithm>
+#include <vector>
 
 namespace {
 
@@ -98,8 +101,8 @@ inline float fp8_e8m0_to_float(uint8_t v) {
   return u.f;
 }
 
-// Dequantize the FP8 KV cache into a contiguous BF16 tensor of shape
-// [num_blocks, block_size, d_qk].  This is parallel over tokens.
+// Dequantize the active FP8 KV-cache prefix into a contiguous BF16 tensor of
+// shape [active_total_tokens, d_qk].  This is parallel over tokens.
 //
 // `fp8_storage` is the raw byte view of `k_cache` (last dim = bytes_per_token
 // for V32 / variable padded for MODEL1).
@@ -107,15 +110,14 @@ template <int64_t LAYOUT>
 void dequantize_fp8_kvcache_impl(
     at::BFloat16* __restrict__ out,
     const uint8_t* __restrict__ fp8_storage,
-    int64_t num_blocks,
     int64_t block_size,
+    int64_t active_total_tokens,
     int64_t storage_block_stride_bytes) {
   static_assert(LAYOUT == kV32FP8Sparse || LAYOUT == kModel1FP8Sparse, "bad layout");
   constexpr FP8LayoutMeta meta = (LAYOUT == kV32FP8Sparse) ? FP8LayoutMeta{576, 512, 64, 128, 4}
                                                             : FP8LayoutMeta{512, 448, 64, 64, 7};
 
-  // total tokens
-  const int64_t total_tokens = num_blocks * block_size;
+  const int64_t total_tokens = active_total_tokens;
 
   if constexpr (LAYOUT == kV32FP8Sparse) {
     constexpr int64_t bytes_per_token = meta.d_nope + meta.num_tiles * 4 + meta.d_rope * 2;  // 656
@@ -181,7 +183,7 @@ void dequantize_fp8_kvcache_impl(
   }
 }
 
-at::Tensor dequantize_fp8_kvcache(at::Tensor k_cache, int64_t layout) {
+at::Tensor dequantize_fp8_kvcache(at::Tensor k_cache, int64_t layout, int64_t active_total_tokens) {
   const FP8LayoutMeta meta = get_fp8_meta(layout);
 
   TORCH_CHECK(k_cache.dim() == 4, "k_cache must be 4D [num_blocks, block_size, 1, packed_bytes]");
@@ -193,6 +195,14 @@ at::Tensor dequantize_fp8_kvcache(at::Tensor k_cache, int64_t layout) {
 
   const int64_t num_blocks = k_cache.size(0);
   const int64_t block_size = k_cache.size(1);
+  const int64_t capacity = num_blocks * block_size;
+  TORCH_CHECK(
+      active_total_tokens >= 0 && active_total_tokens <= capacity,
+      "flash_mla_with_kvcache_cpu: active_total_tokens (",
+      active_total_tokens,
+      ") must be within KV-cache capacity (",
+      capacity,
+      ")");
 
   // Each block is contiguous in storage but its trailing-bytes count differs
   // per layout.  The outermost stride in *bytes* tells us the true padded
@@ -200,18 +210,71 @@ at::Tensor dequantize_fp8_kvcache(at::Tensor k_cache, int64_t layout) {
   const int64_t block_stride_elems = k_cache.stride(0);
   const int64_t storage_block_stride_bytes = block_stride_elems * k_cache.element_size();
 
-  auto out = at::empty(
-      {num_blocks, block_size, 1, meta.d}, k_cache.options().dtype(at::kBFloat16));
+  auto out = at::empty({active_total_tokens, meta.d}, k_cache.options().dtype(at::kBFloat16));
   const uint8_t* fp8_storage = static_cast<const uint8_t*>(k_cache.data_ptr());
 
   if (layout == kV32FP8Sparse) {
     dequantize_fp8_kvcache_impl<kV32FP8Sparse>(
-        out.data_ptr<at::BFloat16>(), fp8_storage, num_blocks, block_size, storage_block_stride_bytes);
+        out.data_ptr<at::BFloat16>(),
+        fp8_storage,
+        block_size,
+        active_total_tokens,
+        storage_block_stride_bytes);
   } else {
     dequantize_fp8_kvcache_impl<kModel1FP8Sparse>(
-        out.data_ptr<at::BFloat16>(), fp8_storage, num_blocks, block_size, storage_block_stride_bytes);
+        out.data_ptr<at::BFloat16>(),
+        fp8_storage,
+        block_size,
+        active_total_tokens,
+        storage_block_stride_bytes);
   }
   return out;
+}
+
+template <typename index_t>
+int64_t infer_active_total_tokens(
+    const index_t* __restrict__ indices,
+    int64_t batches,
+    int64_t s_q,
+    int64_t topk,
+    int64_t capacity,
+    const int32_t* __restrict__ topk_length) {
+  if (indices == nullptr || topk == 0 || capacity == 0) {
+    return 0;
+  }
+
+  const int num_threads = at::get_num_threads();
+  std::vector<int64_t> thread_max(num_threads, -1);
+  at::parallel_for(0, batches * s_q, 0, [&](int64_t begin, int64_t end) {
+    const int tid = at::get_thread_num();
+    int64_t local_max = -1;
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t b = i / s_q;
+      const int64_t limit = topk_length != nullptr
+          ? std::max<int64_t>(0, std::min<int64_t>(topk_length[b], topk))
+          : topk;
+      const index_t* row = indices + i * topk;
+      for (int64_t k = 0; k < limit; ++k) {
+        const int64_t v = static_cast<int64_t>(row[k]);
+        if (v >= 0 && v < capacity) {
+          local_max = std::max(local_max, v);
+        }
+      }
+    }
+    thread_max[tid] = std::max(thread_max[tid], local_max);
+  });
+
+  int64_t max_seen = -1;
+  for (int64_t v : thread_max) {
+    max_seen = std::max(max_seen, v);
+  }
+  return max_seen + 1;
+}
+
+template <typename index_t>
+inline bool is_valid_sparse_index(index_t idx, int64_t pos, int64_t topk_limit, int64_t total_tokens) {
+  const int64_t v = static_cast<int64_t>(idx);
+  return pos < topk_limit && v >= 0 && v < total_tokens;
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +296,9 @@ inline void sparse_pack_vnni_Nx32(
     const scalar_t* __restrict__ src,
     const index_t* __restrict__ ind,
     int N,
+    int64_t n_start,
+    int64_t topk_limit,
+    int64_t total_tokens,
     int ld_src,
     int ld_dst0,
     int ld_dst1,
@@ -241,7 +307,7 @@ inline void sparse_pack_vnni_Nx32(
   int n = 0;
   for (; n < N; ++n) {
     index_t idx = ind[n];
-    if (idx < 0) {
+    if (!is_valid_sparse_index(idx, n_start + n, topk_limit, total_tokens)) {
       vinputs[n] = _mm512_set1_epi32(0);
     } else {
       vinputs[n] = _mm512_loadu_si512(src + idx * ld_src);
@@ -277,6 +343,9 @@ void sparse_pack_vnni(
     int N,
     int K,
     int Kv,
+    int64_t n_start,
+    int64_t topk_limit,
+    int64_t total_tokens,
     int ld_src,
     int ld_dst0,
     int ld_dst1) {
@@ -293,6 +362,9 @@ void sparse_pack_vnni(
           /*     src */ src + kb * 32,
           /*     ind */ ind + nb * 16,
           /*       N */ nb_size,
+          /* n_start */ n_start + nb * 16,
+          /* top_lim */ topk_limit,
+          /*  n_tokn */ total_tokens,
           /*  ld_src */ ld_src,
           /* ld_dst0 */ ld_dst0,
           /* ld_dst1 */ ld_dst1,
@@ -303,9 +375,10 @@ void sparse_pack_vnni(
   // Reference scalar fallback (NO-AVX512 build).
   for (int n = 0; n < N; ++n) {
     index_t idx = ind[n];
+    const bool valid = is_valid_sparse_index(idx, n_start + n, topk_limit, total_tokens);
     for (int k = 0; k < K / 2; ++k) {
       for (int d = 0; d < 2; ++d) {
-        scalar_t v = (idx < 0) ? scalar_t(0) : src[idx * ld_src + k * 2 + d];
+        scalar_t v = !valid ? scalar_t(0) : src[idx * ld_src + k * 2 + d];
         dst0[k * ld_dst0 * 2 + n * 2 + d] = v;
       }
     }
@@ -313,15 +386,18 @@ void sparse_pack_vnni(
   for (int n = 0; n < (N >> 1) * 2; n += 2) {
     index_t i0 = ind[n + 0];
     index_t i1 = ind[n + 1];
+    const bool valid0 = is_valid_sparse_index(i0, n_start + n + 0, topk_limit, total_tokens);
+    const bool valid1 = is_valid_sparse_index(i1, n_start + n + 1, topk_limit, total_tokens);
     for (int k = 0; k < Kv; ++k) {
-      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 0] = (i0 < 0) ? scalar_t(0) : src[i0 * ld_src + k];
-      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 1] = (i1 < 0) ? scalar_t(0) : src[i1 * ld_src + k];
+      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 0] = !valid0 ? scalar_t(0) : src[i0 * ld_src + k];
+      dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 1] = !valid1 ? scalar_t(0) : src[i1 * ld_src + k];
     }
   }
   if (N % 2 != 0) {
     index_t idx = ind[N - 1];
+    const bool valid = is_valid_sparse_index(idx, n_start + N - 1, topk_limit, total_tokens);
     for (int k = 0; k < Kv; ++k) {
-      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 0] = (idx < 0) ? scalar_t(0) : src[idx * ld_src + k];
+      dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 0] = !valid ? scalar_t(0) : src[idx * ld_src + k];
       dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 1] = 0;
     }
   }
@@ -387,11 +463,12 @@ inline void fmla_finalize_out(
 }
 
 // ---------------------------------------------------------------------------
-// Main kernel: sparse MLA decode (FP8 + AMX BF16 brgemm).
+// Main kernel: sparse MLA decode (AMX BF16 brgemm).
 //
 // query    : [B, S_q, H_q, D_qk]   bf16
-// k_dequant: [num_blocks * block_size, D_qk]  bf16 (k_cache + extra concatenated)
-// indices  : [B, S_q, T]           int32 (T = topk + extra_topk)
+// k_main   : [active_main_tokens, D_qk] bf16 or original bf16 cache flattened
+// indices  : [B, S_q, topk_main]        int32/int64
+// k_extra  : optional extra KV source with its own indices
 // topk_len : [B]                   int32 or null
 // attn_sink: [H_q]                 float32 or null
 // output   : [B, S_q, H_q, D_v]    bf16
@@ -403,8 +480,12 @@ void sparse_mla_decode_kernel_impl(
     scalar_t* __restrict__ output,
     float* __restrict__ lse_out,
     const scalar_t* __restrict__ query,
-    const scalar_t* __restrict__ k_dequant,
+    const scalar_t* __restrict__ k_main,
+    const scalar_t* __restrict__ k_extra,
     const index_t* __restrict__ indices,
+    const index_t* __restrict__ extra_indices,
+    const int32_t* __restrict__ topk_length,
+    const int32_t* __restrict__ extra_topk_length,
     const float* __restrict__ attn_sink,
     scalar_t* __restrict__ buffer,
     int64_t batches,
@@ -412,14 +493,19 @@ void sparse_mla_decode_kernel_impl(
     int64_t num_heads,
     int64_t head_size,
     int64_t head_size_v,
-    int64_t topk_total,
-    int64_t total_tokens,
+    int64_t topk_main,
+    int64_t topk_extra,
+    int64_t total_tokens_main,
+    int64_t total_tokens_extra,
     int64_t q_strideB,
     int64_t q_strideS,
     int64_t q_strideH,
-    int64_t k_strideN,
+    int64_t k_main_strideN,
+    int64_t k_extra_strideN,
     int64_t idx_strideB,
     int64_t idx_strideS,
+    int64_t extra_idx_strideB,
+    int64_t extra_idx_strideS,
     float scaling,
     int64_t buffer_size_per_thread) {
   using Vec = at::vec::Vectorized<float>;
@@ -456,8 +542,9 @@ void sparse_mla_decode_kernel_impl(
 
       const scalar_t* __restrict__ q_ptr = query + bs * q_strideB + sq * q_strideS + h_start * q_strideH;
       const index_t* __restrict__ idx_ptr = indices + bs * idx_strideB + sq * idx_strideS;
-
-      const int64_t topk_used = topk_total;
+      const index_t* __restrict__ extra_idx_ptr = extra_indices == nullptr
+          ? nullptr
+          : extra_indices + bs * extra_idx_strideB + sq * extra_idx_strideS;
 
       fmla_fill_stub(s_prime, 0.f, BLOCK_H);
       fmla_fill_stub(m_prime, -std::numeric_limits<float>::infinity(), BLOCK_H);
@@ -465,104 +552,130 @@ void sparse_mla_decode_kernel_impl(
         fmla_fill_stub(v_acc_local + h * head_size_v, 0.f, head_size_v);
       }
 
-      // loop over the top-k axis
-      for (int64_t n = 0; n < topk_used; n += BLOCK_N) {
-        int64_t n_size = std::min<int64_t>(BLOCK_N, topk_used - n);
-        const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
-
-        // Pack K (BLOCK_N rows from k_dequant via gather) into Btmp0 (key, vnni)
-        // and Btmp1 (value, vnni).  Invalid (-1) indices load zeros — their
-        // contribution is masked to -inf below.
-        sparse_pack_vnni<scalar_t, index_t>(
-            /*    dst0 */ Btmp0,
-            /*    dst1 */ Btmp1,
-            /*     src */ k_dequant,
-            /*     ind */ idx_ptr + n,
-            /*       N */ static_cast<int>(n_size),
-            /*       K */ static_cast<int>(head_size),
-            /*      Kv */ static_cast<int>(head_size_v),
-            /*  ld_src */ static_cast<int>(k_strideN),
-            /* ld_dst0 */ static_cast<int>(BLOCK_N),
-            /* ld_dst1 */ static_cast<int>(head_size_v));
-
-        // Q @ K
-        at::native::cpublas::brgemm(
-            /* M     */ h_size,
-            /* N     */ n_size,
-            /* K     */ head_size,
-            /* lda   */ q_strideH,
-            /* ldb   */ BLOCK_N,
-            /* ldc   */ BLOCK_N,
-            /* add_C */ false,
-            /* A     */ q_ptr,
-            /* B     */ Btmp0,
-            /* C     */ s_i);
-
-        const Vec scale_vec = Vec(scaling);
-        for (int64_t h = 0; h < h_size; ++h) {
-          float* row = s_i + h * BLOCK_N;
-          // s_i <- s_i * scale, with masking for invalid indices and tail
-          at::vec::map<float>([scale_vec](Vec x) { return x * scale_vec; }, row, row, n_size);
-
-          // Mask invalid (-1) indices to -inf so they don't contribute.
-          for (int64_t k = 0; k < n_size; ++k) {
-            if (idx_ptr[n + k] < 0) {
-              row[k] = -std::numeric_limits<float>::infinity();
-            }
-          }
-
-          // online softmax update
-          float m_i = at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, row, n_size);
-          m_i = std::max(m_i, m_prime[h]);
-
-          // Guard against the all-masked tile (m_i == -inf): keep state unchanged.
-          if (!std::isfinite(m_i)) {
-            // Still need to produce zeros for s_delta on this tile.
-            fmla_fill_stub(s_delta + h * BLOCK_N, 0.f, padded_n_size);
-            fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
-            continue;
-          }
-
-          const float m_delta = std::exp(m_prime[h] - m_i);
-          at::vec::map<float>(
-              [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); },
-              s_delta + h * BLOCK_N,
-              row,
-              n_size);
-
-          s_prime[h] *= m_delta;
-          s_prime[h] += at::vec::reduce_all<float>(
-              [](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
-
-          m_prime[h] = m_i;
-
-          // Rescale the running V accumulator for this head.
-          float scale_m = m_delta;
-          at::vec::map<float>(
-              [scale_m](Vec x) { return x * Vec(scale_m); },
-              v_acc_local + h * head_size_v,
-              v_acc_local + h * head_size_v,
-              head_size_v);
-
-          // Pad s_delta with 0 then convert to bf16 (s_delta2)
-          fmla_fill_stub(s_delta + h * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
-          fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
+      auto process_cache = [&](const scalar_t* __restrict__ k_ptr,
+                               const index_t* __restrict__ cur_idx_ptr,
+                               const int32_t* __restrict__ cur_topk_length,
+                               int64_t topk_count,
+                               int64_t total_tokens,
+                               int64_t k_strideN) {
+        if (k_ptr == nullptr || cur_idx_ptr == nullptr || topk_count == 0) {
+          return;
         }
+        const int64_t topk_limit = cur_topk_length != nullptr
+            ? std::max<int64_t>(0, std::min<int64_t>(cur_topk_length[bs], topk_count))
+            : topk_count;
 
-        // V' <- s_delta @ V + V'   (accumulate into v_acc_local at f32)
-        at::native::cpublas::brgemm(
-            /* M     */ h_size,
-            /* N     */ head_size_v,
-            /* K     */ padded_n_size,
-            /* lda   */ BLOCK_N,
-            /* ldb   */ head_size_v,
-            /* ldc   */ head_size_v,
-            /* add_C */ true,
-            /* A     */ s_delta2,
-            /* B     */ Btmp1,
-            /* C     */ v_acc_local);
-      }  // n loop
+        // loop over one top-k source (main or extra). Processing them as two
+        // consecutive streams avoids allocating/copying a unified KV buffer and
+        // merged indices while preserving online-softmax semantics.
+        for (int64_t n = 0; n < topk_count; n += BLOCK_N) {
+          int64_t n_size = std::min<int64_t>(BLOCK_N, topk_count - n);
+          const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
+
+          // Pack K (BLOCK_N rows via gather) into Btmp0 (key, vnni) and Btmp1
+          // (value, vnni). Invalid entries load zeros and are masked below.
+          sparse_pack_vnni<scalar_t, index_t>(
+              /*    dst0 */ Btmp0,
+              /*    dst1 */ Btmp1,
+              /*     src */ k_ptr,
+              /*     ind */ cur_idx_ptr + n,
+              /*       N */ static_cast<int>(n_size),
+              /*       K */ static_cast<int>(head_size),
+              /*      Kv */ static_cast<int>(head_size_v),
+              /* n_start */ n,
+              /* top_lim */ topk_limit,
+              /*  n_tokn */ total_tokens,
+              /*  ld_src */ static_cast<int>(k_strideN),
+              /* ld_dst0 */ static_cast<int>(BLOCK_N),
+              /* ld_dst1 */ static_cast<int>(head_size_v));
+
+          // Q @ K
+          at::native::cpublas::brgemm(
+              /* M     */ h_size,
+              /* N     */ n_size,
+              /* K     */ head_size,
+              /* lda   */ q_strideH,
+              /* ldb   */ BLOCK_N,
+              /* ldc   */ BLOCK_N,
+              /* add_C */ false,
+              /* A     */ q_ptr,
+              /* B     */ Btmp0,
+              /* C     */ s_i);
+
+          const Vec scale_vec = Vec(scaling);
+          for (int64_t h = 0; h < h_size; ++h) {
+            float* row = s_i + h * BLOCK_N;
+            // s_i <- s_i * scale, with masking for invalid indices and tail
+            at::vec::map<float>([scale_vec](Vec x) { return x * scale_vec; }, row, row, n_size);
+
+            for (int64_t k = 0; k < n_size; ++k) {
+              if (!is_valid_sparse_index(cur_idx_ptr[n + k], n + k, topk_limit, total_tokens)) {
+                row[k] = -std::numeric_limits<float>::infinity();
+              }
+            }
+
+            // online softmax update
+            float m_i = at::vec::reduce_all<float>(
+                [](Vec& x, Vec& y) { return at::vec::maximum(x, y); }, row, n_size);
+            m_i = std::max(m_i, m_prime[h]);
+
+            // Guard against the all-masked tile (m_i == -inf): keep state unchanged.
+            if (!std::isfinite(m_i)) {
+              // Still need to produce zeros for s_delta on this tile.
+              fmla_fill_stub(s_delta + h * BLOCK_N, 0.f, padded_n_size);
+              fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
+              continue;
+            }
+
+            const float m_delta = std::exp(m_prime[h] - m_i);
+            at::vec::map<float>(
+                [m_i](Vec x) { return (x - Vec(m_i)).exp_u20(); },
+                s_delta + h * BLOCK_N,
+                row,
+                n_size);
+
+            s_prime[h] *= m_delta;
+            s_prime[h] += at::vec::reduce_all<float>(
+                [](Vec& x, Vec& y) { return x + y; }, s_delta + h * BLOCK_N, n_size);
+
+            m_prime[h] = m_i;
+
+            // Rescale the running V accumulator for this head.
+            float scale_m = m_delta;
+            at::vec::map<float>(
+                [scale_m](Vec x) { return x * Vec(scale_m); },
+                v_acc_local + h * head_size_v,
+                v_acc_local + h * head_size_v,
+                head_size_v);
+
+            // Pad s_delta with 0 then convert to bf16 (s_delta2)
+            fmla_fill_stub(s_delta + h * BLOCK_N + n_size, 0.f, padded_n_size - n_size);
+            fmla_copy_stub<scalar_t, BLOCK_N>(s_delta2 + h * BLOCK_N, s_delta + h * BLOCK_N);
+          }
+
+          // V' <- s_delta @ V + V'   (accumulate into v_acc_local at f32)
+          at::native::cpublas::brgemm(
+              /* M     */ h_size,
+              /* N     */ head_size_v,
+              /* K     */ padded_n_size,
+              /* lda   */ BLOCK_N,
+              /* ldb   */ head_size_v,
+              /* ldc   */ head_size_v,
+              /* add_C */ true,
+              /* A     */ s_delta2,
+              /* B     */ Btmp1,
+              /* C     */ v_acc_local);
+        }
+      };
+
+      process_cache(k_main, idx_ptr, topk_length, topk_main, total_tokens_main, k_main_strideN);
+      process_cache(
+          k_extra,
+          extra_idx_ptr,
+          extra_topk_length,
+          topk_extra,
+          total_tokens_extra,
+          k_extra_strideN);
 
       // Apply attention sink correction directly on the output and lse.
       //   out *= exp(lse_no_sink) / (exp(lse_no_sink) + exp(attn_sink))
@@ -604,68 +717,12 @@ void sparse_mla_decode_kernel_impl(
   });
 }
 
-// ---------------------------------------------------------------------------
-// Index merging: concatenate `indices_in_kvcache` and `extra_indices_in_kvcache`
-// along the topk axis, offsetting the extra indices by `total_tokens_main` so
-// they land in the right segment of the unified K buffer.  Invalid (-1) entries
-// are preserved.  Out-of-range (>= per_kv_total) entries are clamped to -1 so
-// they are masked just like -1 below.
-// ---------------------------------------------------------------------------
-
-template <typename index_t>
-void merge_indices_with_extra(
-    index_t* __restrict__ out,
-    const index_t* __restrict__ main,
-    const index_t* __restrict__ extra,
-    int64_t b,
-    int64_t s_q,
-    int64_t topk_main,
-    int64_t topk_extra,
-    int64_t total_tokens_main,
-    int64_t total_tokens_extra,
-    const int32_t* __restrict__ topk_length_main,
-    const int32_t* __restrict__ topk_length_extra) {
-  const int64_t topk_total = topk_main + topk_extra;
-  at::parallel_for(0, b * s_q, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t i = begin; i < end; ++i) {
-      const int64_t bi = i / s_q;
-      const int64_t si = i - bi * s_q;
-      index_t* dst = out + (bi * s_q + si) * topk_total;
-      const index_t* src_main = main + (bi * s_q + si) * topk_main;
-      const int32_t lim_main =
-          topk_length_main != nullptr ? std::min<int64_t>(topk_length_main[bi], topk_main) : topk_main;
-      for (int64_t k = 0; k < topk_main; ++k) {
-        index_t v = src_main[k];
-        if (k >= lim_main || v < 0 || v >= total_tokens_main) {
-          dst[k] = -1;
-        } else {
-          dst[k] = v;
-        }
-      }
-      if (extra != nullptr) {
-        const index_t* src_extra = extra + (bi * s_q + si) * topk_extra;
-        const int32_t lim_extra = topk_length_extra != nullptr
-            ? std::min<int64_t>(topk_length_extra[bi], topk_extra)
-            : topk_extra;
-        for (int64_t k = 0; k < topk_extra; ++k) {
-          index_t v = src_extra[k];
-          if (k >= lim_extra || v < 0 || v >= total_tokens_extra) {
-            dst[topk_main + k] = -1;
-          } else {
-            dst[topk_main + k] = v + static_cast<index_t>(total_tokens_main);
-          }
-        }
-      }
-    }
-  });
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // Public entry point: flash_mla_with_kvcache_cpu
 //
-// Mirrors the (sparse FP8) decode path of FlashMLA's flash_mla_with_kvcache.
+// Mirrors the sparse decode path of FlashMLA's flash_mla_with_kvcache.
 // Returns (out, lse).
 // ---------------------------------------------------------------------------
 
@@ -680,6 +737,7 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
     std::optional<at::Tensor> extra_k_cache,
     std::optional<at::Tensor> extra_indices,
     std::optional<at::Tensor> extra_topk_length,
+    bool is_fp8_kvcache,
     int64_t fp8_layout) {
   RECORD_FUNCTION(
       "sgl-kernel::flash_mla_with_kvcache_cpu", std::vector<c10::IValue>({q, k_cache, indices}));
@@ -708,92 +766,136 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   CHECK_EQ(indices.size(1), S_q);
   const int64_t topk_main = indices.size(2);
 
-  // 1) dequantize main K cache (and extra if given) into BF16 buffers.
-  at::Tensor k_dequant_main = dequantize_fp8_kvcache(k_cache, fp8_layout);
-  // shape: [num_blocks_main, block_size, 1, D_qk_real]
-  const int64_t num_blocks_main = k_dequant_main.size(0);
-  const int64_t block_size_main = k_dequant_main.size(1);
-  const int64_t total_tokens_main = num_blocks_main * block_size_main;
   TORCH_CHECK(
-      k_dequant_main.size(3) == D_qk,
-      "k_cache dequantized D_qk (",
-      k_dequant_main.size(3),
-      ") does not match q's last dim (",
-      D_qk,
-      ")");
-
-  at::Tensor k_dequant_extra;
-  int64_t total_tokens_extra = 0;
-  int64_t topk_extra = 0;
-  bool has_extra = extra_k_cache.has_value() && extra_indices.has_value();
+      extra_k_cache.has_value() == extra_indices.has_value(),
+      "extra_k_cache and extra_indices must be both provided or both omitted");
+  bool has_extra = extra_k_cache.has_value();
+  int64_t topk_extra = has_extra ? extra_indices.value().size(2) : 0;
   if (has_extra) {
-    k_dequant_extra = dequantize_fp8_kvcache(extra_k_cache.value(), fp8_layout);
-    total_tokens_extra = k_dequant_extra.size(0) * k_dequant_extra.size(1);
-    topk_extra = extra_indices.value().size(2);
-    TORCH_CHECK(extra_indices.value().scalar_type() == indices.scalar_type(),
-                "extra_indices dtype must match indices dtype");
+    CHECK_EQ(extra_indices.value().size(0), B);
+    CHECK_EQ(extra_indices.value().size(1), S_q);
+    TORCH_CHECK(
+        extra_indices.value().scalar_type() == indices.scalar_type(),
+        "extra_indices dtype must match indices dtype");
   }
 
-  // 2) build a unified K buffer along the token axis: [total_tokens_main + total_tokens_extra, D_qk]
-  const int64_t total_tokens = total_tokens_main + total_tokens_extra;
-  at::Tensor k_unified;
-  if (has_extra) {
-    k_unified = at::empty({total_tokens, D_qk}, k_dequant_main.options());
-    auto* dst = k_unified.data_ptr<at::BFloat16>();
-    std::memcpy(
-        dst,
-        k_dequant_main.data_ptr<at::BFloat16>(),
-        sizeof(at::BFloat16) * total_tokens_main * D_qk);
-    std::memcpy(
-        dst + total_tokens_main * D_qk,
-        k_dequant_extra.data_ptr<at::BFloat16>(),
-        sizeof(at::BFloat16) * total_tokens_extra * D_qk);
-  } else {
-    k_unified = k_dequant_main.view({total_tokens_main, D_qk});
+  if (topk_length.has_value()) {
+    TORCH_CHECK(topk_length.value().scalar_type() == at::kInt, "topk_length must be int32");
+    CHECK_EQ(topk_length.value().size(0), B);
   }
-
-  // 3) merged indices buffer [B, S_q, topk_main + topk_extra]
-  const int64_t topk_total = topk_main + topk_extra;
-  at::Tensor merged_indices = at::empty({B, S_q, topk_total}, indices.options());
-
+  if (extra_topk_length.has_value()) {
+    TORCH_CHECK(extra_topk_length.value().scalar_type() == at::kInt, "extra_topk_length must be int32");
+    CHECK_EQ(extra_topk_length.value().size(0), B);
+  }
   const int32_t* tl_main_ptr =
       topk_length.has_value() ? topk_length.value().data_ptr<int32_t>() : nullptr;
   const int32_t* tl_extra_ptr =
       extra_topk_length.has_value() ? extra_topk_length.value().data_ptr<int32_t>() : nullptr;
 
-  if (indices.scalar_type() == at::kInt) {
-    merge_indices_with_extra<int32_t>(
-        merged_indices.data_ptr<int32_t>(),
-        indices.data_ptr<int32_t>(),
-        has_extra ? extra_indices.value().data_ptr<int32_t>() : nullptr,
-        B,
-        S_q,
-        topk_main,
-        topk_extra,
-        total_tokens_main,
-        total_tokens_extra,
-        tl_main_ptr,
-        tl_extra_ptr);
-  } else {
-    merge_indices_with_extra<int64_t>(
-        merged_indices.data_ptr<int64_t>(),
-        indices.data_ptr<int64_t>(),
-        has_extra ? extra_indices.value().data_ptr<int64_t>() : nullptr,
-        B,
-        S_q,
-        topk_main,
-        topk_extra,
-        total_tokens_main,
-        total_tokens_extra,
-        tl_main_ptr,
-        tl_extra_ptr);
+  const int64_t capacity_main = k_cache.size(0) * k_cache.size(1);
+  int64_t capacity_extra = 0;
+  if (has_extra) {
+    capacity_extra = extra_k_cache.value().size(0) * extra_k_cache.value().size(1);
   }
 
-  // 4) allocate outputs
+  int64_t total_tokens_main = 0;
+  int64_t total_tokens_extra = 0;
+
+  if (indices.scalar_type() == at::kInt) {
+    total_tokens_main = infer_active_total_tokens<int32_t>(
+        indices.data_ptr<int32_t>(),
+        B,
+        S_q,
+        topk_main,
+        capacity_main,
+        tl_main_ptr);
+    if (has_extra) {
+      total_tokens_extra = infer_active_total_tokens<int32_t>(
+          extra_indices.value().data_ptr<int32_t>(),
+          B,
+          S_q,
+          topk_extra,
+          capacity_extra,
+          tl_extra_ptr);
+    }
+  } else {
+    total_tokens_main = infer_active_total_tokens<int64_t>(
+        indices.data_ptr<int64_t>(),
+        B,
+        S_q,
+        topk_main,
+        capacity_main,
+        tl_main_ptr);
+    if (has_extra) {
+      total_tokens_extra = infer_active_total_tokens<int64_t>(
+          extra_indices.value().data_ptr<int64_t>(),
+          B,
+          S_q,
+          topk_extra,
+          capacity_extra,
+          tl_extra_ptr);
+    }
+  }
+
+  at::Tensor k_dequant_main;
+  at::Tensor k_dequant_extra;
+  const at::BFloat16* k_main_ptr = nullptr;
+  const at::BFloat16* k_extra_ptr = nullptr;
+  int64_t k_main_strideN = D_qk;
+  int64_t k_extra_strideN = D_qk;
+
+  if (is_fp8_kvcache) {
+    k_dequant_main = dequantize_fp8_kvcache(k_cache, fp8_layout, total_tokens_main);
+    TORCH_CHECK(
+        k_dequant_main.size(1) == D_qk,
+        "k_cache dequantized D_qk (",
+        k_dequant_main.size(1),
+        ") does not match q's last dim (",
+        D_qk,
+        ")");
+    k_main_ptr = k_dequant_main.data_ptr<at::BFloat16>();
+    k_main_strideN = k_dequant_main.stride(0);
+    if (has_extra) {
+      k_dequant_extra = dequantize_fp8_kvcache(extra_k_cache.value(), fp8_layout, total_tokens_extra);
+      TORCH_CHECK(
+          k_dequant_extra.size(1) == D_qk,
+          "extra_k_cache dequantized D_qk (",
+          k_dequant_extra.size(1),
+          ") does not match q's last dim (",
+          D_qk,
+          ")");
+      k_extra_ptr = k_dequant_extra.data_ptr<at::BFloat16>();
+      k_extra_strideN = k_dequant_extra.stride(0);
+    }
+  } else {
+    TORCH_CHECK(
+        k_cache.scalar_type() == at::kBFloat16,
+        "flash_mla_with_kvcache_cpu: non-FP8 k_cache must be bfloat16, got ",
+        k_cache.scalar_type());
+    TORCH_CHECK(k_cache.is_contiguous(), "non-FP8 k_cache must be contiguous");
+    CHECK_EQ(k_cache.size(2), 1);
+    CHECK_EQ(k_cache.size(3), D_qk);
+    k_main_ptr = k_cache.data_ptr<at::BFloat16>();
+    k_main_strideN = k_cache.stride(1);
+
+    if (has_extra) {
+      TORCH_CHECK(
+          extra_k_cache.value().scalar_type() == at::kBFloat16,
+          "flash_mla_with_kvcache_cpu: non-FP8 extra_k_cache must be bfloat16, got ",
+          extra_k_cache.value().scalar_type());
+      TORCH_CHECK(extra_k_cache.value().is_contiguous(), "non-FP8 extra_k_cache must be contiguous");
+      CHECK_EQ(extra_k_cache.value().size(2), 1);
+      CHECK_EQ(extra_k_cache.value().size(3), D_qk);
+      k_extra_ptr = extra_k_cache.value().data_ptr<at::BFloat16>();
+      k_extra_strideN = extra_k_cache.value().stride(1);
+    }
+  }
+
+  // 2) allocate outputs
   auto out = at::empty({B, S_q, H_q, D_v}, q.options());
   auto lse = at::empty({B, H_q, S_q}, q.options().dtype(at::kFloat));
 
-  // 5) per-thread B buffer for K (head_size) + V (head_size_v) packing,
+  // 3) per-thread B buffer for K (head_size) + V (head_size_v) packing,
   //    plus an f32 V accumulator of size kBLOCK_H_MAX * head_size_v.
   constexpr int64_t BLOCK_N = 128;  // multiple of 32 for AMX brgemm
   constexpr int64_t kBLOCK_H_MAX = 16;
@@ -807,22 +909,27 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
   const int64_t buffer_size_per_thread = BLOCK_N * D_qk + BLOCK_N * D_v + 2 * kBLOCK_H_MAX * D_v;
   auto buffer = at::empty({num_threads, buffer_size_per_thread}, q.options());
 
-  // 6) strides
+  // 4) strides
   const int64_t q_strideB = q.stride(0);
   const int64_t q_strideS = q.stride(1);
   const int64_t q_strideH = q.stride(2);
-  const int64_t k_strideN = k_unified.stride(0);
-  const int64_t idx_strideB = merged_indices.stride(0);
-  const int64_t idx_strideS = merged_indices.stride(1);
+  const int64_t idx_strideB = indices.stride(0);
+  const int64_t idx_strideS = indices.stride(1);
+  const int64_t extra_idx_strideB = has_extra ? extra_indices.value().stride(0) : 0;
+  const int64_t extra_idx_strideS = has_extra ? extra_indices.value().stride(1) : 0;
 
-  // 7) dispatch on indices dtype
-  if (merged_indices.scalar_type() == at::kInt) {
+  // 5) dispatch on indices dtype
+  if (indices.scalar_type() == at::kInt) {
     sparse_mla_decode_kernel_impl<at::BFloat16, int32_t, BLOCK_N>(
         out.data_ptr<at::BFloat16>(),
         lse.data_ptr<float>(),
         q.data_ptr<at::BFloat16>(),
-        k_unified.data_ptr<at::BFloat16>(),
-        merged_indices.data_ptr<int32_t>(),
+        k_main_ptr,
+        k_extra_ptr,
+        indices.data_ptr<int32_t>(),
+        has_extra ? extra_indices.value().data_ptr<int32_t>() : nullptr,
+        tl_main_ptr,
+        tl_extra_ptr,
         attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
         buffer.data_ptr<at::BFloat16>(),
         B,
@@ -830,14 +937,19 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         H_q,
         D_qk,
         D_v,
-        topk_total,
-        total_tokens,
+        topk_main,
+        topk_extra,
+        total_tokens_main,
+        total_tokens_extra,
         q_strideB,
         q_strideS,
         q_strideH,
-        k_strideN,
+        k_main_strideN,
+        k_extra_strideN,
         idx_strideB,
         idx_strideS,
+        extra_idx_strideB,
+        extra_idx_strideS,
         static_cast<float>(softmax_scale),
         buffer_size_per_thread);
   } else {
@@ -845,8 +957,12 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         out.data_ptr<at::BFloat16>(),
         lse.data_ptr<float>(),
         q.data_ptr<at::BFloat16>(),
-        k_unified.data_ptr<at::BFloat16>(),
-        merged_indices.data_ptr<int64_t>(),
+        k_main_ptr,
+        k_extra_ptr,
+        indices.data_ptr<int64_t>(),
+        has_extra ? extra_indices.value().data_ptr<int64_t>() : nullptr,
+        tl_main_ptr,
+        tl_extra_ptr,
         attn_sink.has_value() ? attn_sink.value().data_ptr<float>() : nullptr,
         buffer.data_ptr<at::BFloat16>(),
         B,
@@ -854,14 +970,19 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
         H_q,
         D_qk,
         D_v,
-        topk_total,
-        total_tokens,
+        topk_main,
+        topk_extra,
+        total_tokens_main,
+        total_tokens_extra,
         q_strideB,
         q_strideS,
         q_strideH,
-        k_strideN,
+        k_main_strideN,
+        k_extra_strideN,
         idx_strideB,
         idx_strideS,
+        extra_idx_strideB,
+        extra_idx_strideS,
         static_cast<float>(softmax_scale),
         buffer_size_per_thread);
   }

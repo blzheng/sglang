@@ -129,7 +129,7 @@ void extend_attention_cpu(
     double sm_scale,
     double logit_cap);
 
-// flash_mla_with_kvcache (DeepSeek FlashMLA sparse FP8 decode), AMX impl
+// flash_mla_with_kvcache (DeepSeek FlashMLA sparse decode), AMX impl
 std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
     at::Tensor& q,
     at::Tensor& k_cache,
@@ -141,6 +141,7 @@ std::tuple<at::Tensor, at::Tensor> flash_mla_with_kvcache_cpu(
     std::optional<at::Tensor> extra_k_cache,
     std::optional<at::Tensor> extra_indices,
     std::optional<at::Tensor> extra_topk_length,
+    bool is_fp8_kvcache,
     int64_t fp8_layout);
 
 // linear attention
@@ -448,12 +449,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "extend_start_loc, int max_len_extend, float sm_scale, float logit_cap) -> ()");
   m.impl("extend_attention_cpu", torch::kCPU, &extend_attention_cpu);
 
-  // flash mla with kvcache (sparse FP8 decode, AMX optimized)
+  // flash mla with kvcache (sparse decode, AMX optimized)
   m.def(
       "flash_mla_with_kvcache_cpu(Tensor q, Tensor k_cache, int head_dim_v, float softmax_scale, "
       "Tensor indices, Tensor? topk_length, Tensor? attn_sink, "
       "Tensor? extra_k_cache, Tensor? extra_indices, Tensor? extra_topk_length, "
-      "int fp8_layout) -> (Tensor, Tensor)");
+      "bool is_fp8_kvcache, int fp8_layout) -> (Tensor, Tensor)");
   m.impl("flash_mla_with_kvcache_cpu", torch::kCPU, &flash_mla_with_kvcache_cpu);
 
   // linear attn

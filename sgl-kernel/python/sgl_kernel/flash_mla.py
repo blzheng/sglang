@@ -156,7 +156,7 @@ def flash_mla_sparse_fwd(
 
 
 # ---------------------------------------------------------------------------
-# Intel CPU AMX implementation of flash_mla_with_kvcache (sparse FP8 decode).
+# Intel CPU AMX implementation of flash_mla_with_kvcache (sparse decode).
 #
 # Mirrors the upstream FlashMLA `flash_mla_with_kvcache` interface so the same
 # call-site in `flash_mla_with_kvcache_torch` /
@@ -189,13 +189,11 @@ def flash_mla_with_kvcache_cpu(
     extra_topk_length: Optional[torch.Tensor] = None,
     fp8_layout: int = _FP8_LAYOUT_MODEL1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Intel CPU AMX implementation of FlashMLA's sparse FP8 decode.
+    """Intel CPU AMX implementation of FlashMLA's sparse decode.
 
     Arguments mirror :func:`flash_mla_with_kvcache` (and the reference
-    ``flash_mla_with_kvcache_torch``).  Currently only the sparse FP8 decode
-    path (``indices is not None``, ``is_fp8_kvcache=True``) is supported, which
-    matches the DeepSeek V3.2 / DSv4 setup described in
-    ``flash_mla_with_kvcache_torch``.
+    ``flash_mla_with_kvcache_torch``).  The sparse path supports FP8 KV cache
+    (with dequantization) and BF16 KV cache (without dequantization).
 
     Returns:
         out: ``(B, S_q, H_q, head_dim_v)``, ``bfloat16``.
@@ -204,9 +202,6 @@ def flash_mla_with_kvcache_cpu(
     assert indices is not None, (
         "flash_mla_with_kvcache_cpu currently only supports the sparse path "
         "(indices must be provided)"
-    )
-    assert is_fp8_kvcache, (
-        "flash_mla_with_kvcache_cpu currently only supports is_fp8_kvcache=True"
     )
     assert not causal, "causal must be False for sparse attention"
     assert (
@@ -227,6 +222,7 @@ def flash_mla_with_kvcache_cpu(
         extra_k_cache,
         extra_indices_in_kvcache,
         extra_topk_length,
+        bool(is_fp8_kvcache),
         int(fp8_layout),
     )
     return out, lse

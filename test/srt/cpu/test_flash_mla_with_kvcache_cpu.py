@@ -128,6 +128,13 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         k_dequant = flashmla_quant.dequantize_k_cache(k_quant, layout_enum)
         return k_quant.contiguous(), k_dequant
 
+    def _make_bf16_kv_cache(self, num_blocks, page_size, d_qk):
+        k_bf16 = (
+            torch.randn(num_blocks, page_size, 1, d_qk, dtype=torch.bfloat16) * 0.5
+        )
+        k_bf16 = k_bf16.contiguous()
+        return k_bf16, k_bf16
+
     def _make_indices(
         self, b, s_q, topk, total_tokens, *, dtype=torch.int32, invalid_ratio=0.0
     ):
@@ -162,17 +169,25 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         have_extra_topk_length=False,
         extra_topk=0,
         extra_num_blocks=0,
+        valid_tokens=None,
+        extra_valid_tokens=None,
         invalid_ratio=0.0,
+        is_fp8_kvcache=True,
     ):
         d_qk, d_v = _LAYOUT_DIMS[fp8_layout]
         layout_enum = flashmla_quant.FP8KVCacheLayout(fp8_layout)
 
         q = torch.randn(b, s_q, h_q, d_qk, dtype=torch.bfloat16) * 0.5
 
-        k_quant, k_dequant = self._make_quantized_kv_cache(
-            num_blocks, page_size, d_qk, layout_enum
-        )
-        total_tokens = num_blocks * page_size
+        if is_fp8_kvcache:
+            k_cache, k_dequant = self._make_quantized_kv_cache(
+                num_blocks, page_size, d_qk, layout_enum
+            )
+        else:
+            k_cache, k_dequant = self._make_bf16_kv_cache(
+                num_blocks, page_size, d_qk
+            )
+        total_tokens = valid_tokens if valid_tokens is not None else (num_blocks * page_size)
         indices = self._make_indices(
             b, s_q, topk, total_tokens, dtype=idx_dtype, invalid_ratio=invalid_ratio
         )
@@ -187,15 +202,24 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                 low=lo, high=topk + 1, size=(b,), dtype=torch.int32
             )
 
-        extra_k_quant = None
+        extra_k_cache = None
         extra_k_dequant = None
         extra_indices = None
         extra_topk_length = None
         if have_extra:
-            extra_k_quant, extra_k_dequant = self._make_quantized_kv_cache(
-                extra_num_blocks, page_size, d_qk, layout_enum
+            if is_fp8_kvcache:
+                extra_k_cache, extra_k_dequant = self._make_quantized_kv_cache(
+                    extra_num_blocks, page_size, d_qk, layout_enum
+                )
+            else:
+                extra_k_cache, extra_k_dequant = self._make_bf16_kv_cache(
+                    extra_num_blocks, page_size, d_qk
+                )
+            extra_total_tokens = (
+                extra_valid_tokens
+                if extra_valid_tokens is not None
+                else (extra_num_blocks * page_size)
             )
-            extra_total_tokens = extra_num_blocks * page_size
             extra_indices = self._make_indices(
                 b, s_q, extra_topk, extra_total_tokens, dtype=idx_dtype
             )
@@ -209,16 +233,16 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
 
         out_cpu, lse_cpu = flash_mla_with_kvcache_cpu(
             q=q,
-            k_cache=k_quant,
+            k_cache=k_cache,
             block_table=None,
             cache_seqlens=None,
             head_dim_v=d_v,
             softmax_scale=sm_scale,
             causal=False,
-            is_fp8_kvcache=True,
+            is_fp8_kvcache=is_fp8_kvcache,
             indices=indices,
             attn_sink=attn_sink,
-            extra_k_cache=extra_k_quant,
+            extra_k_cache=extra_k_cache,
             extra_indices_in_kvcache=extra_indices,
             topk_length=topk_length,
             extra_topk_length=extra_topk_length,
@@ -386,6 +410,49 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                         have_topk_length=have_topk_length,
                         have_extra_topk_length=have_extra_topk_length,
                     )
+
+    def test_with_bf16_kv_cache(self):
+        # Non-FP8 KV cache should skip dequantization and use BF16 cache rows
+        # directly for both main and extra KV sources.
+        for have_extra in (False, True):
+            with self.subTest(have_extra=have_extra):
+                self._run_one(
+                    b=2,
+                    s_q=1,
+                    h_q=16,
+                    topk=64,
+                    page_size=64,
+                    num_blocks=4,
+                    fp8_layout=2,
+                    have_extra=have_extra,
+                    extra_topk=32 if have_extra else 0,
+                    extra_num_blocks=2 if have_extra else 0,
+                    have_topk_length=True,
+                    have_extra_topk_length=have_extra,
+                    is_fp8_kvcache=False,
+                )
+
+    def test_oversized_preallocated_kv_cache(self):
+        # Only the token range implied by indices should be considered active;
+        # the backing KV cache can be much larger because it is preallocated.
+        for is_fp8_kvcache in (True, False):
+            with self.subTest(is_fp8_kvcache=is_fp8_kvcache):
+                self._run_one(
+                    b=2,
+                    s_q=1,
+                    h_q=16,
+                    topk=64,
+                    page_size=64,
+                    num_blocks=8,
+                    fp8_layout=2,
+                    have_extra=True,
+                    extra_topk=32,
+                    extra_num_blocks=4,
+                    valid_tokens=96,
+                    extra_valid_tokens=48,
+                    invalid_ratio=0.1,
+                    is_fp8_kvcache=is_fp8_kvcache,
+                )
 
     def test_with_attn_sink_and_extra(self):
         # Combined: attn_sink + topk_length + extra K cache, both layouts.
