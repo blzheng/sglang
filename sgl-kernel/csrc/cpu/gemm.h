@@ -63,7 +63,6 @@ inline int64_t get_row_size<uint8_t>(int64_t K) {
   return K >> 1;
 }
 
-
 inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
@@ -74,9 +73,7 @@ enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1, clamped_silu_and_m
 //   limit + alpha ⇒ gpt-oss swiglu.
 //   limit only    ⇒ DSV4-2604B clamped silu_and_mul.
 //   neither       ⇒ plain silu_and_mul.
-inline CPUAcTMethod select_act_func(
-    const std::optional<double>& alpha,
-    const std::optional<double>& limit) {
+inline CPUAcTMethod select_act_func(const std::optional<double>& alpha, const std::optional<double>& limit) {
   if (!limit.has_value()) {
     return CPUAcTMethod::silu_and_mul;
   }
@@ -241,7 +238,10 @@ void shared_expert_fp_kernel_impl(
     float routed_scaling_factor,
     int64_t M,
     int64_t N,
-    int64_t K);
+    int64_t K,
+    float alpha,
+    float limit,
+    CPUAcTMethod act_func);
 
 // tinygemm interface
 template <typename scalar_t>

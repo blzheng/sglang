@@ -740,7 +740,9 @@ class DeepseekV2MoE(nn.Module):
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
         ):
-            return self.forward_cpu(hidden_states, should_allreduce_fusion, input_ids_global)
+            return self.forward_cpu(
+                hidden_states, should_allreduce_fusion, input_ids_global
+            )
 
         if hidden_states.shape[0] > 0:
             if (
@@ -851,7 +853,7 @@ class DeepseekV2MoE(nn.Module):
             True,  # inplace
             self.shared_experts_is_int8,  # use_int8_w8a8
             self.shared_experts_is_fp8,  # use_fp8_w8a16
-            self.shared_experts_is_mxfp4, # use_mxfp4
+            self.shared_experts_is_mxfp4,  # use_mxfp4
             (
                 self.shared_experts.gate_up_proj.weight_scale
                 if self.shared_experts_is_int8
@@ -875,6 +877,8 @@ class DeepseekV2MoE(nn.Module):
                 if self.shared_experts_is_fp8
                 else None
             ),  # block_size
+            None,  # alpha
+            self.shared_experts.swiglu_limit,  # swiglu_limit
             True,  # is_vnni
         )
         if self.tp_size > 1 and not should_allreduce_fusion:
