@@ -1196,7 +1196,7 @@ def _dispatch_bf16_fp32_backend(
         return z
     elif algo == "cpu_amx":
         return torch.ops.sgl_kernel.weight_packed_linear(
-            x, y, None, False, torch.float32
+            x, y, None, True, torch.float32
         )
     else:
         return torch.nn.functional.linear(x.float(), y.float())
