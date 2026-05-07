@@ -169,7 +169,12 @@ std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 
 // gemm
 at::Tensor
-weight_packed_linear(at::Tensor& mat1, at::Tensor& mat2, const std::optional<at::Tensor>& bias, bool is_vnni);
+weight_packed_linear(
+    at::Tensor& mat1,
+    at::Tensor& mat2,
+    const std::optional<at::Tensor>& bias,
+    bool is_vnni,
+    std::optional<at::ScalarType> out_dtype = c10::nullopt);
 
 // gemm fusion
 at::Tensor fused_linear_sigmoid_mul(
@@ -477,7 +482,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
 
   // gemm
-  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni) -> Tensor");
+  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, ScalarType? out_dtype=None) -> Tensor");
   m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
 
   // gemm fusion
