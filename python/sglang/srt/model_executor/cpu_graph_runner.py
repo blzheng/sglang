@@ -226,8 +226,11 @@ def register_fake_ops():
         return q_input, k_input, v_input
 
     @torch.library.register_fake("sgl_kernel::weight_packed_linear")
-    def _(x, weight, bias, is_vnni):
-        return x.new_empty(x.shape[0], weight.shape[0])
+    def _(x, weight, bias, is_vnni, out_dtype=None):
+        M = x.shape[0]
+        N = weight.shape[0]
+        dtype = out_dtype if out_dtype is not None else x.dtype
+        return x.new_empty(M, N, dtype=dtype)
 
     @torch.library.register_fake("sgl_kernel::per_token_quant_int8_cpu")
     def _(input):
