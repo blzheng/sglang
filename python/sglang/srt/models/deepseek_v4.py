@@ -69,6 +69,7 @@ from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_lo
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
+from sglang.srt.models.deepseek_common.utils import _is_cpu, _is_cpu_amx_available
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
@@ -77,6 +78,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     make_layers,
     maybe_torch_compile,
+    use_intel_amx_backend,
 )
 
 logger = logging.getLogger(__name__)
@@ -853,6 +855,13 @@ class MQALayer(nn.Module):
                 self.wo_a, "weight_scale_inv"
             ), "FP8 quant_config must create weight_scale_inv"
             self.wo_a.weight_scale_inv.format_ue8m0 = True
+        elif _is_cpu and _is_cpu_amx_available:
+            from sglang.srt.layers.amx_utils import PackWeightMethodBMM
+
+            self.wo_a.quant_method = PackWeightMethodBMM(
+                n_groups=self.n_local_groups,
+                group_size=self.o_lora_rank,
+            )
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
             self.hidden_size,
@@ -1159,6 +1168,19 @@ class MQALayer(nn.Module):
                 recipe=(1, 1, 128),
             )
             o = output
+        elif use_intel_amx_backend(self.wo_a):
+            T, G, D = o.shape
+            R = self.o_lora_rank
+            output = torch.empty([T, G, R], dtype=o.dtype, device=o.device)
+            torch.ops.sgl_kernel.bmm_cpu(
+                output.transpose(0, 1),  # [G, T, R]
+                o.transpose(0, 1),  # [G, T, D]
+                self.wo_a.weight,  # [G, R, D] packed in VNNI
+                True,  # is_vnni
+                None,  # scale
+            )
+            o = output
+
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
