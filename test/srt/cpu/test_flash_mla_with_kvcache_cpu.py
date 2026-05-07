@@ -173,6 +173,8 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         extra_valid_tokens=None,
         invalid_ratio=0.0,
         is_fp8_kvcache=True,
+        topk_length_value=None,
+        extra_topk_length_value=None,
     ):
         d_qk, d_v = _LAYOUT_DIMS[fp8_layout]
         layout_enum = flashmla_quant.FP8KVCacheLayout(fp8_layout)
@@ -197,10 +199,13 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
         )
         topk_length = None
         if have_topk_length:
-            lo = max(1, topk // 2)
-            topk_length = torch.randint(
-                low=lo, high=topk + 1, size=(b,), dtype=torch.int32
-            )
+            if topk_length_value is None:
+                lo = max(1, topk // 2)
+                topk_length = torch.randint(
+                    low=lo, high=topk + 1, size=(b,), dtype=torch.int32
+                )
+            else:
+                topk_length = torch.full((b,), topk_length_value, dtype=torch.int32)
 
         extra_k_cache = None
         extra_k_dequant = None
@@ -224,10 +229,15 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                 b, s_q, extra_topk, extra_total_tokens, dtype=idx_dtype
             )
             if have_extra_topk_length:
-                lo = max(1, extra_topk // 2)
-                extra_topk_length = torch.randint(
-                    low=lo, high=extra_topk + 1, size=(b,), dtype=torch.int32
-                )
+                if extra_topk_length_value is None:
+                    lo = max(1, extra_topk // 2)
+                    extra_topk_length = torch.randint(
+                        low=lo, high=extra_topk + 1, size=(b,), dtype=torch.int32
+                    )
+                else:
+                    extra_topk_length = torch.full(
+                        (b,), extra_topk_length_value, dtype=torch.int32
+                    )
 
         sm_scale = d_qk ** -0.5
 
@@ -368,6 +378,29 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                     have_topk_length=True,
                 )
 
+    def test_with_short_topk_length(self):
+        # Covers the optimized path that stops processing once topk_length is
+        # reached instead of iterating over the full preallocated topk width.
+        for is_fp8_kvcache in (True, False):
+            with self.subTest(is_fp8_kvcache=is_fp8_kvcache):
+                self._run_one(
+                    b=2,
+                    s_q=1,
+                    h_q=16,
+                    topk=256,
+                    page_size=128,
+                    num_blocks=4,
+                    fp8_layout=2,
+                    have_topk_length=True,
+                    topk_length_value=17,
+                    have_extra=True,
+                    extra_topk=128,
+                    extra_num_blocks=2,
+                    have_extra_topk_length=True,
+                    extra_topk_length_value=9,
+                    is_fp8_kvcache=is_fp8_kvcache,
+                )
+
     def test_with_invalid_indices(self):
         # Some indices set to -1; the kernel must mask them out and the
         # reference output must still match.
@@ -382,6 +415,23 @@ class TestFlashMLAWithKVCacheCPU(CustomTestCase):
                     num_blocks=4,
                     fp8_layout=fp8_layout,
                     invalid_ratio=0.25,
+                )
+
+    def test_with_all_invalid_tile(self):
+        # A fully invalid sparse tile should be skipped without changing the
+        # online-softmax state; the query becomes lonely and returns zero/+inf.
+        for is_fp8_kvcache in (True, False):
+            with self.subTest(is_fp8_kvcache=is_fp8_kvcache):
+                self._run_one(
+                    b=2,
+                    s_q=1,
+                    h_q=16,
+                    topk=256,
+                    page_size=128,
+                    num_blocks=4,
+                    fp8_layout=2,
+                    invalid_ratio=1.0,
+                    is_fp8_kvcache=is_fp8_kvcache,
                 )
 
     def test_with_extra_kv_cache(self):

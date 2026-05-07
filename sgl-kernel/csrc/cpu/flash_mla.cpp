@@ -295,10 +295,8 @@ inline void sparse_pack_vnni_Nx32(
     scalar_t* __restrict__ dst1,
     const scalar_t* __restrict__ src,
     const index_t* __restrict__ ind,
+    const bool* __restrict__ valid_mask,
     int N,
-    int64_t n_start,
-    int64_t topk_limit,
-    int64_t total_tokens,
     int ld_src,
     int ld_dst0,
     int ld_dst1,
@@ -307,7 +305,7 @@ inline void sparse_pack_vnni_Nx32(
   int n = 0;
   for (; n < N; ++n) {
     index_t idx = ind[n];
-    if (!is_valid_sparse_index(idx, n_start + n, topk_limit, total_tokens)) {
+    if (!valid_mask[n]) {
       vinputs[n] = _mm512_set1_epi32(0);
     } else {
       vinputs[n] = _mm512_loadu_si512(src + idx * ld_src);
@@ -340,12 +338,10 @@ void sparse_pack_vnni(
     scalar_t* __restrict__ dst1,
     const scalar_t* __restrict__ src,
     const index_t* __restrict__ ind,
+    const bool* __restrict__ valid_mask,
     int N,
     int K,
     int Kv,
-    int64_t n_start,
-    int64_t topk_limit,
-    int64_t total_tokens,
     int ld_src,
     int ld_dst0,
     int ld_dst1) {
@@ -361,10 +357,8 @@ void sparse_pack_vnni(
           /*    dst1 */ dst1 + ((nb * 16) >> 1) * ld_dst1 * 2 + kb * 32 * 2,
           /*     src */ src + kb * 32,
           /*     ind */ ind + nb * 16,
+          /*   valid */ valid_mask + nb * 16,
           /*       N */ nb_size,
-          /* n_start */ n_start + nb * 16,
-          /* top_lim */ topk_limit,
-          /*  n_tokn */ total_tokens,
           /*  ld_src */ ld_src,
           /* ld_dst0 */ ld_dst0,
           /* ld_dst1 */ ld_dst1,
@@ -375,7 +369,7 @@ void sparse_pack_vnni(
   // Reference scalar fallback (NO-AVX512 build).
   for (int n = 0; n < N; ++n) {
     index_t idx = ind[n];
-    const bool valid = is_valid_sparse_index(idx, n_start + n, topk_limit, total_tokens);
+    const bool valid = valid_mask[n];
     for (int k = 0; k < K / 2; ++k) {
       for (int d = 0; d < 2; ++d) {
         scalar_t v = !valid ? scalar_t(0) : src[idx * ld_src + k * 2 + d];
@@ -386,8 +380,8 @@ void sparse_pack_vnni(
   for (int n = 0; n < (N >> 1) * 2; n += 2) {
     index_t i0 = ind[n + 0];
     index_t i1 = ind[n + 1];
-    const bool valid0 = is_valid_sparse_index(i0, n_start + n + 0, topk_limit, total_tokens);
-    const bool valid1 = is_valid_sparse_index(i1, n_start + n + 1, topk_limit, total_tokens);
+    const bool valid0 = valid_mask[n + 0];
+    const bool valid1 = valid_mask[n + 1];
     for (int k = 0; k < Kv; ++k) {
       dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 0] = !valid0 ? scalar_t(0) : src[i0 * ld_src + k];
       dst1[(n >> 1) * ld_dst1 * 2 + k * 2 + 1] = !valid1 ? scalar_t(0) : src[i1 * ld_src + k];
@@ -395,7 +389,7 @@ void sparse_pack_vnni(
   }
   if (N % 2 != 0) {
     index_t idx = ind[N - 1];
-    const bool valid = is_valid_sparse_index(idx, n_start + N - 1, topk_limit, total_tokens);
+    const bool valid = valid_mask[N - 1];
     for (int k = 0; k < Kv; ++k) {
       dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 0] = !valid ? scalar_t(0) : src[idx * ld_src + k];
       dst1[(N >> 1) * ld_dst1 * 2 + k * 2 + 1] = 0;
@@ -564,13 +558,26 @@ void sparse_mla_decode_kernel_impl(
         const int64_t topk_limit = cur_topk_length != nullptr
             ? std::max<int64_t>(0, std::min<int64_t>(cur_topk_length[bs], topk_count))
             : topk_count;
+        if (topk_limit == 0) {
+          return;
+        }
 
         // loop over one top-k source (main or extra). Processing them as two
         // consecutive streams avoids allocating/copying a unified KV buffer and
         // merged indices while preserving online-softmax semantics.
-        for (int64_t n = 0; n < topk_count; n += BLOCK_N) {
-          int64_t n_size = std::min<int64_t>(BLOCK_N, topk_count - n);
+        for (int64_t n = 0; n < topk_limit; n += BLOCK_N) {
+          int64_t n_size = std::min<int64_t>(BLOCK_N, topk_limit - n);
           const int64_t padded_n_size = div_up(int(n_size), TILE_K) * TILE_K;
+          bool valid_mask[BLOCK_N];
+          bool has_valid = false;
+          for (int64_t k = 0; k < n_size; ++k) {
+            const bool valid = is_valid_sparse_index(cur_idx_ptr[n + k], n + k, topk_limit, total_tokens);
+            valid_mask[k] = valid;
+            has_valid |= valid;
+          }
+          if (!has_valid) {
+            continue;
+          }
 
           // Pack K (BLOCK_N rows via gather) into Btmp0 (key, vnni) and Btmp1
           // (value, vnni). Invalid entries load zeros and are masked below.
@@ -579,12 +586,10 @@ void sparse_mla_decode_kernel_impl(
               /*    dst1 */ Btmp1,
               /*     src */ k_ptr,
               /*     ind */ cur_idx_ptr + n,
+              /*   valid */ valid_mask,
               /*       N */ static_cast<int>(n_size),
               /*       K */ static_cast<int>(head_size),
               /*      Kv */ static_cast<int>(head_size_v),
-              /* n_start */ n,
-              /* top_lim */ topk_limit,
-              /*  n_tokn */ total_tokens,
               /*  ld_src */ static_cast<int>(k_strideN),
               /* ld_dst0 */ static_cast<int>(BLOCK_N),
               /* ld_dst1 */ static_cast<int>(head_size_v));
@@ -609,7 +614,7 @@ void sparse_mla_decode_kernel_impl(
             at::vec::map<float>([scale_vec](Vec x) { return x * scale_vec; }, row, row, n_size);
 
             for (int64_t k = 0; k < n_size; ++k) {
-              if (!is_valid_sparse_index(cur_idx_ptr[n + k], n + k, topk_limit, total_tokens)) {
+              if (!valid_mask[k]) {
                 row[k] = -std::numeric_limits<float>::infinity();
               }
             }
