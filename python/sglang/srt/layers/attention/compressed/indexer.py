@@ -352,6 +352,13 @@ def fused_scale_torch(
     return out
 
 
+def fused_scale_cpu(
+    weight: torch.Tensor,
+    out_scale: float,
+    q_scale: torch.Tensor,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.fused_scale_cpu(weight, out_scale, q_scale)
+
 class C4IndexerBackend:
     def __init__(self):
         super().__init__()
@@ -423,7 +430,10 @@ class C4IndexerBackend:
         q = c4_indexer.compute_q(q_lora, positions=positions)
         q_fp8, q_scale = act_quant(q)
         weights = c4_indexer.compute_weights(x, skip_scale=True)
-        weights = fused_scale_torch(weights, c4_indexer.weight_scale, q_scale)
+        if _is_cpu_amx_available:
+            weights = fused_scale_cpu(weights, c4_indexer.weight_scale, q_scale)
+        else:
+            weights = fused_scale_torch(weights, c4_indexer.weight_scale, q_scale)
         self.forward_indexer_compressor(
             x=x,
             forward_batch=forward_batch,
