@@ -8,6 +8,8 @@ from sglang.srt.layers.attention.compressed.indexer import (
 )
 from sglang.test.test_utils import CustomTestCase
 
+from utils import precision
+
 
 BLOCK_SIZE = 64
 HEAD_DIM = 128
@@ -24,13 +26,14 @@ class TestFp8PagedMqaLogitsCPU(CustomTestCase):
         num_blocks: int = 8,
         index_dtype: torch.dtype = torch.int32,
         weight_dtype: torch.dtype = torch.float32,
+        q_dtype: torch.dtype = torch.bfloat16,
     ):
-        torch.manual_seed(0)
+        torch.manual_seed(2)
 
-        q = torch.randn(batch_size, 1, num_heads, HEAD_DIM, dtype=torch.float32) * 0.25
+        q = (torch.randn(batch_size, 1, num_heads, HEAD_DIM) * 0.25).to(q_dtype)
         q_fp8 = q.to(torch.float8_e4m3fn).contiguous()
 
-        k = torch.randn(num_blocks, BLOCK_SIZE, HEAD_DIM, dtype=torch.float32) * 0.25
+        k = (torch.randn(num_blocks, BLOCK_SIZE, HEAD_DIM) * 0.25).to(q_dtype)
         k_fp8 = k.to(torch.float8_e4m3fn).contiguous()
         k_bytes = k_fp8.view(num_blocks, BLOCK_SIZE * HEAD_DIM).view(dtype=torch.uint8)
 
@@ -51,10 +54,16 @@ class TestFp8PagedMqaLogitsCPU(CustomTestCase):
 
         return q_fp8, kvcache, weight, seq_lens, page_table, max_seq_len
 
-    def _assert_matches_reference(self, index_dtype: torch.dtype, weight_dtype: torch.dtype):
+    def _assert_matches_reference(
+        self,
+        index_dtype: torch.dtype,
+        weight_dtype: torch.dtype,
+        q_dtype: torch.dtype = torch.bfloat16,
+    ):
         q_fp8, kvcache, weight, seq_lens, page_table, max_seq_len = self._make_inputs(
             index_dtype=index_dtype,
             weight_dtype=weight_dtype,
+            q_dtype=q_dtype,
         )
 
         actual = torch.ops.sgl_kernel.fp8_paged_mqa_logits_cpu(
@@ -79,14 +88,15 @@ class TestFp8PagedMqaLogitsCPU(CustomTestCase):
 
         self.assertEqual(actual.shape, (seq_lens.numel(), max_seq_len))
         self.assertEqual(actual.dtype, torch.float32)
+        atol = rtol = precision[q_dtype]
         for batch_idx, seq_len in enumerate(seq_lens.tolist()):
             if seq_len == 0:
                 continue
             torch.testing.assert_close(
                 actual[batch_idx, :seq_len],
                 expected[batch_idx, :seq_len],
-                rtol=1e-5,
-                atol=1e-5,
+                atol=atol,
+                rtol=rtol,
             )
 
     @unittest.skipIf(

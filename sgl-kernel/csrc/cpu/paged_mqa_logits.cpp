@@ -4,7 +4,6 @@
 #include "vec.h"
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 
 namespace {
@@ -29,35 +28,15 @@ inline float dot_fp8_128_scalar(const uint8_t* k, const uint8_t* q) {
   return dot;
 }
 
-inline const float* fp8_e4m3_to_float_lut() {
-  static const std::array<float, 256> lut = [] {
-    std::array<float, 256> values{};
-    for (int i = 0; i < 256; ++i) {
-      values[i] = fp8_e4m3_to_float(static_cast<uint8_t>(i));
-    }
-    return values;
-  }();
-  return lut.data();
-}
-
 #if defined(CPU_CAPABILITY_AVX512)
 inline float dot_fp8_128(const uint8_t* k, const uint8_t* q) {
-  using fVec = at::vec::Vectorized<float>;
-
-  const float* lut = fp8_e4m3_to_float_lut();
-  fVec acc(0.0f);
-
-  for (int64_t d = 0; d < kHeadDim; d += 16) {
-    const __m128i k_fp8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(k + d));
-    const __m128i q_fp8 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(q + d));
-    const __m512i k_idx = _mm512_cvtepu8_epi32(k_fp8);
-    const __m512i q_idx = _mm512_cvtepu8_epi32(q_fp8);
-    const fVec k_val(_mm512_i32gather_ps(k_idx, lut, sizeof(float)));
-    const fVec q_val(_mm512_i32gather_ps(q_idx, lut, sizeof(float)));
-    acc = k_val * q_val + acc;
+  __m512 acc = _mm512_setzero_ps();
+  for (int64_t d = 0; d < kHeadDim; d += 32) {
+    const __m256i k8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(k + d));
+    const __m256i q8 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q + d));
+    acc = _mm512_dpbf16_ps(acc, CVT_FP8_TO_BF16(k8), CVT_FP8_TO_BF16(q8));
   }
-
-  return vec_reduce_sum(acc);
+  return _mm512_reduce_add_ps(acc);
 }
 #else
 inline float dot_fp8_128(const uint8_t* k, const uint8_t* q) {
