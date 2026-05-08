@@ -3,6 +3,7 @@ import unittest
 import torch
 from utils import precision
 
+from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     RotaryEmbedding,
@@ -14,6 +15,38 @@ torch.manual_seed(1234)
 
 
 class TestROPE(CustomTestCase):
+    def test_apply_rotary_emb_interleaved_cpu_entry_compat(self):
+        rope_dim = 64
+        for dtype in [torch.float32, torch.bfloat16]:
+            for shape in [(41, rope_dim), (41, 3, rope_dim)]:
+                with self.subTest(dtype=dtype, shape=shape):
+                    angles = torch.randn(shape[0], rope_dim // 2, dtype=torch.float32)
+                    freqs_cis = torch.polar(torch.ones_like(angles), angles).to(
+                        torch.complex64
+                    )
+                    x_ref = torch.randn(*shape, dtype=dtype)
+                    x_cpp = x_ref.clone()
+
+                    apply_rotary_emb_triton(
+                        x_ref,
+                        freqs_cis,
+                        inverse=False,
+                    )
+
+                    torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+                        x_cpp,
+                        freqs_cis,
+                        False,
+                    )
+
+                    atol = rtol = precision[x_ref.dtype]
+                    torch.testing.assert_close(
+                        x_cpp.float(),
+                        x_ref.float(),
+                        atol=atol,
+                        rtol=rtol,
+                    )
+
     def test_deepseek_v2_rope(self):
         num_head = 16
         seq_len = 1024

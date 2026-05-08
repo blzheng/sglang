@@ -385,3 +385,213 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
   });
   return std::make_tuple(query_out, key_out);
 }
+
+// In-place rotary embedding on interleaved real/imag pairs.
+// Supports [T, rope_dim] and [T, nh, rope_dim] with explicit outer strides.
+namespace {
+
+template <typename scalar_t>
+static void apply_rotary_emb_single_impl(
+    scalar_t* __restrict__ x,
+    const float* __restrict__ freqs,
+    int64_t T,
+    int64_t nh,
+    int64_t rope_dim,
+    int64_t x_stride_t,
+    int64_t x_stride_h,
+    int64_t freqs_stride_t,
+    bool inverse) {
+  // Interleaved complex rotation:
+  //   x = [xr0, xi0, xr1, xi1, ...]
+  //   f = [c0,  s0,  c1,  s1,  ...]
+  // AVX-512 uses permutes to broadcast cos/sin within each pair and a sign mask
+  // to switch between forward and inverse rotation without branching.
+
+#ifdef CPU_CAPABILITY_AVX512
+  // Forward negates even lanes of the sin broadcast; inverse negates odd lanes.
+  const __m512 avx_sign = _mm512_castsi512_ps(
+      inverse ? _mm512_set_epi32(
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0)
+              : _mm512_set_epi32(
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000,
+                    0,
+                    (int)0x80000000));
+#endif
+
+  at::parallel_for(0, T * nh, GRAIN_SIZE / rope_dim, [&](int64_t begin, int64_t end) {
+    int64_t t = 0, h = 0;
+    data_index_init(begin, t, T, h, nh);
+    for (int64_t i = begin; i < end; ++i) {
+      scalar_t* xp = x + t * x_stride_t + h * x_stride_h;
+      const float* fp = freqs + t * freqs_stride_t;
+
+#ifdef CPU_CAPABILITY_AVX512
+      {
+        using bVec = at::vec::Vectorized<scalar_t>;
+        using fVec = at::vec::Vectorized<float>;
+        constexpr int64_t kVecSize = bVec::size();
+        constexpr int64_t kFVecSize = fVec::size();
+
+        int64_t k = 0;
+        // double is dispatched but handled by the scalar path below.
+        if constexpr (!std::is_same_v<scalar_t, double>) {
+          for (; k <= rope_dim - kVecSize; k += kVecSize) {
+            if constexpr (std::is_same_v<scalar_t, float>) {
+              const __m512 xv0 = _mm512_loadu_ps(xp + k);
+              const __m512 fv0 = _mm512_loadu_ps(fp + k);
+              // 0xA0 broadcasts even lanes within each complex pair, 0xF5 broadcasts
+              // odd lanes, and 0xB1 swaps real/imag lanes within each pair.
+              const __m512 out0 = _mm512_fmadd_ps(
+                  xv0,
+                  _mm512_permute_ps(fv0, 0xA0),
+                  _mm512_mul_ps(_mm512_permute_ps(xv0, 0xB1), _mm512_xor_ps(_mm512_permute_ps(fv0, 0xF5), avx_sign)));
+              _mm512_storeu_ps(xp + k, out0);
+            } else {
+              fVec x0_v, x1_v;
+              std::tie(x0_v, x1_v) = at::vec::convert_to_float(bVec::loadu(xp + k));
+              const __m512 xv0 = x0_v;
+              const __m512 xv1 = x1_v;
+
+              const __m512 fv0 = _mm512_loadu_ps(fp + k);
+              const __m512 fv1 = _mm512_loadu_ps(fp + k + kFVecSize);
+
+              const __m512 out0 = _mm512_fmadd_ps(
+                  xv0,
+                  _mm512_permute_ps(fv0, 0xA0),
+                  _mm512_mul_ps(_mm512_permute_ps(xv0, 0xB1), _mm512_xor_ps(_mm512_permute_ps(fv0, 0xF5), avx_sign)));
+              const __m512 out1 = _mm512_fmadd_ps(
+                  xv1,
+                  _mm512_permute_ps(fv1, 0xA0),
+                  _mm512_mul_ps(_mm512_permute_ps(xv1, 0xB1), _mm512_xor_ps(_mm512_permute_ps(fv1, 0xF5), avx_sign)));
+
+              at::vec::convert_from_float<scalar_t>(fVec(out0), fVec(out1)).store(xp + k);
+            }
+          }
+        }  // if constexpr (!double)
+
+        // Scalar tail.
+        for (; k < rope_dim; k += 2) {
+          const float xr = static_cast<float>(xp[k]);
+          const float xi = static_cast<float>(xp[k + 1]);
+          const float cr = fp[k], ci = fp[k + 1];
+          if (inverse) {
+            xp[k] = static_cast<scalar_t>(xr * cr + xi * ci);
+            xp[k + 1] = static_cast<scalar_t>(xi * cr - xr * ci);
+          } else {
+            xp[k] = static_cast<scalar_t>(xr * cr - xi * ci);
+            xp[k + 1] = static_cast<scalar_t>(xr * ci + xi * cr);
+          }
+        }
+      }
+#else
+      // Scalar fallback.
+      for (int64_t k = 0; k < rope_dim; k += 2) {
+        const float xr = static_cast<float>(xp[k]);
+        const float xi = static_cast<float>(xp[k + 1]);
+        const float cr = fp[k], ci = fp[k + 1];
+        if (inverse) {
+          xp[k]     = static_cast<scalar_t>(xr * cr + xi * ci);
+          xp[k + 1] = static_cast<scalar_t>(xi * cr - xr * ci);
+        } else {
+          xp[k]     = static_cast<scalar_t>(xr * cr - xi * ci);
+          xp[k + 1] = static_cast<scalar_t>(xr * ci + xi * cr);
+        }
+      }
+#endif
+      data_index_step(t, T, h, nh);
+    }
+  });
+}
+
+}  // namespace
+
+at::Tensor apply_rotary_emb_interleaved_cpu(at::Tensor& x, at::Tensor& freqs, bool inverse) {
+  RECORD_FUNCTION("sgl-kernel::apply_rotary_emb_interleaved_cpu", {});
+  TORCH_CHECK(
+      x.dim() == 2 || x.dim() == 3,
+      "apply_rotary_emb_interleaved_cpu: x must be 2D [T,rope_dim] or 3D [T,nh,rope_dim]");
+  TORCH_CHECK(
+      x.device().is_cpu() && freqs.device().is_cpu(), "apply_rotary_emb_interleaved_cpu: all tensors must be on CPU");
+
+  const int64_t T = x.size(0);
+  const int64_t rope_dim = x.size(-1);
+  const int64_t nh = x.dim() == 3 ? x.size(1) : 1;
+
+  at::Tensor freqs_real;
+  if (freqs.is_complex()) {
+    TORCH_CHECK(freqs.dim() == 2, "apply_rotary_emb_interleaved_cpu: freqs_cis must be 2D [N, rope_dim/2]");
+    TORCH_CHECK(
+        freqs.scalar_type() == at::kComplexFloat, "apply_rotary_emb_interleaved_cpu: complex freqs must be complex64");
+    freqs_real = at::view_as_real(freqs).flatten(-2);
+  } else {
+    TORCH_CHECK(
+        freqs.dim() == 2 && freqs.scalar_type() == at::kFloat,
+        "apply_rotary_emb_interleaved_cpu: freqs must be float32 [N, rope_dim] or complex64 [N, rope_dim/2]");
+    freqs_real = freqs;
+  }
+
+  TORCH_CHECK(rope_dim % 2 == 0, "apply_rotary_emb_interleaved_cpu: rope_dim must be even");
+
+  TORCH_CHECK(
+      freqs_real.size(1) == rope_dim, "apply_rotary_emb_interleaved_cpu: frequency rope dim must match x last dim");
+
+  TORCH_CHECK(freqs_real.size(0) == T, "apply_rotary_emb_interleaved_cpu: freqs must have shape [T, rope_dim]");
+
+  if (freqs_real.stride(-1) != 1) {
+    freqs_real = freqs_real.contiguous();
+  }
+
+  // The rope dimension must be contiguous. Outer strides are handled explicitly,
+  // so non-contiguous [T] or [head] slices are still supported.
+  TORCH_CHECK(
+      x.stride(-1) == 1,
+      "apply_rotary_emb_interleaved_cpu: x inner (rope) dim must be contiguous (stride[-1]==1); "
+      "got stride[-1]=",
+      x.stride(-1));
+
+  const int64_t x_stride_t = x.stride(0);
+  const int64_t x_stride_h = x.dim() == 3 ? x.stride(1) : 0;
+  const int64_t freqs_stride_t = freqs_real.stride(0);
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kBFloat16, at::kHalf, x.scalar_type(), "apply_rotary_emb_interleaved_cpu", [&] {
+    apply_rotary_emb_single_impl<scalar_t>(
+        x.data_ptr<scalar_t>(),
+        freqs_real.data_ptr<float>(),
+        T,
+        nh,
+        rope_dim,
+        x_stride_t,
+        x_stride_h,
+        freqs_stride_t,
+        inverse);
+  });
+  return x;
+}
