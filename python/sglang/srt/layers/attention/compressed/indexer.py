@@ -17,7 +17,7 @@ from sglang.srt.layers.attention.indexer_topk_capturer import (
     get_global_indexer_capturer,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_hip
+from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.compressor import CompressorBackend
@@ -332,6 +332,7 @@ def fused_scale(
     return out
 
 
+@torch.compile(dynamic=True, backend=get_compiler_backend())
 def fused_scale_torch(
     weight: torch.Tensor,
     out_scale: float,
@@ -343,6 +344,7 @@ def fused_scale_torch(
     acc = weight.reshape(-1).float() * out_scale * q_scale.reshape(-1).float()
     out = acc.to(out_dtype).reshape(B, H, 1)
     return out
+
 
 class C4IndexerBackend:
     def __init__(self):
