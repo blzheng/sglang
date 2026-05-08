@@ -4,9 +4,10 @@ import triton.language as tl
 
 from sglang.srt.layers.attention.nsa.index_buf_accessor_v4 import NopeFp8RopeBf16Pack
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-
+from sglang.srt.utils import cpu_has_amx_support, is_cpu
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
-
+_is_cpu = is_cpu()
+_is_cpu_amx_available = cpu_has_amx_support()
 
 @triton.jit
 def _quant_k_cache_fused_kernel(
@@ -121,6 +122,9 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
 
 
 def quant_to_nope_fp8_rope_bf16_pack(k_bf16: torch.Tensor) -> NopeFp8RopeBf16Pack:
+    if _is_cpu and _is_cpu_amx_available:
+        return NopeFp8RopeBf16Pack(*torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16))
+
     assert k_bf16.dtype == torch.bfloat16
     _num_tokens, hidden_dim = k_bf16.shape
     assert hidden_dim == 512
