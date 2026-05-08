@@ -187,6 +187,8 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 
 // quant
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
+std::tuple<at::Tensor, at::Tensor> act_quant_cpu(
+    at::Tensor& x, int64_t block_size, const std::optional<std::string>& scale_fmt);
 
 // gemm
 at::Tensor weight_packed_linear(
@@ -561,6 +563,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // quant
   m.def("per_token_quant_int8_cpu(Tensor A) -> (Tensor, Tensor)");
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
+    m.def("act_quant_cpu(Tensor x, int block_size=128, str? scale_fmt=None) -> (Tensor, Tensor)");
+    m.impl("act_quant_cpu", torch::kCPU, &act_quant_cpu);
 
   // gemm
   m.def(
