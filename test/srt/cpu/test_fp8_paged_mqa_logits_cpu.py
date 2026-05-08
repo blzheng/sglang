@@ -99,17 +99,12 @@ class TestFp8PagedMqaLogitsCPU(CustomTestCase):
                 rtol=rtol,
             )
 
-    @unittest.skipIf(
-        not hasattr(torch, "float8_e4m3fn"), "torch.float8_e4m3fn is unavailable"
-    )
-    def test_matches_torch_reference_int32_float32(self):
-        self._assert_matches_reference(torch.int32, torch.float32)
-
-    @unittest.skipIf(
-        not hasattr(torch, "float8_e4m3fn"), "torch.float8_e4m3fn is unavailable"
-    )
-    def test_matches_torch_reference_int64_bfloat16(self):
-        self._assert_matches_reference(torch.int64, torch.bfloat16)
+    def test_matches_torch_reference(self):
+        self._assert_matches_reference(
+            index_dtype=torch.int32,
+            weight_dtype=torch.float32,
+            q_dtype=torch.bfloat16,
+        )
 
 
 if __name__ == "__main__":
