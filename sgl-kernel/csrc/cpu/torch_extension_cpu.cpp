@@ -414,6 +414,22 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
     int64_t head_qk,
     int64_t head_v);
 
+// mhc (Multi-Head Channel) kernels
+std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
+    at::Tensor& x,
+    at::Tensor& hc_fn,
+    at::Tensor& hc_scale,
+    at::Tensor& hc_base,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    double rms_eps,
+    double hc_eps);
+
+at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& post, at::Tensor& comb);
+
+at::Tensor hc_head_fused_cpu(
+    at::Tensor& x, at::Tensor& hc_fn, at::Tensor& hc_scale, at::Tensor& hc_base, double hc_eps, double norm_eps);
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
   m.def("silu_and_mul_cpu(Tensor input) -> Tensor");
@@ -665,6 +681,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
       "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("fused_qkvzba_split_reshape_cat_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_cpu);
+  // mhc (Multi-Head Channel)
+  m.def(
+      "hc_pre_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "int hc_mult, int sinkhorn_iters, float rms_eps, float hc_eps) -> (Tensor, Tensor, Tensor)");
+  m.impl("hc_pre_fused_cpu", torch::kCPU, &hc_pre_fused_cpu);
+
+  m.def("hc_post_fused_cpu(Tensor x, Tensor residual, Tensor post, Tensor comb) -> Tensor");
+  m.impl("hc_post_fused_cpu", torch::kCPU, &hc_post_fused_cpu);
+
+  m.def(
+      "hc_head_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "float hc_eps, float norm_eps) -> Tensor");
+  m.impl("hc_head_fused_cpu", torch::kCPU, &hc_head_fused_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
