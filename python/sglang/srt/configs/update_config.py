@@ -54,6 +54,13 @@ def get_num_heads_padding_size(tp_size, weight_block_size, head_dim):
     return pad_size
 
 
+def _set_padded_attr(model_config, attr_name, value):
+    if hasattr(model_config, attr_name):
+        setattr(model_config, attr_name, value)
+    setattr(model_config.hf_config, attr_name, value)
+    setattr(model_config.hf_text_config, attr_name, value)
+
+
 def update_intermediate_size(model_config, attr_name, intermediate_padding_size):
     attr_value = intermediate_padding_size
     if hasattr(model_config, "hf_config") and hasattr(
@@ -83,24 +90,43 @@ def adjust_config_with_unaligned_cpu_tp(
     # Support the case where the num_attention_heads is not divisible by the TP size.
     weight_block_size = may_get_weight_block_size(model_config, load_config)
 
-    model_config.hf_config.original_num_attention_heads = (
-        model_config.num_attention_heads
+    _set_padded_attr(
+        model_config, "original_num_attention_heads", model_config.num_attention_heads
     )
-    model_config.hf_text_config.original_num_attention_heads = (
-        model_config.num_attention_heads
-    )
-
-    model_config.hf_config.original_total_num_kv_heads = (
-        model_config.get_total_num_kv_heads()
-    )
-    model_config.hf_text_config.original_total_num_kv_heads = (
-        model_config.get_total_num_kv_heads()
+    _set_padded_attr(
+        model_config,
+        "original_total_num_kv_heads",
+        model_config.get_total_num_kv_heads(),
     )
 
     total_kv_heads = model_config.get_total_num_kv_heads()
     # MQA models (num_kv_heads == 1) replicate the single KV head across TP ranks,
     # so kv-head padding is not applicable — only attention-head padding is.
     is_mqa = total_kv_heads == 1
+
+    # Grouped-MQA models (e.g. DeepSeek-V4) carry an additional `o_groups` dim
+    # that must also divide tp_size; the heads-per-group ratio must remain
+    # integer, so pad `o_groups` and `num_attention_heads` together.
+    o_groups = getattr(model_config.hf_config, "o_groups", None)
+    if (
+        is_mqa
+        and isinstance(o_groups, int)
+        and o_groups > 0
+        and model_config.num_attention_heads % o_groups == 0
+        and (
+            o_groups % tp_size != 0
+            or model_config.num_attention_heads % tp_size != 0
+        )
+    ):
+        _set_padded_attr(model_config, "original_o_groups", o_groups)
+
+        heads_per_group = model_config.num_attention_heads // o_groups
+        new_o_groups = ((o_groups + tp_size - 1) // tp_size) * tp_size
+        new_num_attention_heads = heads_per_group * new_o_groups
+
+        _set_padded_attr(model_config, "o_groups", new_o_groups)
+        _set_padded_attr(model_config, "num_attention_heads", new_num_attention_heads)
+
     needs_attn_pad = model_config.num_attention_heads % tp_size != 0
     needs_kv_pad = not is_mqa and total_kv_heads % tp_size != 0
 
@@ -128,6 +154,8 @@ def adjust_config_with_unaligned_cpu_tp(
         pad_size = get_num_heads_padding_size(tp_size, weight_block_size, head_dim)
 
         if is_mqa:
+            # Plain MQA path; grouped-MQA models (with `o_groups`) were already
+            # aligned by the pre-pad above, so they won't reach here.
             # Keep num_key_value_heads == 1 (replicated). Pad attention heads only.
             num_attention_heads = pad_vocab_size(
                 model_config.num_attention_heads, pad_size
@@ -136,15 +164,11 @@ def adjust_config_with_unaligned_cpu_tp(
             query_heads_per_kv = model_config.num_attention_heads // total_kv_heads
             num_key_value_heads = pad_vocab_size(total_kv_heads, pad_size)
 
-            model_config.num_key_value_heads = num_key_value_heads
-            model_config.hf_config.num_key_value_heads = num_key_value_heads
-            model_config.hf_text_config.num_key_value_heads = num_key_value_heads
+            _set_padded_attr(model_config, "num_key_value_heads", num_key_value_heads)
 
             num_attention_heads = num_key_value_heads * query_heads_per_kv
 
-        model_config.num_attention_heads = num_attention_heads
-        model_config.hf_config.num_attention_heads = num_attention_heads
-        model_config.hf_text_config.num_attention_heads = num_attention_heads
+        _set_padded_attr(model_config, "num_attention_heads", num_attention_heads)
 
     intermediate_padding_size = tp_size * get_moe_padding_size(weight_block_size)
     model_config = update_intermediate_size(
