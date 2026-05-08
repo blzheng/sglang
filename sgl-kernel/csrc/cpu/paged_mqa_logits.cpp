@@ -173,6 +173,7 @@ at::Tensor fp8_paged_mqa_logits_cpu(
   TORCH_CHECK(q_fp8.scalar_type() == at::ScalarType::Float8_e4m3fn, "q_fp8 must be torch.float8_e4m3fn");
   TORCH_CHECK(kvcache_fp8.scalar_type() == at::kByte, "kvcache_fp8 must be torch.uint8 storage");
 
+  // The checks are aligned with fp8_paged_mqa_logits_torch in indexer.py.
   TORCH_CHECK(q_fp8.dim() == 4, "q_fp8 must have shape [batch, 1, heads, 128]");
   TORCH_CHECK(q_fp8.size(1) == 1, "q_fp8 second dimension must be 1");
   TORCH_CHECK(q_fp8.size(3) == kHeadDim, "q_fp8 head_dim must be 128");
