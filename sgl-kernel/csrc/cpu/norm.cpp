@@ -1,6 +1,13 @@
 #include "common.h"
 #include "vec.h"
 
+#define SGL_DISPATCH_FP16_BF16_F32_TYPES(TYPE, NAME, ...)                                                         \
+  AT_DISPATCH_SWITCH(                                                                                             \
+      TYPE,                                                                                                       \
+      NAME,                                                                                                       \
+      AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__) AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__) \
+          AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__))
+
 namespace {
 
 // NB: avoid using `at::vec::map<>` on bfloat16 or half
@@ -28,12 +35,17 @@ void l2norm_kernel_impl(
       int64_t d;
 #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        bVec x_bvec = bVec::loadu(input_ptr + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          fVec x_fvec = fVec::loadu(input_ptr + d);
+          sum_fvec += x_fvec * x_fvec;
+        } else {
+          bVec x_bvec = bVec::loadu(input_ptr + d);
+          fVec x_fvec0, x_fvec1;
+          std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
-        sum_fvec += x_fvec0 * x_fvec0;
-        sum_fvec += x_fvec1 * x_fvec1;
+          sum_fvec += x_fvec0 * x_fvec0;
+          sum_fvec += x_fvec1 * x_fvec1;
+        }
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
@@ -47,15 +59,21 @@ void l2norm_kernel_impl(
 
 #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        bVec x_bvec = bVec::loadu(input_ptr + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          fVec x_fvec = fVec::loadu(input_ptr + d);
+          x_fvec = x_fvec * scale_fvec;
+          x_fvec.store(out_ptr + d);
+        } else {
+          bVec x_bvec = bVec::loadu(input_ptr + d);
+          fVec x_fvec0, x_fvec1;
+          std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
-        x_fvec0 = x_fvec0 * scale_fvec;
-        x_fvec1 = x_fvec1 * scale_fvec;
+          x_fvec0 = x_fvec0 * scale_fvec;
+          x_fvec1 = x_fvec1 * scale_fvec;
 
-        bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        out_bvec.store(out_ptr + d);
+          bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+          out_bvec.store(out_ptr + d);
+        }
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
@@ -92,12 +110,17 @@ void rmsnorm_kernel_impl(
       int64_t d;
 #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        bVec x_bvec = bVec::loadu(input_ptr + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          fVec x_fvec = fVec::loadu(input_ptr + d);
+          sum_fvec += x_fvec * x_fvec;
+        } else {
+          bVec x_bvec = bVec::loadu(input_ptr + d);
+          fVec x_fvec0, x_fvec1;
+          std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
-        sum_fvec += x_fvec0 * x_fvec0;
-        sum_fvec += x_fvec1 * x_fvec1;
+          sum_fvec += x_fvec0 * x_fvec0;
+          sum_fvec += x_fvec1 * x_fvec1;
+        }
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
@@ -111,19 +134,26 @@ void rmsnorm_kernel_impl(
 
 #pragma GCC unroll 4
       for (d = 0; d <= hidden_size - kVecSize; d += kVecSize) {
-        bVec x_bvec = bVec::loadu(input_ptr + d);
-        fVec x_fvec0, x_fvec1;
-        std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
+        if constexpr (std::is_same_v<scalar_t, float>) {
+          fVec x_fvec = fVec::loadu(input_ptr + d);
+          fVec w_fvec = fVec::loadu(weight + d);
+          x_fvec = x_fvec * scale_fvec * vf(w_fvec);
+          x_fvec.store(out_ptr + d);
+        } else {
+          bVec x_bvec = bVec::loadu(input_ptr + d);
+          fVec x_fvec0, x_fvec1;
+          std::tie(x_fvec0, x_fvec1) = at::vec::convert_to_float(x_bvec);
 
-        bVec w_bvec = bVec::loadu(weight + d);
-        fVec w_fvec0, w_fvec1;
-        std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
+          bVec w_bvec = bVec::loadu(weight + d);
+          fVec w_fvec0, w_fvec1;
+          std::tie(w_fvec0, w_fvec1) = at::vec::convert_to_float(w_bvec);
 
-        x_fvec0 = x_fvec0 * scale_fvec * vf(w_fvec0);
-        x_fvec1 = x_fvec1 * scale_fvec * vf(w_fvec1);
+          x_fvec0 = x_fvec0 * scale_fvec * vf(w_fvec0);
+          x_fvec1 = x_fvec1 * scale_fvec * vf(w_fvec1);
 
-        bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
-        out_bvec.store(out_ptr + d);
+          bVec out_bvec = convert_from_float_ext<scalar_t>(x_fvec0, x_fvec1);
+          out_bvec.store(out_ptr + d);
+        }
       }
 #pragma GCC unroll 4
       for (; d < hidden_size; ++d) {
@@ -506,7 +536,7 @@ at::Tensor l2norm_cpu(at::Tensor& input, double eps) {
   int64_t hidden_size = input.size(1);
   at::Tensor output = at::empty_like(input);
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "l2norm_kernel", [&] {
+  SGL_DISPATCH_FP16_BF16_F32_TYPES(input.scalar_type(), "l2norm_kernel", [&] {
     l2norm_kernel_impl<scalar_t>(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), batch_size, hidden_size, eps);
   });
   return output;
@@ -527,7 +557,7 @@ at::Tensor rmsnorm_cpu(at::Tensor& input, at::Tensor& weight, double eps) {
   at::Tensor output = at::empty_like(input);
   int64_t input_strideN = input.stride(0);
 
-  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "rmsnorm_kernel", [&] {
+  SGL_DISPATCH_FP16_BF16_F32_TYPES(input.scalar_type(), "rmsnorm_kernel", [&] {
     using Vec = at::vec::Vectorized<float>;
     rmsnorm_kernel_impl<scalar_t>(
         output.data_ptr<scalar_t>(),
@@ -809,3 +839,5 @@ void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor
         eps);
   });
 }
+
+#undef SGL_DISPATCH_FP16_BF16_F32_TYPES
