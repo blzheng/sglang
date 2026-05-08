@@ -26,12 +26,73 @@ constexpr float QUANT_FP8_MAX = 448.0f;
 constexpr float QUANT_FP8_MIN = -448.0f;
 constexpr float QUANT_EPS = 1e-4f;
 
-// Float to fp8_e4m3fn using PyTorch's conversion for correctness
+// Float to fp8_e4m3fn using PyTorch's conversion (scalar fallback)
 inline uint8_t float_to_fp8_e4m3fn(float val) {
   return at::Float8_e4m3fn(val).x;
 }
 
 #if defined(CPU_CAPABILITY_AVX512)
+
+// Vectorized float32x16 -> fp8_e4m3fn x16 using AVX512 bit manipulation.
+// Implements RNE (round-to-nearest-even). Flushes subnormal fp8 to zero
+// (safe because SGLANG_CPU_FP8_CVT_FTZ flushes them on decode too).
+// fp8_e4m3fn: sign(1), exp(4, bias=7), mant(3), no inf/nan special values.
+// Normal: exp_field in [1..15], value = 2^(exp-7) * (1 + mant/8)
+// Input assumed clamped to [-448, 448].
+inline __m128i cvt_fp32x16_to_fp8x16(__m512 input) {
+  __m512i bits = _mm512_castps_si512(input);
+
+  // Extract sign -> bit 7 of fp8 byte
+  __m512i signs = _mm512_srli_epi32(_mm512_and_si512(bits, _mm512_set1_epi32(0x80000000)), 24);
+
+  // Absolute value bits
+  __m512i abs_bits = _mm512_and_si512(bits, _mm512_set1_epi32(0x7FFFFFFF));
+
+  // Float32 biased exponent
+  __m512i f32_exp = _mm512_srli_epi32(abs_bits, 23);
+
+  // Float32 mantissa (23 bits)
+  __m512i f32_mant = _mm512_and_si512(abs_bits, _mm512_set1_epi32(0x7FFFFF));
+
+  // fp8_exp = f32_exp - 120 (rebias from 127 to 7)
+  __m512i fp8_exp = _mm512_sub_epi32(f32_exp, _mm512_set1_epi32(120));
+
+  // Top 3 mantissa bits
+  __m512i mant3 = _mm512_srli_epi32(f32_mant, 20);
+
+  // RNE rounding: round_bit = bit 19, sticky = bits[18:0]
+  __m512i round_bit = _mm512_and_si512(_mm512_srli_epi32(f32_mant, 19), _mm512_set1_epi32(1));
+  __m512i sticky_bits = _mm512_and_si512(f32_mant, _mm512_set1_epi32(0x7FFFF));
+  __mmask16 has_sticky = _mm512_cmpneq_epi32_mask(sticky_bits, _mm512_setzero_si512());
+
+  // Round up if round_bit AND (sticky OR lsb_of_mant3)
+  __m512i lsb = _mm512_and_si512(mant3, _mm512_set1_epi32(1));
+  __m512i sticky_or_lsb = _mm512_or_si512(
+      _mm512_maskz_mov_epi32(has_sticky, _mm512_set1_epi32(1)), lsb);
+  __m512i do_round = _mm512_and_si512(round_bit, sticky_or_lsb);
+  mant3 = _mm512_add_epi32(mant3, do_round);
+
+  // Mantissa overflow (mant3 == 8) -> increment exponent, zero mantissa
+  __mmask16 mant_ovf = _mm512_cmpeq_epi32_mask(mant3, _mm512_set1_epi32(8));
+  mant3 = _mm512_mask_mov_epi32(mant3, mant_ovf, _mm512_setzero_si512());
+  fp8_exp = _mm512_mask_add_epi32(fp8_exp, mant_ovf, fp8_exp, _mm512_set1_epi32(1));
+
+  // Clamp exponent: max 15
+  fp8_exp = _mm512_min_epi32(fp8_exp, _mm512_set1_epi32(15));
+
+  // Result: (fp8_exp << 3) | mant3
+  __m512i result = _mm512_or_si512(_mm512_slli_epi32(fp8_exp, 3), mant3);
+
+  // Flush to zero: if f32_exp < 121 (would be subnormal in fp8), output 0
+  __mmask16 is_subnormal_or_zero = _mm512_cmplt_epi32_mask(f32_exp, _mm512_set1_epi32(121));
+  result = _mm512_mask_mov_epi32(result, is_subnormal_or_zero, _mm512_setzero_si512());
+
+  // Add sign
+  result = _mm512_or_si512(result, signs);
+
+  // Pack 16 x i32 -> 16 x i8
+  return _mm512_cvtepi32_epi8(result);
+}
 
 // Process one tile (64 bf16 values): find amax, compute scale, quantize to fp8
 inline uint8_t quantize_tile_avx512(
@@ -86,20 +147,16 @@ inline uint8_t quantize_tile_avx512(
   s2 = _mm512_max_ps(_mm512_min_ps(s2, vmax), vmin);
   s3 = _mm512_max_ps(_mm512_min_ps(s3, vmax), vmin);
 
-  // Convert float -> fp8
-  alignas(64) float buf[16];
+  // Vectorized float -> fp8 conversion (16 values at a time)
+  __m128i fp8_0 = cvt_fp32x16_to_fp8x16(s0);
+  __m128i fp8_1 = cvt_fp32x16_to_fp8x16(s1);
+  __m128i fp8_2 = cvt_fp32x16_to_fp8x16(s2);
+  __m128i fp8_3 = cvt_fp32x16_to_fp8x16(s3);
 
-  _mm512_store_ps(buf, s0);
-  for (int j = 0; j < 16; ++j) dst[j] = float_to_fp8_e4m3fn(buf[j]);
-
-  _mm512_store_ps(buf, s1);
-  for (int j = 0; j < 16; ++j) dst[16 + j] = float_to_fp8_e4m3fn(buf[j]);
-
-  _mm512_store_ps(buf, s2);
-  for (int j = 0; j < 16; ++j) dst[32 + j] = float_to_fp8_e4m3fn(buf[j]);
-
-  _mm512_store_ps(buf, s3);
-  for (int j = 0; j < 16; ++j) dst[48 + j] = float_to_fp8_e4m3fn(buf[j]);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(dst), fp8_0);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 16), fp8_1);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 32), fp8_2);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 48), fp8_3);
 
   return scale_uint8;
 }
@@ -171,7 +228,7 @@ void set_k_and_s_cpu(
   const int32_t* loc_i32 = loc_is_int64 ? nullptr : loc.data_ptr<int32_t>();
   const int64_t* loc_i64 = loc_is_int64 ? loc.data_ptr<int64_t>() : nullptr;
 
-  at::parallel_for(0, num_tokens, 1, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     for (int64_t i = begin; i < end; ++i) {
       const int64_t token_loc = loc_is_int64 ? loc_i64[i] : static_cast<int64_t>(loc_i32[i]);
       const int64_t page_idx = token_loc / page_size;
@@ -258,7 +315,7 @@ quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16) {
   at::BFloat16* rope_ptr = k_rope_bf16.data_ptr<at::BFloat16>();
   uint8_t* scale_ptr = scale_out.data_ptr<uint8_t>();
 
-  at::parallel_for(0, num_tokens, /*grain_size=*/64, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
     for (int64_t t = begin; t < end; ++t) {
       const at::BFloat16* src_token = input_ptr + t * 512;
 

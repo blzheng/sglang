@@ -171,7 +171,7 @@ void fast_hadamard_transform_kernel_impl(
     int64_t rows,
     int64_t n,
     float scale) {
-  at::parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, rows, 0, [&](int64_t begin, int64_t end) {
     float* buf = nullptr;
     std::vector<float> scratch;
     if constexpr (!std::is_same_v<scalar_t, float>) {
