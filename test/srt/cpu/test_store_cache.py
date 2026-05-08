@@ -138,5 +138,115 @@ class TestSetKAndS(CustomTestCase):
         torch.testing.assert_close(buf_ref, buf_test)
 
 
+# ===========================================================================
+# Reference for quant_to_nope_fp8_rope_bf16_pack
+# ===========================================================================
+
+def _cast_scale_inv_to_ue8m0(scales_inv, out_dtype=torch.float32):
+    return torch.pow(2, torch.clamp_min(scales_inv, 1e-4).log2().ceil()).to(out_dtype)
+
+
+def quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16):
+    """Reference implementation from quant_k_cache_v4.py."""
+    assert k_bf16.dtype == torch.bfloat16
+    _num_tokens, hidden_dim = k_bf16.shape
+    assert hidden_dim == 512
+    dim_nope = 448
+    dim_rope = 64
+
+    k_nope_bf16, k_rope_bf16 = k_bf16.split([dim_nope, dim_rope], dim=-1)
+
+    tile_size = 64
+    num_tiles = dim_nope // tile_size
+
+    x = k_nope_bf16.contiguous().view(-1, num_tiles, tile_size)
+    scale = x.abs().amax(dim=-1).float() / 448.0
+    scale_pow2_fp32 = _cast_scale_inv_to_ue8m0(scale, out_dtype=torch.float32)
+    scale_k_nope_ue8m0 = scale_pow2_fp32.to(torch.float8_e8m0fnu)
+    k_nope_fp8 = (x.float() / scale_pow2_fp32.unsqueeze(-1)).to(fp8_dtype)
+    k_nope_fp8 = k_nope_fp8.view(-1, tile_size * num_tiles)
+    scale_k_nope_ue8m0 = scale_k_nope_ue8m0.view(torch.uint8)
+
+    return k_nope_fp8, k_rope_bf16.contiguous(), scale_k_nope_ue8m0
+
+
+class TestQuantToNopeFp8RopeBf16Pack(CustomTestCase):
+    num_tokens_list = [1, 7, 32, 128, 512]
+
+    def _test_quant(self, num_tokens):
+        k_bf16 = torch.randn(num_tokens, 512, dtype=torch.bfloat16)
+
+        ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
+        cpp_nope, cpp_rope, cpp_scale = (
+            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+        )
+
+        torch.testing.assert_close(ref_rope, cpp_rope)
+        torch.testing.assert_close(ref_scale, cpp_scale)
+        torch.testing.assert_close(
+            ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8)
+        )
+
+    def test_quant_various_sizes(self):
+        for num_tokens in self.num_tokens_list:
+            with self.subTest(num_tokens=num_tokens):
+                self._test_quant(num_tokens)
+
+    def test_quant_small_values(self):
+        """Test with very small values that exercise the EPS clamp."""
+        k_bf16 = torch.randn(16, 512, dtype=torch.bfloat16) * 1e-6
+        ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
+        cpp_nope, cpp_rope, cpp_scale = (
+            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+        )
+        torch.testing.assert_close(ref_rope, cpp_rope)
+        torch.testing.assert_close(ref_scale, cpp_scale)
+        torch.testing.assert_close(
+            ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8)
+        )
+
+    def test_quant_large_values(self):
+        """Test with large values."""
+        k_bf16 = torch.randn(16, 512, dtype=torch.bfloat16) * 100.0
+        ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
+        cpp_nope, cpp_rope, cpp_scale = (
+            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+        )
+        torch.testing.assert_close(ref_rope, cpp_rope)
+        torch.testing.assert_close(ref_scale, cpp_scale)
+        torch.testing.assert_close(
+            ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8)
+        )
+
+    def test_quant_zeros(self):
+        """Test with zero input."""
+        k_bf16 = torch.zeros(8, 512, dtype=torch.bfloat16)
+        ref_nope, ref_rope, ref_scale = quant_to_nope_fp8_rope_bf16_pack_ref(k_bf16)
+        cpp_nope, cpp_rope, cpp_scale = (
+            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+        )
+        torch.testing.assert_close(ref_rope, cpp_rope)
+        torch.testing.assert_close(ref_scale, cpp_scale)
+        torch.testing.assert_close(
+            ref_nope.view(torch.uint8), cpp_nope.view(torch.uint8)
+        )
+
+    def test_output_shapes_and_dtypes(self):
+        """Verify output shapes and dtypes."""
+        num_tokens = 16
+        k_bf16 = torch.randn(num_tokens, 512, dtype=torch.bfloat16)
+        cpp_nope, cpp_rope, cpp_scale = (
+            torch.ops.sgl_kernel.quant_to_nope_fp8_rope_bf16_pack_cpu(k_bf16)
+        )
+
+        self.assertEqual(cpp_nope.shape, (num_tokens, 448))
+        self.assertEqual(cpp_rope.shape, (num_tokens, 64))
+        self.assertEqual(cpp_scale.shape, (num_tokens, 7))
+
+        self.assertEqual(cpp_nope.dtype, fp8_dtype)
+        self.assertEqual(cpp_rope.dtype, torch.bfloat16)
+        self.assertEqual(cpp_scale.dtype, torch.uint8)
+
+
 if __name__ == "__main__":
     unittest.main()

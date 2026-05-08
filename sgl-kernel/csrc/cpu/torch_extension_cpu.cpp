@@ -365,6 +365,10 @@ void set_k_and_s_cpu(
     at::Tensor& scale_k_nope,
     int64_t page_size);
 
+// quant_to_nope_fp8_rope_bf16_pack
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16);
+
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log,
@@ -612,6 +616,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "set_k_and_s_cpu(Tensor(a!) buf, Tensor loc, Tensor k_nope, Tensor k_rope, "
       "Tensor scale_k_nope, int page_size) -> ()");
   m.impl("set_k_and_s_cpu", torch::kCPU, &set_k_and_s_cpu);
+
+  // quant_to_nope_fp8_rope_bf16_pack
+  m.def(
+      "quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");
+  m.impl("quant_to_nope_fp8_rope_bf16_pack_cpu", torch::kCPU, &quant_to_nope_fp8_rope_bf16_pack_cpu);
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(
