@@ -3,158 +3,209 @@
 
 namespace {
 
-// ──────────────────────────────────────────────────────────────────────
-// Iterative Cooley-Tukey-style Fast Walsh-Hadamard Transform (FWHT)
-// along the last dimension.  n must be a power of two.
-//
-// For each row of length n the butterfly loop is:
-//   for h = 1, 2, 4, …, n/2
-//     for every pair (a[j], b[j]) separated by stride h
-//       (a[j], b[j]) ← (a[j]+b[j], a[j]−b[j])
-//
-// When h >= 16 (== 512-bit / sizeof(float)) we can do the butterfly
-// entirely with AVX-512 loads/stores.  The inner two cases (h < 16)
-// use in-register shuffles so we never spill to memory at small
-// strides.
-// ──────────────────────────────────────────────────────────────────────
+using fVec = at::vec::Vectorized<float>;
 
-// Scalar fallback for a single row of length n
-inline void fwht_row_scalar(float* __restrict__ row, int64_t n, float scale) {
-  for (int64_t h = 1; h < n; h <<= 1) {
-    for (int64_t j = 0; j < n; j += 2 * h) {
-      for (int64_t k = 0; k < h; ++k) {
-        float a = row[j + k];
-        float b = row[j + k + h];
-        row[j + k]     = a + b;
-        row[j + k + h] = a - b;
-      }
-    }
+// ── Unified scalar FWHT ──
+// For float: buf unused, work=out; casts are no-ops.
+// For bf16/f16: work=buf as scratch; casts do dtype conversion.
+template <typename scalar_t>
+inline void fwht_row_scalar(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ in,
+    float* __restrict__ buf,
+    int64_t n,
+    float scale) {
+  if (n == 1) {
+    out[0] = static_cast<scalar_t>(static_cast<float>(in[0]) * scale);
+    return;
   }
-  for (int64_t d = 0; d < n; ++d) {
-    row[d] *= scale;
+  if (n == 2) {
+    float a = static_cast<float>(in[0]), b = static_cast<float>(in[1]);
+    out[0] = static_cast<scalar_t>((a + b) * scale);
+    out[1] = static_cast<scalar_t>((a - b) * scale);
+    return;
+  }
+  float* work;
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    work = out;
+  } else {
+    work = buf;
+  }
+  // h=1: read from in → work
+  for (int64_t j = 0; j < n; j += 2) {
+    float a = static_cast<float>(in[j]), b = static_cast<float>(in[j + 1]);
+    work[j]     = a + b;
+    work[j + 1] = a - b;
+  }
+  // h=2..n/4: in-place on work
+  const int64_t last_h = n >> 1;
+  for (int64_t h = 2; h < last_h; h <<= 1)
+    for (int64_t j = 0; j < n; j += 2 * h)
+      for (int64_t k = 0; k < h; ++k) {
+        float a = work[j + k], b = work[j + k + h];
+        work[j + k]     = a + b;
+        work[j + k + h] = a - b;
+      }
+  // h=n/2: butterfly + scale → out
+  for (int64_t k = 0; k < last_h; ++k) {
+    float a = work[k], b = work[k + last_h];
+    out[k]          = static_cast<scalar_t>((a + b) * scale);
+    out[k + last_h] = static_cast<scalar_t>((a - b) * scale);
   }
 }
 
 #if defined(CPU_CAPABILITY_AVX512)
 
-// AVX-512 optimized FWHT for a single row of length n (power of 2, n >= 16)
-inline void fwht_row_avx512(float* __restrict__ row, int64_t n, float scale) {
-  // For small strides (h < 16), we process 16 floats at a time using
-  // in-register shuffles to do butterflies without extra loads/stores.
-  // For h >= 16, we do standard load-butterfly-store with AVX-512.
+// Phase-1: in-register butterflies h=1,2,4,8.
+// Requires permute/blend intrinsics with no Vectorized equivalent.
+static inline __m512 fwht_phase1_fused(__m512 v) {
+  __m512 p, s, d;
+  p = _mm512_permute_ps(v, 0b10'11'00'01);                          // h=1
+  s = _mm512_add_ps(v, p); d = _mm512_sub_ps(p, v);
+  v = _mm512_mask_blend_ps((__mmask16)0xAAAA, s, d);
+  p = _mm512_permute_ps(v, 0b01'00'11'10);                          // h=2
+  s = _mm512_add_ps(v, p); d = _mm512_sub_ps(p, v);
+  v = _mm512_mask_blend_ps((__mmask16)0xCCCC, s, d);
+  p = _mm512_permutexvar_ps(                                         // h=4
+      _mm512_set_epi32(11,10,9,8, 15,14,13,12, 3,2,1,0, 7,6,5,4), v);
+  s = _mm512_add_ps(v, p); d = _mm512_sub_ps(p, v);
+  v = _mm512_mask_blend_ps((__mmask16)0xF0F0, s, d);
+  p = _mm512_permutexvar_ps(                                         // h=8
+      _mm512_set_epi32(7,6,5,4, 3,2,1,0, 15,14,13,12, 11,10,9,8), v);
+  s = _mm512_add_ps(v, p); d = _mm512_sub_ps(p, v);
+  v = _mm512_mask_blend_ps((__mmask16)0xFF00, s, d);
+  return v;
+}
 
-  // Phase 1: h = 1, 2, 4, 8 — in-register butterflies
-  // Process the row in chunks of 16 floats.
-  // For h=1: butterfly pairs at stride 1 within each 16-float chunk.
-  // For h=2: butterfly pairs at stride 2 within each 16-float chunk.
-  // etc.
+// fVec wrapper for fwht_phase1_fused
+static inline fVec fwht_phase1(fVec v) {
+  return fVec(fwht_phase1_fused(__m512(v)));
+}
 
-  for (int64_t h = 1; h < 16 && h < n; h <<= 1) {
-    for (int64_t j = 0; j < n; j += 16) {
-      __m512 v = _mm512_loadu_ps(row + j);
+// ── Vectorized dtype conversion (16 elements) ──
+// For float: identity load/store. For bf16/f16: intrinsic conversion.
+template <typename scalar_t> static inline fVec load_cvt(const scalar_t*);
+template <typename scalar_t> static inline void store_cvt(scalar_t*, fVec);
 
-      // Shuffle to get the paired element.
-      // For stride h, element i is paired with element i^h.
-      // We need to swap elements that differ in bit position log2(h).
-      __m512 paired;
-      if (h == 1) {
-        // swap adjacent: 0↔1, 2↔3, 4↔5, …
-        paired = _mm512_permute_ps(v, 0b10'11'00'01);
-      } else if (h == 2) {
-        // swap pairs: (0,1)↔(2,3), (4,5)↔(6,7), …
-        paired = _mm512_permute_ps(v, 0b01'00'11'10);
-      } else if (h == 4) {
-        // swap quads: (0..3)↔(4..7) within each 256-bit half
-        paired = _mm512_permutexvar_ps(
-            _mm512_set_epi32(11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4), v);
-      } else {  // h == 8
-        // swap octets: (0..7)↔(8..15)
-        paired = _mm512_permutexvar_ps(
-            _mm512_set_epi32(7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8), v);
+template <> inline fVec load_cvt<float>(const float* p) {
+  return fVec::loadu(p);
+}
+template <> inline fVec load_cvt<at::BFloat16>(const at::BFloat16* p) {
+  return fVec(CVT_BF16_TO_FP32(
+      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p))));
+}
+template <> inline fVec load_cvt<at::Half>(const at::Half* p) {
+  return fVec(CVT_FP16_TO_FP32(
+      _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p))));
+}
+template <> inline void store_cvt<float>(float* p, fVec v) {
+  v.store(p);
+}
+template <> inline void store_cvt<at::BFloat16>(at::BFloat16* p, fVec v) {
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(p),
+      (__m256i)_mm512_cvtneps_pbh(__m512(v)));
+}
+template <> inline void store_cvt<at::Half>(at::Half* p, fVec v) {
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(p),
+      _mm512_cvtps_ph(__m512(v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+}
+
+// Phase-2: h=16..last_h-1 vectorized butterflies on float buffer.
+static inline void fwht_phase2(float* __restrict__ buf, int64_t n, int64_t last_h) {
+  for (int64_t h = 16; h < last_h; h <<= 1)
+    for (int64_t j = 0; j < n; j += 2 * h)
+      for (int64_t k = 0; k < h; k += fVec::size()) {
+        fVec a = fVec::loadu(buf + j + k);
+        fVec b = fVec::loadu(buf + j + k + h);
+        (a + b).store(buf + j + k);
+        (a - b).store(buf + j + k + h);
       }
+}
 
-      // For the "first" slot (bit log2(h) == 0): v[i]=a, paired[i]=b → sum = a+b
-      // For the "second" slot (bit log2(h) == 1): v[i]=b, paired[i]=a → diff = a-b
-      __m512 sum  = _mm512_add_ps(v, paired);
-      __m512 diff = _mm512_sub_ps(paired, v);  // paired - v = a - b for second slots
-
-      // Blend: for indices where bit log2(h) is 0, take sum; else take diff.
-      __mmask16 mask;
-      if (h == 1) {
-        mask = 0xAAAA;  // bits: 1010 1010 1010 1010  (odd positions)
-      } else if (h == 2) {
-        mask = 0xCCCC;  // bits: 1100 1100 1100 1100
-      } else if (h == 4) {
-        mask = 0xF0F0;  // bits: 1111 0000 1111 0000
-      } else {  // h == 8
-        mask = 0xFF00;  // bits: 1111 1111 0000 0000
-      }
-      __m512 result = _mm512_mask_blend_ps(mask, sum, diff);
-      _mm512_storeu_ps(row + j, result);
-    }
+// Unified AVX-512 FWHT with optional dtype conversion.
+// For float: load_cvt/store_cvt are identity, work=out.
+// For bf16/f16: load_cvt/store_cvt handle conversion, work=buf.
+template <typename scalar_t>
+inline void fwht_row_avx512(
+    scalar_t* __restrict__ out,
+    const scalar_t* __restrict__ in,
+    float* __restrict__ buf,
+    int64_t n,
+    float scale) {
+  fVec sv(scale);
+  if (n == 16) {
+    store_cvt(out, fwht_phase1(load_cvt(in)) * sv);
+    return;
   }
 
-  // Phase 2: h >= 16 — standard load-add/sub-store
-  for (int64_t h = 16; h < n; h <<= 1) {
-    for (int64_t j = 0; j < n; j += 2 * h) {
-      for (int64_t k = 0; k < h; k += 16) {
-        __m512 a = _mm512_loadu_ps(row + j + k);
-        __m512 b = _mm512_loadu_ps(row + j + k + h);
-        _mm512_storeu_ps(row + j + k,     _mm512_add_ps(a, b));
-        _mm512_storeu_ps(row + j + k + h, _mm512_sub_ps(a, b));
-      }
-    }
+  float* work;
+  if constexpr (std::is_same_v<scalar_t, float>) {
+    work = out;
+  } else {
+    work = buf;
   }
 
-  // Apply scale
-  __m512 scale_vec = _mm512_set1_ps(scale);
-  int64_t d = 0;
-  for (; d <= n - 16; d += 16) {
-    __m512 v = _mm512_loadu_ps(row + d);
-    _mm512_storeu_ps(row + d, _mm512_mul_ps(v, scale_vec));
-  }
-  for (; d < n; ++d) {
-    row[d] *= scale;
+  // Phase 1: load (+ convert) → fused butterflies → work
+  for (int64_t j = 0; j < n; j += fVec::size())
+    fwht_phase1(load_cvt(in + j)).store(work + j);
+
+  // Phase 2: h=16..n/4 butterflies on work
+  const int64_t last_h = n >> 1;
+  fwht_phase2(work, n, last_h);
+
+  // Last stage: butterfly + scale (+ convert) → out
+  for (int64_t k = 0; k < last_h; k += fVec::size()) {
+    fVec a = fVec::loadu(work + k);
+    fVec b = fVec::loadu(work + k + last_h);
+    store_cvt(out + k,          (a + b) * sv);
+    store_cvt(out + k + last_h, (a - b) * sv);
   }
 }
 
 #endif  // CPU_CAPABILITY_AVX512
 
+template <typename scalar_t>
+void fast_hadamard_transform_kernel_impl(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ input,
+    int64_t rows,
+    int64_t n,
+    float scale) {
+  at::parallel_for(0, rows, 1, [&](int64_t begin, int64_t end) {
+    float* buf = nullptr;
+    std::vector<float> scratch;
+    if constexpr (!std::is_same_v<scalar_t, float>) {
+      scratch.resize(n);
+      buf = scratch.data();
+    }
+    for (int64_t r = begin; r < end; ++r) {
+#if defined(CPU_CAPABILITY_AVX512)
+      if (n >= 16)
+        fwht_row_avx512(output + r * n, input + r * n, buf, n, scale);
+      else
+#endif
+        fwht_row_scalar(output + r * n, input + r * n, buf, n, scale);
+    }
+  });
+}
+
 }  // anonymous namespace
 
-// ──────────────────────────────────────────────────────────────────────
-// fast_hadamard_transform_cpu
-//
-// Input:  x      – arbitrary-shape tensor whose last dim is a power of 2
-//         scale  – multiplicative scale applied after the transform
-// Output: tensor of same shape/dtype with FWHT applied along the last dim
-// ──────────────────────────────────────────────────────────────────────
 at::Tensor fast_hadamard_transform_cpu(const at::Tensor& x, double scale) {
+  CHECK_INPUT(x);
   const int64_t n = x.size(-1);
   TORCH_CHECK(n > 0 && (n & (n - 1)) == 0,
               "fast_hadamard_transform: last dim must be a power of 2, got ", n);
 
-  // Flatten to 2-D, work in float, then cast back.
   const int64_t rows = x.numel() / n;
-  auto x_flat = x.reshape({rows, n}).to(at::kFloat).contiguous();
-  auto out = x_flat.clone();  // mutable working copy
-  float* out_ptr = out.data_ptr<float>();
+  auto out = at::empty_like(x);
+  const float s = static_cast<float>(scale);
 
-  at::parallel_for(0, rows, /*grain_size=*/1, [&](int64_t begin, int64_t end) {
-    for (int64_t r = begin; r < end; ++r) {
-      float* row = out_ptr + r * n;
-#if defined(CPU_CAPABILITY_AVX512)
-      if (n >= 16) {
-        fwht_row_avx512(row, n, static_cast<float>(scale));
-      } else {
-        fwht_row_scalar(row, n, static_cast<float>(scale));
-      }
-#else
-      fwht_row_scalar(row, n, static_cast<float>(scale));
-#endif
-    }
+  CPU_DISPATCH_FLOATING_TYPES(x.scalar_type(),
+      "fast_hadamard_transform_cpu", [&] {
+    fast_hadamard_transform_kernel_impl<scalar_t>(
+        out.data_ptr<scalar_t>(), x.data_ptr<scalar_t>(), rows, n, s);
   });
 
-  // Reshape back and cast to original dtype.
-  return out.view(x.sizes()).to(x.scalar_type());
+  return out;
 }
