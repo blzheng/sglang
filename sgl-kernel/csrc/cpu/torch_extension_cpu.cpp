@@ -58,6 +58,10 @@ at::Tensor fused_add_layernorm_cpu(
 // topk
 std::tuple<at::Tensor, at::Tensor>
 topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
+
+// hadamard transform
+at::Tensor fast_hadamard_transform_cpu(const at::Tensor& x, double scale);
+
 std::tuple<at::Tensor, at::Tensor>
 topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
 
@@ -382,6 +386,19 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
+// set_k_and_s
+void set_k_and_s_cpu(
+    at::Tensor& buf,
+    at::Tensor& loc,
+    at::Tensor& k_nope,
+    at::Tensor& k_rope,
+    at::Tensor& scale_k_nope,
+    int64_t page_size);
+
+// quant_to_nope_fp8_rope_bf16_pack
+std::tuple<at::Tensor, at::Tensor, at::Tensor>
+quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16);
+
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log,
@@ -670,6 +687,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // hadamard transform
+  m.def("fast_hadamard_transform_cpu(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_cpu", torch::kCPU, &fast_hadamard_transform_cpu);
+
+  // set_k_and_s
+  m.def(
+      "set_k_and_s_cpu(Tensor(a!) buf, Tensor loc, Tensor k_nope, Tensor k_rope, "
+      "Tensor scale_k_nope, int page_size) -> ()");
+  m.impl("set_k_and_s_cpu", torch::kCPU, &set_k_and_s_cpu);
+
+  // quant_to_nope_fp8_rope_bf16_pack
+  m.def(
+      "quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");
+  m.impl("quant_to_nope_fp8_rope_bf16_pack_cpu", torch::kCPU, &quant_to_nope_fp8_rope_bf16_pack_cpu);
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(
