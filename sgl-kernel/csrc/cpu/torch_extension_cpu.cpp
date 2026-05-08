@@ -356,6 +356,15 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
+// set_k_and_s
+void set_k_and_s_cpu(
+    at::Tensor& buf,
+    at::Tensor& loc,
+    at::Tensor& k_nope,
+    at::Tensor& k_rope,
+    at::Tensor& scale_k_nope,
+    int64_t page_size);
+
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log,
@@ -597,6 +606,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // hadamard transform
   m.def("fast_hadamard_transform_cpu(Tensor x, float scale) -> Tensor");
   m.impl("fast_hadamard_transform_cpu", torch::kCPU, &fast_hadamard_transform_cpu);
+
+  // set_k_and_s
+  m.def(
+      "set_k_and_s_cpu(Tensor(a!) buf, Tensor loc, Tensor k_nope, Tensor k_rope, "
+      "Tensor scale_k_nope, int page_size) -> ()");
+  m.impl("set_k_and_s_cpu", torch::kCPU, &set_k_and_s_cpu);
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(
