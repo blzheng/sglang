@@ -1,3 +1,5 @@
+#include <type_traits>
+
 #include "common.h"
 #include "vec.h"
 
@@ -517,12 +519,12 @@ static inline void apply_rotary_emb_row(
 #endif
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename index_t>
 static void apply_rotary_emb_impl(
     scalar_t* __restrict__ q,
     scalar_t* __restrict__ k,
     const float* __restrict__ freqs,
-    const int64_t* __restrict__ positions,
+    const index_t* __restrict__ positions,
     int64_t T,
     int64_t q_nh,
     int64_t k_nh,
@@ -553,7 +555,7 @@ static void apply_rotary_emb_impl(
     for (int64_t i = begin; i < end; ++i) {
       const int64_t t = i / max_nh;
       const int64_t h = i % max_nh;
-      const int64_t freq_t = positions == nullptr ? t : positions[t * positions_stride];
+      const int64_t freq_t = positions == nullptr ? t : static_cast<int64_t>(positions[t * positions_stride]);
       const float* fp = freqs + freq_t * freqs_stride_t;
       const bool do_q = h < q_nh;
       const bool do_k = k != nullptr && h < k_nh;
@@ -642,7 +644,9 @@ at::Tensor apply_rotary_emb_interleaved_cpu(
     TORCH_CHECK(pos.device().is_cpu(), "apply_rotary_emb_interleaved_cpu: positions must be on CPU");
     TORCH_CHECK(pos.dim() == 1, "apply_rotary_emb_interleaved_cpu: positions must be 1D [T]");
     TORCH_CHECK(pos.size(0) == T, "apply_rotary_emb_interleaved_cpu: positions must have shape [T]");
-    TORCH_CHECK(pos.scalar_type() == at::kLong, "apply_rotary_emb_interleaved_cpu: positions must be int64");
+    TORCH_CHECK(
+        pos.scalar_type() == at::kLong || pos.scalar_type() == at::kInt,
+        "apply_rotary_emb_interleaved_cpu: positions must be int64 or int32");
   } else {
     TORCH_CHECK(freqs_real.size(0) == T, "apply_rotary_emb_interleaved_cpu: freqs must have shape [T, rope_dim]");
   }
@@ -678,8 +682,8 @@ at::Tensor apply_rotary_emb_interleaved_cpu(
   const int64_t x_stride_t = x.stride(0);
   const int64_t x_stride_h = x.dim() == 3 ? x.stride(1) : 0;
   const int64_t freqs_stride_t = freqs_real.stride(0);
-  const int64_t* positions_ptr = has_positions ? positions.value().data_ptr<int64_t>() : nullptr;
   const int64_t positions_stride = has_positions ? positions.value().stride(0) : 0;
+  const bool pos_i64 = has_positions && positions.value().scalar_type() == at::kLong;
 
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kBFloat16, at::kHalf, x.scalar_type(), "apply_rotary_emb_interleaved_cpu", [&] {
     scalar_t* k_ptr = nullptr;
@@ -687,22 +691,31 @@ at::Tensor apply_rotary_emb_interleaved_cpu(
       k_ptr = k_opt.value().data_ptr<scalar_t>();
     }
 
-    apply_rotary_emb_impl<scalar_t>(
-        x.data_ptr<scalar_t>(),
-        k_ptr,
-        freqs_real.data_ptr<float>(),
-        positions_ptr,
-        T,
-        nh,
-        k_nh,
-        rope_dim,
-        x_stride_t,
-        x_stride_h,
-        k_stride_t,
-        k_stride_h,
-        freqs_stride_t,
-        positions_stride,
-        inverse);
+    auto run_with_positions = [&](const auto* positions_ptr) {
+      using index_t = typename std::remove_cv<typename std::remove_pointer<decltype(positions_ptr)>::type>::type;
+      apply_rotary_emb_impl<scalar_t, index_t>(
+          x.data_ptr<scalar_t>(),
+          k_ptr,
+          freqs_real.data_ptr<float>(),
+          positions_ptr,
+          T,
+          nh,
+          k_nh,
+          rope_dim,
+          x_stride_t,
+          x_stride_h,
+          k_stride_t,
+          k_stride_h,
+          freqs_stride_t,
+          positions_stride,
+          inverse);
+    };
+
+    if (!has_positions || pos_i64) {
+      run_with_positions(has_positions ? positions.value().data_ptr<int64_t>() : nullptr);
+    } else {
+      run_with_positions(positions.value().data_ptr<int32_t>());
+    }
   });
   return x;
 }
