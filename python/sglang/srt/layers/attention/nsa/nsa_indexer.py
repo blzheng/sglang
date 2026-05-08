@@ -11,6 +11,7 @@ from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     add_prefix,
     ceil_align,
     get_device_sm,
@@ -23,6 +24,7 @@ from sglang.srt.utils import (
 
 global _use_multi_stream
 _is_cuda = is_cuda()
+_is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _is_sm103 = _is_cuda and get_device_sm() == 103
 _is_npu = is_npu()
@@ -149,7 +151,9 @@ def _torch_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     if _is_hip or _is_sm103:
         from fast_hadamard_transform import hadamard_transform
-    elif _is_xpu or _is_cpu:
+    elif _is_cpu and _is_cpu_amx_available:
+        hadamard_transform = torch.ops.sgl_kernel.fast_hadamard_transform_cpu
+    elif _is_xpu:
         hadamard_transform = _torch_hadamard_transform
     else:
         try:

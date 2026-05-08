@@ -51,6 +51,10 @@ void fused_add_layernorm_cpu(at::Tensor& input, at::Tensor& residual, at::Tensor
 // topk
 std::tuple<at::Tensor, at::Tensor>
 topk_sigmoid_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
+
+// hadamard transform
+at::Tensor fast_hadamard_transform_cpu(const at::Tensor& x, double scale);
+
 std::tuple<at::Tensor, at::Tensor>
 topk_softmax_cpu(at::Tensor& hidden_states, at::Tensor& gating_output, int64_t topk, bool renormalize);
 
@@ -589,6 +593,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // hadamard transform
+  m.def("fast_hadamard_transform_cpu(Tensor x, float scale) -> Tensor");
+  m.impl("fast_hadamard_transform_cpu", torch::kCPU, &fast_hadamard_transform_cpu);
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(
