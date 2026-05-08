@@ -20,7 +20,7 @@ except Exception as _e:  # pragma: no cover - exercised only when kernel missing
 # ``flashmla_quant.FP8KVCacheLayout``) -> (d_qk, d_v).
 _LAYOUT_DIMS = {
     1: (576, 512),  # V32_FP8Sparse
-    2: (512, 448),  # MODEL1_FP8Sparse
+    2: (512, 512),  # MODEL1_FP8Sparse
 }
 
 
