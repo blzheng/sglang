@@ -189,8 +189,7 @@ at::Tensor convert_scale_packed(at::Tensor& scale);
 std::tuple<at::Tensor, at::Tensor> per_token_quant_int8_cpu(at::Tensor& A);
 
 // gemm
-at::Tensor
-weight_packed_linear(
+at::Tensor weight_packed_linear(
     at::Tensor& mat1,
     at::Tensor& mat2,
     const std::optional<at::Tensor>& bias,
@@ -389,8 +388,7 @@ void set_k_and_s_cpu(
     int64_t page_size);
 
 // quant_to_nope_fp8_rope_bf16_pack
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16);
 
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
@@ -420,7 +418,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
     int64_t head_qk,
     int64_t head_v);
 
-// mhc (Multi-Head Channel) kernels
+// mhc kernels
 std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
     at::Tensor& x,
     at::Tensor& hc_fn,
@@ -550,7 +548,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("per_token_quant_int8_cpu", torch::kCPU, &per_token_quant_int8_cpu);
 
   // gemm
-  m.def("weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, ScalarType? out_dtype=None) -> Tensor");
+  m.def(
+      "weight_packed_linear(Tensor mat1, Tensor mat2, Tensor? bias, bool is_vnni, ScalarType? out_dtype=None) -> "
+      "Tensor");
   m.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
 
   // gemm fusion
@@ -673,8 +673,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("set_k_and_s_cpu", torch::kCPU, &set_k_and_s_cpu);
 
   // quant_to_nope_fp8_rope_bf16_pack
-  m.def(
-      "quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");
+  m.def("quant_to_nope_fp8_rope_bf16_pack_cpu(Tensor k_bf16) -> (Tensor, Tensor, Tensor)");
   m.impl("quant_to_nope_fp8_rope_bf16_pack_cpu", torch::kCPU, &quant_to_nope_fp8_rope_bf16_pack_cpu);
 
   // fused_sigmoid_gating_delta_rule_update
@@ -691,7 +690,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
       "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("fused_qkvzba_split_reshape_cat_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_cpu);
-  // mhc (Multi-Head Channel)
+  // mhc
   m.def(
       "hc_pre_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
       "int hc_mult, int sinkhorn_iters, float rms_eps, float hc_eps) -> (Tensor, Tensor, Tensor)");
