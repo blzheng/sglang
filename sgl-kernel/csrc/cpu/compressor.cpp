@@ -19,6 +19,7 @@ limitations under the License.
 #include <cmath>
 #include <algorithm>
 #include <vector>
+#include <cstring>
 
 namespace {
 
@@ -271,7 +272,6 @@ void compress_decode_cpu_impl(
     std::vector<float> score_buf(ratio * coff * coff_hd);
     std::vector<float> kv_work(ratio * coff * head_dim);
     std::vector<float> score_work(ratio * coff * head_dim);
-    std::vector<float> softmax_weights(ratio * coff);
     std::vector<float> compressed(head_dim);
 
     for (int64_t b = begin; b < end; ++b) {
@@ -344,34 +344,81 @@ void compress_decode_cpu_impl(
       // Now: kv_work, score_work are [ratio*coff, head_dim]
       int64_t compress_rows = ratio * coff;
 
-      // Softmax over score per head_dim column, then weighted sum
-      // For each dim d: softmax(score[:, d]) then sum(kv[:, d] * softmax_weight)
-      // But actually: softmax is over dim=1 (the ratio*coff rows) for each element
-      // Wait - looking at the Python code more carefully:
-      // kv_and_score_to_compress.score.softmax(dim=1)
-      // The shapes are [bs, ratio*coff, head_dim]
-      // So softmax is over axis 1 (ratio*coff) for each head_dim independently
-      // Then: (kv * softmax_weights).sum(dim=1) -> [bs, head_dim]
-
-      // For each head_dim position:
-      for (int64_t d = 0; d < head_dim; ++d) {
-        // Gather scores for this dim across all rows
-        float max_val = -1e30f;
-        for (int64_t r = 0; r < compress_rows; ++r) {
-          float s = score_work[r * head_dim + d];
-          if (s > max_val) max_val = s;
+      // Row-major vectorized softmax + weighted sum
+      // 1) Find per-column max across rows
+      std::memcpy(compressed.data(), score_work.data(), head_dim * sizeof(float));
+      for (int64_t r = 1; r < compress_rows; ++r) {
+        const float* sr = score_work.data() + r * head_dim;
+        int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+        for (; d <= head_dim - 16; d += 16) {
+          __m512 mx = _mm512_loadu_ps(compressed.data() + d);
+          __m512 sv = _mm512_loadu_ps(sr + d);
+          _mm512_storeu_ps(compressed.data() + d, _mm512_max_ps(mx, sv));
         }
-        float sum_exp = 0.0f;
-        for (int64_t r = 0; r < compress_rows; ++r) {
-          softmax_weights[r] = std::exp(score_work[r * head_dim + d] - max_val);
-          sum_exp += softmax_weights[r];
+#endif
+        for (; d < head_dim; ++d) {
+          compressed[d] = std::max(compressed[d], sr[d]);
         }
-        float inv_sum = 1.0f / sum_exp;
-        float weighted_sum = 0.0f;
-        for (int64_t r = 0; r < compress_rows; ++r) {
-          weighted_sum += kv_work[r * head_dim + d] * softmax_weights[r] * inv_sum;
+      }
+      // 2) Compute exp(score - max) in-place in score_work, accumulate sum
+      // Use kv_buf as sum accumulator (reuse buffer, head_dim <= kv_buf size)
+      float* sum_buf = kv_buf.data();  // reuse, only need head_dim floats
+      std::memset(sum_buf, 0, head_dim * sizeof(float));
+      for (int64_t r = 0; r < compress_rows; ++r) {
+        float* sr = score_work.data() + r * head_dim;
+        int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+        for (; d <= head_dim - 16; d += 16) {
+          __m512 sv = _mm512_loadu_ps(sr + d);
+          __m512 mx = _mm512_loadu_ps(compressed.data() + d);
+          __m512 diff = _mm512_sub_ps(sv, mx);
+          // Fast exp approximation via Sleef or cephes-style
+          // Use the vectorized exp from ATen
+          fVec diff_v = fVec::loadu(sr + d) - fVec::loadu(compressed.data() + d);
+          fVec exp_v = diff_v.exp();
+          exp_v.store(sr + d);
+          __m512 ev = _mm512_loadu_ps(sr + d);
+          __m512 sm = _mm512_loadu_ps(sum_buf + d);
+          _mm512_storeu_ps(sum_buf + d, _mm512_add_ps(sm, ev));
         }
-        compressed[d] = weighted_sum;
+#endif
+        for (; d < head_dim; ++d) {
+          sr[d] = std::exp(sr[d] - compressed[d]);
+          sum_buf[d] += sr[d];
+        }
+      }
+      // 3) Compute inv_sum and weighted sum: output = sum(kv * softmax_weight) / sum
+      std::memset(compressed.data(), 0, head_dim * sizeof(float));
+      for (int64_t r = 0; r < compress_rows; ++r) {
+        const float* kr = kv_work.data() + r * head_dim;
+        const float* sr = score_work.data() + r * head_dim;
+        int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+        for (; d <= head_dim - 16; d += 16) {
+          __m512 kv = _mm512_loadu_ps(kr + d);
+          __m512 sw = _mm512_loadu_ps(sr + d);
+          __m512 acc = _mm512_loadu_ps(compressed.data() + d);
+          _mm512_storeu_ps(compressed.data() + d, _mm512_fmadd_ps(kv, sw, acc));
+        }
+#endif
+        for (; d < head_dim; ++d) {
+          compressed[d] += kr[d] * sr[d];
+        }
+      }
+      // Divide by sum
+      {
+        int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+        for (; d <= head_dim - 16; d += 16) {
+          __m512 acc = _mm512_loadu_ps(compressed.data() + d);
+          __m512 sm = _mm512_loadu_ps(sum_buf + d);
+          _mm512_storeu_ps(compressed.data() + d, _mm512_div_ps(acc, sm));
+        }
+#endif
+        for (; d < head_dim; ++d) {
+          compressed[d] /= sum_buf[d];
+        }
       }
 
       // RMS norm with weight
@@ -551,40 +598,97 @@ void compress_extend_cpu_impl(
       }
 
       // Compress each remaining group
-      std::vector<float> compressed(head_dim);
-      std::vector<float> softmax_weights(2 * ratio);
+      // Parallelize across groups - each writes to independent output index
+      int64_t beg_idx = (prefix_len / ratio) * ratio;
+      int64_t start = prefix_len;
+      start = start + ratio - 1 - start % ratio;
 
-      for (int64_t g = 0; g < out_groups; ++g) {
+      at::parallel_for(0, out_groups, 1, [&](int64_t g_begin, int64_t g_end) {
+        std::vector<float> compressed(head_dim);
+        std::vector<float> normed(head_dim);
+        std::vector<float> col_max(head_dim);
+        std::vector<float> col_sum(head_dim);
+
+        for (int64_t g = g_begin; g < g_end; ++g) {
         int64_t src_g = g + 1;  // skip first group
         int64_t compress_rows = 2 * ratio;
         const float* kv_g = ot_kv.data() + src_g * compress_rows * head_dim;
-        const float* sc_g = ot_score.data() + src_g * compress_rows * head_dim;
+        float* sc_g = ot_score.data() + src_g * compress_rows * head_dim;
 
-        for (int64_t d = 0; d < head_dim; ++d) {
-          float max_val = -1e30f;
-          for (int64_t r = 0; r < compress_rows; ++r) {
-            float s = sc_g[r * head_dim + d];
-            if (s > max_val) max_val = s;
+        // Row-major vectorized softmax + weighted sum
+        // 1) Per-column max
+        std::memcpy(col_max.data(), sc_g, head_dim * sizeof(float));
+        for (int64_t r = 1; r < compress_rows; ++r) {
+          const float* sr = sc_g + r * head_dim;
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            __m512 mx = _mm512_loadu_ps(col_max.data() + d);
+            __m512 sv = _mm512_loadu_ps(sr + d);
+            _mm512_storeu_ps(col_max.data() + d, _mm512_max_ps(mx, sv));
           }
-          float sum_exp = 0.0f;
-          for (int64_t r = 0; r < compress_rows; ++r) {
-            softmax_weights[r] = std::exp(sc_g[r * head_dim + d] - max_val);
-            sum_exp += softmax_weights[r];
+#endif
+          for (; d < head_dim; ++d) {
+            col_max[d] = std::max(col_max[d], sr[d]);
           }
-          float inv_sum = 1.0f / sum_exp;
-          float wsum = 0.0f;
-          for (int64_t r = 0; r < compress_rows; ++r) {
-            wsum += kv_g[r * head_dim + d] * softmax_weights[r] * inv_sum;
+        }
+        // 2) exp(score - max) in-place, accumulate sum
+        std::memset(col_sum.data(), 0, head_dim * sizeof(float));
+        for (int64_t r = 0; r < compress_rows; ++r) {
+          float* sr = sc_g + r * head_dim;
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            fVec diff_v = fVec::loadu(sr + d) - fVec::loadu(col_max.data() + d);
+            fVec exp_v = diff_v.exp();
+            exp_v.store(sr + d);
+            __m512 ev = _mm512_loadu_ps(sr + d);
+            __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
+            _mm512_storeu_ps(col_sum.data() + d, _mm512_add_ps(sm, ev));
           }
-          compressed[d] = wsum;
+#endif
+          for (; d < head_dim; ++d) {
+            sr[d] = std::exp(sr[d] - col_max[d]);
+            col_sum[d] += sr[d];
+          }
+        }
+        // 3) Weighted sum: compressed = sum(kv * softmax_weight) / sum
+        std::memset(compressed.data(), 0, head_dim * sizeof(float));
+        for (int64_t r = 0; r < compress_rows; ++r) {
+          const float* kr = kv_g + r * head_dim;
+          const float* sr = sc_g + r * head_dim;
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            __m512 kv = _mm512_loadu_ps(kr + d);
+            __m512 sw = _mm512_loadu_ps(sr + d);
+            __m512 acc = _mm512_loadu_ps(compressed.data() + d);
+            _mm512_storeu_ps(compressed.data() + d, _mm512_fmadd_ps(kv, sw, acc));
+          }
+#endif
+          for (; d < head_dim; ++d) {
+            compressed[d] += kr[d] * sr[d];
+          }
+        }
+        // Divide by sum
+        {
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            __m512 acc = _mm512_loadu_ps(compressed.data() + d);
+            __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
+            _mm512_storeu_ps(compressed.data() + d, _mm512_div_ps(acc, sm));
+          }
+#endif
+          for (; d < head_dim; ++d) {
+            compressed[d] /= col_sum[d];
+          }
         }
 
         // RMS norm
-        std::vector<float> normed(head_dim);
         rmsnorm_row(normed.data(), compressed.data(), norm_weight, head_dim, norm_eps);
 
         // RoPE
-        int64_t beg_idx = (prefix_len / ratio) * ratio;
         int64_t freq_idx = beg_idx + g * ratio;
         const float* freq_ptr = freqs_cis + freq_idx * freqs_stride;
         apply_rotary_emb_row_f32(
@@ -599,16 +703,6 @@ void compress_extend_cpu_impl(
         }
 
         // Write to output at correct position
-        int64_t start = prefix_len;
-        start = start + ratio - 1 - start % ratio;
-        int64_t out_seq_idx = start + (g + 1) * ratio;
-        // Actually: indices_in_seq = torch.arange(start, prefix_lens[i] + extend_lens[i], ratio)
-        // and then after overlap drop, kv_compressed has out_groups entries
-        // Let me recalculate: before drop, we have num_groups compressed outputs
-        // After drop (skip first), we have out_groups = num_groups - 1
-        // indices_in_seq has the same count as kv_compressed.size(0) = out_groups
-        // indices_in_seq = [start, start+ratio, start+2*ratio, ...]
-        // So index g -> start + g*ratio
         int64_t out_idx = start + g * ratio;
         if (out_idx < prefix_len + extend_len && out_idx >= prefix_len) {
           int64_t flat_idx = out_idx - prefix_len + pt;
@@ -617,38 +711,97 @@ void compress_extend_cpu_impl(
           }
         }
       }
+      });  // end parallel_for
     } else {
-      // No overlap case
-      std::vector<float> compressed(head_dim);
-      std::vector<float> softmax_weights(ratio);
-      std::vector<float> normed(head_dim);
+      // No overlap case (coff==1, so coff_hd == head_dim)
+      int64_t beg_idx_no = (prefix_len / ratio) * ratio;
+      int64_t start_no = prefix_len;
+      start_no = start_no + ratio - 1 - start_no % ratio;
 
-      for (int64_t g = 0; g < num_groups; ++g) {
+      at::parallel_for(0, num_groups, 1, [&](int64_t g_begin, int64_t g_end) {
+        std::vector<float> compressed(head_dim);
+        std::vector<float> normed(head_dim);
+        std::vector<float> col_max(head_dim);
+        std::vector<float> col_sum(head_dim);
+
+        for (int64_t g = g_begin; g < g_end; ++g) {
         int64_t compress_rows = ratio;
+        const float* kv_g = buf_kv.data() + g * ratio * coff_hd;
+        float* sc_g_mut = buf_score.data() + g * ratio * coff_hd;
 
-        for (int64_t d = 0; d < head_dim; ++d) {
-          float max_val = -1e30f;
-          for (int64_t r = 0; r < compress_rows; ++r) {
-            float s = buf_score[(g * ratio + r) * coff_hd + d];
-            if (s > max_val) max_val = s;
+        // Row-major vectorized softmax + weighted sum
+        // 1) Per-column max
+        std::memcpy(col_max.data(), sc_g_mut, head_dim * sizeof(float));
+        for (int64_t r = 1; r < compress_rows; ++r) {
+          const float* sr = sc_g_mut + r * head_dim;
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            __m512 mx = _mm512_loadu_ps(col_max.data() + d);
+            __m512 sv = _mm512_loadu_ps(sr + d);
+            _mm512_storeu_ps(col_max.data() + d, _mm512_max_ps(mx, sv));
           }
-          float sum_exp = 0.0f;
-          for (int64_t r = 0; r < compress_rows; ++r) {
-            softmax_weights[r] = std::exp(buf_score[(g * ratio + r) * coff_hd + d] - max_val);
-            sum_exp += softmax_weights[r];
+#endif
+          for (; d < head_dim; ++d) {
+            col_max[d] = std::max(col_max[d], sr[d]);
           }
-          float inv_sum = 1.0f / sum_exp;
-          float wsum = 0.0f;
-          for (int64_t r = 0; r < compress_rows; ++r) {
-            wsum += buf_kv[(g * ratio + r) * coff_hd + d] * softmax_weights[r] * inv_sum;
+        }
+        // 2) exp(score - max) in-place, accumulate sum
+        std::memset(col_sum.data(), 0, head_dim * sizeof(float));
+        for (int64_t r = 0; r < compress_rows; ++r) {
+          float* sr = sc_g_mut + r * head_dim;
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            fVec diff_v = fVec::loadu(sr + d) - fVec::loadu(col_max.data() + d);
+            fVec exp_v = diff_v.exp();
+            exp_v.store(sr + d);
+            __m512 ev = _mm512_loadu_ps(sr + d);
+            __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
+            _mm512_storeu_ps(col_sum.data() + d, _mm512_add_ps(sm, ev));
           }
-          compressed[d] = wsum;
+#endif
+          for (; d < head_dim; ++d) {
+            sr[d] = std::exp(sr[d] - col_max[d]);
+            col_sum[d] += sr[d];
+          }
+        }
+        // 3) Weighted sum
+        std::memset(compressed.data(), 0, head_dim * sizeof(float));
+        for (int64_t r = 0; r < compress_rows; ++r) {
+          const float* kr = kv_g + r * head_dim;
+          const float* sr = sc_g_mut + r * head_dim;
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            __m512 kv = _mm512_loadu_ps(kr + d);
+            __m512 sw = _mm512_loadu_ps(sr + d);
+            __m512 acc = _mm512_loadu_ps(compressed.data() + d);
+            _mm512_storeu_ps(compressed.data() + d, _mm512_fmadd_ps(kv, sw, acc));
+          }
+#endif
+          for (; d < head_dim; ++d) {
+            compressed[d] += kr[d] * sr[d];
+          }
+        }
+        // Divide by sum
+        {
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            __m512 acc = _mm512_loadu_ps(compressed.data() + d);
+            __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
+            _mm512_storeu_ps(compressed.data() + d, _mm512_div_ps(acc, sm));
+          }
+#endif
+          for (; d < head_dim; ++d) {
+            compressed[d] /= col_sum[d];
+          }
         }
 
         rmsnorm_row(normed.data(), compressed.data(), norm_weight, head_dim, norm_eps);
 
-        int64_t beg_idx = (prefix_len / ratio) * ratio;
-        int64_t freq_idx = beg_idx + g * ratio;
+        int64_t freq_idx = beg_idx_no + g * ratio;
         const float* freq_ptr = freqs_cis + freq_idx * freqs_stride;
         apply_rotary_emb_row_f32(
             normed.data() + (head_dim - rope_head_dim),
@@ -662,16 +815,15 @@ void compress_extend_cpu_impl(
         }
 
         // Write to output
-        int64_t start = prefix_len;
-        start = start + ratio - 1 - start % ratio;
-        int64_t out_idx = start + g * ratio;
+        int64_t out_idx = start_no + g * ratio;
         if (out_idx < prefix_len + extend_len && out_idx >= prefix_len) {
           int64_t flat_idx = out_idx - prefix_len + pt;
           if (flat_idx < total_tokens) {
             std::memcpy(output + flat_idx * head_dim, normed.data(), head_dim * sizeof(float));
           }
         }
-      }
+        }
+      });  // end parallel_for
     }
 
     pt += extend_len;
