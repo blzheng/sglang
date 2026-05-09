@@ -3,6 +3,7 @@ import unittest
 import torch
 from utils import precision
 
+from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding,
     RotaryEmbedding,
@@ -14,6 +15,102 @@ torch.manual_seed(1234)
 
 
 class TestROPE(CustomTestCase):
+    def test_apply_rotary_emb_interleaved_cpu_entry_compat(self):
+        rope_dim = 64
+        for dtype in [torch.float32, torch.bfloat16]:
+            for shape in [(41, rope_dim), (41, 3, rope_dim)]:
+                for inverse in [False, True]:
+                    with self.subTest(dtype=dtype, shape=shape, inverse=inverse):
+                        max_pos = shape[0] + 17
+                        positions = torch.randint(
+                            0, max_pos, (shape[0],), dtype=torch.long
+                        )
+                        angles = torch.randn(
+                            max_pos, rope_dim // 2, dtype=torch.float32
+                        )
+                        freqs_cis = torch.polar(torch.ones_like(angles), angles).to(
+                            torch.complex64
+                        )
+                        x_ref = torch.randn(*shape, dtype=dtype)
+                        x_cpp = x_ref.clone()
+
+                        apply_rotary_emb_triton(
+                            x_ref,
+                            freqs_cis,
+                            positions=positions,
+                            inverse=inverse,
+                        )
+
+                        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+                            x_cpp,
+                            freqs_cis,
+                            inverse,
+                            positions,
+                        )
+
+                        atol = rtol = precision[x_ref.dtype]
+                        torch.testing.assert_close(
+                            x_cpp.float(),
+                            x_ref.float(),
+                            atol=atol,
+                            rtol=rtol,
+                        )
+
+    def test_apply_rotary_emb_interleaved_cpu_with_k_entry_compat(self):
+        if not hasattr(torch.ops.sgl_kernel, "apply_rotary_emb_interleaved_cpu"):
+            self.skipTest("apply_rotary_emb_interleaved_cpu is not available")
+
+        rope_dim = 64
+        for dtype in [torch.float32, torch.bfloat16]:
+            for inverse in [False, True]:
+                with self.subTest(dtype=dtype, inverse=inverse):
+                    T = 41
+                    max_pos = T + 17
+                    positions = torch.randint(0, max_pos, (T,), dtype=torch.long)
+                    angles = torch.randn(max_pos, rope_dim // 2, dtype=torch.float32)
+                    freqs_cis = torch.polar(torch.ones_like(angles), angles).to(
+                        torch.complex64
+                    )
+                    q_ref = torch.randn(T, 3, rope_dim, dtype=dtype)
+                    k_ref = torch.randn(T, 1, rope_dim, dtype=dtype)
+                    q_cpp = q_ref.clone()
+                    k_cpp = k_ref.clone()
+
+                    apply_rotary_emb_triton(
+                        q_ref,
+                        freqs_cis,
+                        positions=positions,
+                        inverse=inverse,
+                    )
+                    apply_rotary_emb_triton(
+                        k_ref,
+                        freqs_cis,
+                        positions=positions,
+                        inverse=inverse,
+                    )
+
+                    torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+                        q_cpp,
+                        freqs_cis,
+                        inverse,
+                        positions,
+                        k_cpp,
+                    )
+
+                    atol = rtol = precision[q_ref.dtype]
+                    torch.testing.assert_close(
+                        q_cpp.float(),
+                        q_ref.float(),
+                        atol=atol,
+                        rtol=rtol,
+                    )
+                    torch.testing.assert_close(
+                        k_cpp.float(),
+                        k_ref.float(),
+                        atol=atol,
+                        rtol=rtol,
+                    )
+
     def test_deepseek_v2_rope(self):
         num_head = 16
         seq_len = 1024

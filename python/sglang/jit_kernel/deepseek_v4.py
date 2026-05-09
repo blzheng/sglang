@@ -16,7 +16,7 @@ from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 # toolchain. On non-CUDA backends (e.g. XPU) those entrypoints fall back to
 # triton/torch implementations.
 _is_cuda = is_cuda()
+
+_is_cpu_amx_available = is_cpu() and cpu_has_amx_support()
 
 
 def make_name(name: str) -> str:
@@ -523,9 +525,7 @@ def _torch_plan_compress_prefill(
             if position >= start_write_pos:
                 write_entries.append(plan)
         counter += extend_len
-    assert (
-        counter == num_tokens
-    ), f"input size {counter} != num_q_tokens {num_tokens}"
+    assert counter == num_tokens, f"input size {counter} != num_q_tokens {num_tokens}"
 
     kInvalid = 0xFFFFFFFF
     invalid_row = struct.pack("<IIII", kInvalid, kInvalid, kInvalid, kInvalid)
@@ -686,6 +686,10 @@ def fused_rope(
         freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
         module = _jit_fused_rope_module()
         module.forward(q, k, freqs_real, positions, inverse)
+    elif _is_cpu_amx_available:
+        torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+            q, freqs_cis, inverse, positions, k
+        )
     else:
         # Triton fallback for non-CUDA backends (e.g. XPU). Mirrors
         # FusedQKRopeKernel: apply rotary embedding in-place to q and
@@ -694,9 +698,7 @@ def fused_rope(
 
         apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
         if k is not None:
-            apply_rotary_emb_triton(
-                k, freqs_cis, positions=positions, inverse=inverse
-            )
+            apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
 
 
 @cache_once
@@ -927,7 +929,9 @@ def triton_create_paged_compress_data(
     full_to_swa_index_mapping: torch.Tensor,
     block: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    _should_dump = envs.SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA.get() and (compress_ratio == 128)
+    _should_dump = envs.SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA.get() and (
+        compress_ratio == 128
+    )
     if _should_dump:
         torch.cuda.synchronize()
         _maybe_dump_create_paged_compress_data_inputs(

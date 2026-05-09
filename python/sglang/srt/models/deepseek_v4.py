@@ -68,13 +68,15 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.models.deepseek_common.utils import _is_cpu, _is_cpu_amx_available
+from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    cpu_has_amx_support,
+    is_cpu,
     log_info_on_rank0,
     make_layers,
     maybe_torch_compile,
@@ -102,18 +104,59 @@ if TYPE_CHECKING:
         PPProxyTensors,
     )
 
+_is_cpu_amx_available = is_cpu() and cpu_has_amx_support()
+
+
+def apply_rotary_emb_maybe_direct_cpu(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+    inverse: bool = False,
+) -> torch.Tensor:
+    if _is_cpu_amx_available:
+        return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
+            x, freqs_cis, inverse, positions
+        )
+    return apply_rotary_emb_triton(x, freqs_cis, positions=positions, inverse=inverse)
+
+
 def rms_normalize_native(
     x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
+    if _is_cpu_amx_available and weight is None:
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1])
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+        return torch.ops.sgl_kernel.l2norm_cpu(x_2d, eps).view(shape)
+
+    if _is_cpu_amx_available and weight is not None:
+        shape = x.shape
+        x_2d = x.reshape(-1, shape[-1])
+        if x_2d.stride(-1) != 1:
+            x_2d = x_2d.contiguous()
+
+        w = weight.reshape(-1)
+        if w.dtype != x.dtype:
+            w = w.to(dtype=x.dtype)
+        if not w.is_contiguous():
+            w = w.contiguous()
+
+        out = torch.ops.sgl_kernel.rmsnorm_cpu(
+            x_2d,
+            w,
+            eps,
+        ).view(shape)
+        return out
+
     x_f32 = x.to(torch.float32)
     variance = x_f32.pow(2).mean(dim=-1, keepdim=True)
     normalized = x_f32 * torch.rsqrt(variance + eps)
-
     if weight is not None:
         normalized = normalized * weight.to(dtype=normalized.dtype)
-
     x.copy_(normalized.to(dtype=x.dtype))
     return x
+
 
 class DeepseekRefRMSNorm(nn.Module):
 
@@ -364,12 +407,11 @@ class Compressor(nn.Module):
             bs, self.ratio * self.coff, self.head_dim
         )
         kv_compressed = (
-            kv_and_score_to_compress.kv
-            * kv_and_score_to_compress.score.softmax(dim=1)
+            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         kv_compressed = self.norm(kv_compressed)
         freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        apply_rotary_emb_triton(
+        apply_rotary_emb_maybe_direct_cpu(
             kv_compressed[..., -self.rope_head_dim :], freqs_cis
         )
         if self.rotate:
@@ -393,9 +435,7 @@ class Compressor(nn.Module):
         req_pool_indices = forward_batch.req_pool_indices
         assert extend_lens is not None and prefix_lens is not None
 
-        max_buffer_size = (
-            2 * kv_and_score_states.shape[1] + kv_and_scores.shape[0]
-        )
+        max_buffer_size = 2 * kv_and_score_states.shape[1] + kv_and_scores.shape[0]
         temp_buffer_shape = [max_buffer_size, head_dim_times_coff]
         temp_buffer = KVAndScoreOld.empty_like(temp_buffer_shape, old=kv_and_scores)
 
@@ -466,10 +506,10 @@ class Compressor(nn.Module):
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
             freqs_cis = self.freqs_cis[beg_idx : end_idx : self.ratio]
-            assert freqs_cis.size(0) == kv_compressed.size(0), (
-                f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            )
-            apply_rotary_emb_triton(
+            assert freqs_cis.size(0) == kv_compressed.size(
+                0
+            ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
+            apply_rotary_emb_maybe_direct_cpu(
                 kv_compressed[..., -self.rope_head_dim :], freqs_cis
             )
 
@@ -485,9 +525,7 @@ class Compressor(nn.Module):
                 device=kv_and_scores.kv.device,
             )
             assert indices_in_seq.size(0) == kv_compressed.size(0)
-            compressed_kv_output[indices_in_seq - prefix_lens[i] + pt] = (
-                kv_compressed
-            )
+            compressed_kv_output[indices_in_seq - prefix_lens[i] + pt] = kv_compressed
 
             pt += extend_lens[i]
 
@@ -503,9 +541,9 @@ class Compressor(nn.Module):
         # pattern used in PR23608.
         if self.use_fused_compress:
             return self.compress_fused(kv_score, forward_batch)
-        assert envs.SGLANG_OPT_USE_OLD_COMPRESSOR.get(), (
-            "Compressor: non-fused path requires SGLANG_OPT_USE_OLD_COMPRESSOR=1"
-        )
+        assert (
+            envs.SGLANG_OPT_USE_OLD_COMPRESSOR.get()
+        ), "Compressor: non-fused path requires SGLANG_OPT_USE_OLD_COMPRESSOR=1"
         self.compress_decode = self.compress_decode_old
         self.compress_extend = self.compress_extend_old
         kv = kv_score[:, : self.coff * self.head_dim]
@@ -945,7 +983,9 @@ class MQALayer(nn.Module):
                 positions=positions,
             )
         else:
-            apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
+            apply_rotary_emb_maybe_direct_cpu(
+                q[..., -self.qk_rope_head_dim :], self.freqs_cis
+            )
         return q
 
     def _compute_kv(
@@ -968,7 +1008,9 @@ class MQALayer(nn.Module):
                 positions=positions,
             )
         else:
-            apply_rotary_emb_triton(kv[..., -self.qk_rope_head_dim :], self.freqs_cis)
+            apply_rotary_emb_maybe_direct_cpu(
+                kv[..., -self.qk_rope_head_dim :], self.freqs_cis
+            )
         return kv
 
     def _forward_prepare_multi_stream(
@@ -1232,9 +1274,7 @@ def _hc_split_sinkhorn_torch(
     post = 2.0 * torch.sigmoid(
         flat[:, hc : 2 * hc] * hc_scale[1] + hc_base[hc : 2 * hc]
     )
-    comb = (
-        flat[:, 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]
-    ).reshape(b * s, hc, hc)
+    comb = (flat[:, 2 * hc :] * hc_scale[2] + hc_base[2 * hc :]).reshape(b * s, hc, hc)
 
     comb = torch.softmax(comb, dim=-1) + eps
     comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
@@ -1382,6 +1422,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.hc_pre_fused_cpu(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
         else:
             x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
 
@@ -1425,6 +1476,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.hc_post_fused_cpu(
+                x,
+                residual,
+                post,
+                comb,
+            )
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
@@ -1590,6 +1648,10 @@ class DeepseekV4Model(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.hc_head_fused_cpu(
+                x, hc_fn, hc_scale, hc_base, self.hc_eps, self.norm_eps
+            )
         shape, dtype = x.size(), x.dtype
         x = x.flatten(1).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
@@ -1991,7 +2053,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if envs.SGLANG_DSV4_FP4_EXPERTS.get():
                     weights = _dequant_fp8_wo_a(weights)
                 else:
-                    weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                    weights = (
+                        (n, t) for n, t in weights if not n.endswith(".wo_a.scale")
+                    )
                 # ------------------------------------------------------------------------
 
         stacked_params_mapping = [
