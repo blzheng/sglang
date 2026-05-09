@@ -474,6 +474,24 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     bool disable_grouping,
     at::ScalarType out_dtype);
 
+// compressor
+at::Tensor compress_decode_cpu(
+    at::Tensor& pool_kv,
+    at::Tensor& pool_score,
+    at::Tensor& kv,
+    at::Tensor& score,
+    at::Tensor& seq_lens,
+    at::Tensor& req_pool_indices,
+    at::Tensor& ape,
+    at::Tensor& norm_weight,
+    at::Tensor& freqs_cis,
+    int64_t ratio,
+    int64_t head_dim,
+    int64_t rope_head_dim,
+    bool overlap,
+    bool rotate,
+    double norm_eps);
+
 // scheduler: paged allocation
 void alloc_extend_kernel_cpu(
     at::Tensor& pre_lens,
@@ -782,6 +800,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
       "out_dtype) -> (Tensor, Tensor)");
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
+
+  // compressor
+  m.def(
+      "compress_decode_cpu(Tensor(a!) pool_kv, Tensor(b!) pool_score, Tensor kv, Tensor score, "
+      "Tensor seq_lens, Tensor req_pool_indices, Tensor ape, Tensor norm_weight, Tensor freqs_cis, "
+      "int ratio, int head_dim, int rope_head_dim, bool overlap, bool rotate, float norm_eps) -> Tensor");
+  m.impl("compress_decode_cpu", torch::kCPU, &compress_decode_cpu);
 
   // scheduler: paged allocation
   m.def(
