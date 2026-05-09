@@ -292,6 +292,57 @@ void set_k_and_s_cpu(
 }
 
 
+// set_s_cpu: scatter-copy scale values (fp32, viewed as 4 bytes uint8)
+// into a paged buffer for NSA (non-sparse attention) index cache.
+//
+// Buffer layout per page (buf shape: [num_pages, buf_numel_per_page]):
+//   K data region: page_size * index_head_dim bytes (fp8 key data)
+//   S data region: page_size * 4 bytes (fp32 scale per token)
+//
+// index_k_scale is fp32 (1 per token), stored as 4 raw bytes in the buffer.
+//
+void set_s_cpu(
+    at::Tensor& buf,            // [num_pages, buf_numel_per_page], uint8
+    at::Tensor& loc,            // [num_tokens], int32 or int64
+    at::Tensor& index_k_scale,  // [num_tokens] or [num_tokens, 1], fp32
+    int64_t page_size,
+    int64_t index_head_dim) {
+  // Flatten index_k_scale to 1D if needed
+  auto scale_flat = index_k_scale.dim() == 2 ? index_k_scale.squeeze(1) : index_k_scale;
+
+  const int64_t num_tokens = loc.size(0);
+  const int64_t buf_numel_per_page = buf.size(1);
+  const int64_t num_s_bytes_per_token = 4;  // fp32 = 4 bytes
+  const int64_t s_offset_in_page = page_size * index_head_dim;
+
+  uint8_t* buf_ptr = buf.data_ptr<uint8_t>();
+  const uint8_t* scale_ptr = reinterpret_cast<const uint8_t*>(scale_flat.data_ptr<float>());
+
+  const bool loc_is_int64 = (loc.scalar_type() == at::kLong);
+  const int32_t* loc_i32 = loc_is_int64 ? nullptr : loc.data_ptr<int32_t>();
+  const int64_t* loc_i64 = loc_is_int64 ? loc.data_ptr<int64_t>() : nullptr;
+
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t token_loc = loc_is_int64 ? loc_i64[i] : static_cast<int64_t>(loc_i32[i]);
+      const int64_t page_idx = token_loc / page_size;
+      const int64_t token_off = token_loc % page_size;
+
+      const int64_t dst_offset =
+          page_idx * buf_numel_per_page
+          + s_offset_in_page
+          + token_off * num_s_bytes_per_token;
+
+      uint8_t* dst = buf_ptr + dst_offset;
+      const uint8_t* src = scale_ptr + i * num_s_bytes_per_token;
+
+      // 4-byte copy: use 32-bit integer copy for efficiency
+      *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(src);
+    }
+  });
+}
+
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 quant_to_nope_fp8_rope_bf16_pack_cpu(at::Tensor& k_bf16) {
   TORCH_CHECK(k_bf16.dtype() == at::kBFloat16,
