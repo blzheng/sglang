@@ -16,7 +16,7 @@ from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_cpu, is_cuda
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -26,7 +26,8 @@ if TYPE_CHECKING:
 # toolchain. On non-CUDA backends (e.g. XPU) those entrypoints fall back to
 # triton/torch implementations.
 _is_cuda = is_cuda()
-_is_cpu = is_cpu()
+
+_is_cpu_amx_available = is_cpu() and cpu_has_amx_support()
 
 
 def make_name(name: str) -> str:
@@ -685,7 +686,7 @@ def fused_rope(
         freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
         module = _jit_fused_rope_module()
         module.forward(q, k, freqs_real, positions, inverse)
-    elif _is_cpu:
+    elif _is_cpu_amx_available:
         torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
             q, freqs_cis, inverse, positions, k
         )

@@ -1,12 +1,4 @@
 // MHC (Multi-Head Channel) fused kernels for Xeon CPU.
-//
-// Public entry points:
-//   hc_pre_fused_cpu, hc_post_fused_cpu, hc_head_fused_cpu
-//
-// Contract:
-//   * data tensors: bf16
-//   * coeff tensors: float32
-//   * accumulation: float32
 
 #include <algorithm>
 #include <cmath>

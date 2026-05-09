@@ -68,8 +68,8 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
-from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.models.deepseek_common.utils import _is_cpu, _is_cpu_amx_available
+from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     BumpAllocator,
@@ -104,7 +104,7 @@ if TYPE_CHECKING:
         PPProxyTensors,
     )
 
-_use_cpu = is_cpu() and cpu_has_amx_support()
+_is_cpu_amx_available = is_cpu() and cpu_has_amx_support()
 
 
 def apply_rotary_emb_maybe_direct_cpu(
@@ -113,7 +113,7 @@ def apply_rotary_emb_maybe_direct_cpu(
     positions: Optional[torch.Tensor] = None,
     inverse: bool = False,
 ) -> torch.Tensor:
-    if _use_cpu:
+    if _is_cpu_amx_available:
         return torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
             x, freqs_cis, inverse, positions
         )
@@ -123,14 +123,14 @@ def apply_rotary_emb_maybe_direct_cpu(
 def rms_normalize_native(
     x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
-    if _use_cpu and weight is None:
+    if _is_cpu_amx_available and weight is None:
         shape = x.shape
         x_2d = x.reshape(-1, shape[-1])
         if not x_2d.is_contiguous():
             x_2d = x_2d.contiguous()
         return torch.ops.sgl_kernel.l2norm_cpu(x_2d, eps).view(shape)
 
-    if _use_cpu and weight is not None:
+    if _is_cpu_amx_available and weight is not None:
         shape = x.shape
         x_2d = x.reshape(-1, shape[-1])
         if x_2d.stride(-1) != 1:
@@ -1422,7 +1422,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
-        if _use_cpu:
+        if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.hc_pre_fused_cpu(
                 x,
                 hc_fn,
@@ -1476,7 +1476,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             from sglang.srt.layers.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)
-        if _use_cpu:
+        if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.hc_post_fused_cpu(
                 x,
                 residual,
@@ -1648,7 +1648,7 @@ class DeepseekV4Model(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        if _use_cpu:
+        if _is_cpu_amx_available:
             return torch.ops.sgl_kernel.hc_head_fused_cpu(
                 x, hc_fn, hc_scale, hc_base, self.hc_eps, self.norm_eps
             )
