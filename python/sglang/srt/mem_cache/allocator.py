@@ -26,7 +26,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2, is_cpu, cpu_has_amx_support
+
+_is_cpu_amx_available = cpu_has_amx_support()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -366,14 +369,24 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         out_indices = torch.empty(
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
-        alloc_extend_kernel_pytorch(
-            prefix_lens,
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            self.page_size,
-        )
+        if _is_cpu and _is_cpu_amx_available:
+            torch.ops.sgl_kernel.alloc_extend_kernel_cpu(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+            )
+        else:
+            alloc_extend_kernel_pytorch(
+                prefix_lens,
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
@@ -457,13 +470,22 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
-        alloc_decode_kernel_pytorch(
-            seq_lens,
-            last_loc,
-            self.free_pages,
-            out_indices,
-            self.page_size,
-        )
+        if _is_cpu and _is_cpu_amx_available:
+            torch.ops.sgl_kernel.alloc_decode_kernel_cpu(
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+            )
+        else:
+            alloc_decode_kernel_pytorch(
+                seq_lens,
+                last_loc,
+                self.free_pages,
+                out_indices,
+                self.page_size,
+            )
 
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)

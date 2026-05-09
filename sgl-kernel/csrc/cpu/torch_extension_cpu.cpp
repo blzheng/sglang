@@ -433,6 +433,21 @@ at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& po
 
 at::Tensor hc_head_fused_cpu(
     at::Tensor& x, at::Tensor& hc_fn, at::Tensor& hc_scale, at::Tensor& hc_base, double hc_eps, double norm_eps);
+// scheduler: paged allocation
+void alloc_extend_kernel_cpu(
+    at::Tensor& pre_lens,
+    at::Tensor& seq_lens,
+    at::Tensor& last_loc,
+    at::Tensor& free_pages,
+    at::Tensor& out_indices,
+    int64_t page_size);
+
+void alloc_decode_kernel_cpu(
+    at::Tensor& seq_lens,
+    at::Tensor& last_loc,
+    at::Tensor& free_pages,
+    at::Tensor& out_indices,
+    int64_t page_size);
 
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // activation
@@ -703,6 +718,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "hc_head_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
       "float hc_eps, float norm_eps) -> Tensor");
   m.impl("hc_head_fused_cpu", torch::kCPU, &hc_head_fused_cpu);
+
+  // scheduler: paged allocation
+  m.def(
+      "alloc_extend_kernel_cpu(Tensor pre_lens, Tensor seq_lens, Tensor last_loc, "
+      "Tensor free_pages, Tensor(a!) out_indices, int page_size) -> ()");
+  m.impl("alloc_extend_kernel_cpu", torch::kCPU, &alloc_extend_kernel_cpu);
+
+  m.def(
+      "alloc_decode_kernel_cpu(Tensor seq_lens, Tensor last_loc, "
+      "Tensor free_pages, Tensor(a!) out_indices, int page_size) -> ()");
+  m.impl("alloc_decode_kernel_cpu", torch::kCPU, &alloc_decode_kernel_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
