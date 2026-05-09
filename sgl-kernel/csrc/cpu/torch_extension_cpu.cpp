@@ -455,6 +455,22 @@ std::tuple<at::Tensor, at::Tensor> image_preprocess_cpu(
     bool disable_grouping,
     at::ScalarType out_dtype);
 
+// scheduler: paged allocation
+void alloc_extend_kernel_cpu(
+    at::Tensor& pre_lens,
+    at::Tensor& seq_lens,
+    at::Tensor& last_loc,
+    at::Tensor& free_pages,
+    at::Tensor& out_indices,
+    int64_t page_size);
+
+void alloc_decode_kernel_cpu(
+    at::Tensor& seq_lens,
+    at::Tensor& last_loc,
+    at::Tensor& free_pages,
+    at::Tensor& out_indices,
+    int64_t page_size);
+
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -731,6 +747,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "image_std, int patch_size, int temporal_patch_size, int merge_size, bool disable_grouping, ScalarType "
       "out_dtype) -> (Tensor, Tensor)");
   m.impl("image_preprocess_cpu", torch::kCPU, &image_preprocess_cpu);
+
+  // scheduler: paged allocation
+  m.def(
+      "alloc_extend_kernel_cpu(Tensor pre_lens, Tensor seq_lens, Tensor last_loc, "
+      "Tensor free_pages, Tensor(a!) out_indices, int page_size) -> ()");
+  m.impl("alloc_extend_kernel_cpu", torch::kCPU, &alloc_extend_kernel_cpu);
+
+  m.def(
+      "alloc_decode_kernel_cpu(Tensor seq_lens, Tensor last_loc, "
+      "Tensor free_pages, Tensor(a!) out_indices, int page_size) -> ()");
+  m.impl("alloc_decode_kernel_cpu", torch::kCPU, &alloc_decode_kernel_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
