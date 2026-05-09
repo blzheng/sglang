@@ -249,6 +249,109 @@ class TestQuantToNopeFp8RopeBf16Pack(CustomTestCase):
 
 
 # ===========================================================================
+# Reference for set_k (from index_buf_accessor.py SetK.torch_fast)
+# ===========================================================================
+
+def _set_k_torch(buf, loc, index_k, page_size, index_head_dim):
+    """Reference implementation matching SetK.torch_fast."""
+    (num_tokens_to_write,) = loc.shape
+    buf_numel_per_page = buf.shape[1]
+    num_k_bytes_per_token = index_head_dim
+
+    loc_page_index = loc // page_size
+    loc_token_offset_in_page = loc % page_size
+
+    flat_buf = buf.flatten()
+    flat_indices = (
+        (loc_page_index * buf_numel_per_page)[:, None]
+        + (loc_token_offset_in_page * num_k_bytes_per_token)[:, None]
+        + torch.arange(num_k_bytes_per_token, dtype=torch.int32, device="cpu")[None, :]
+    )
+    num_k_bytes_total = num_tokens_to_write * num_k_bytes_per_token
+    flat_indices = flat_indices.flatten()[:num_k_bytes_total]
+    flat_buf[flat_indices] = index_k.view(torch.uint8).flatten()
+
+
+def make_set_k_test_data(num_pages, page_size, num_tokens, index_head_dim=128):
+    """Create test data for set_k_cpu."""
+    buf_numel_per_page = page_size * index_head_dim + page_size * 4
+    buf = torch.zeros(num_pages, buf_numel_per_page, dtype=torch.uint8)
+
+    total_slots = num_pages * page_size
+    assert num_tokens <= total_slots
+    perm = torch.randperm(total_slots)[:num_tokens]
+    loc = perm.to(torch.int64)
+
+    index_k = torch.randint(0, 256, (num_tokens, index_head_dim), dtype=torch.uint8).view(fp8_dtype)
+
+    return buf, loc, index_k
+
+
+class TestSetK(CustomTestCase):
+    num_pages_list = [4, 16]
+    page_size_list = [1, 16, 64]
+    num_tokens_list = [1, 7, 32]
+
+    def _test_set_k(self, num_pages, page_size, num_tokens, index_head_dim=128):
+        max_tokens = num_pages * page_size
+        if num_tokens > max_tokens:
+            num_tokens = max_tokens
+
+        buf, loc, index_k = make_set_k_test_data(
+            num_pages, page_size, num_tokens, index_head_dim
+        )
+
+        # Reference
+        buf_ref = buf.clone()
+        _set_k_torch(buf_ref, loc, index_k, page_size, index_head_dim)
+
+        # C++ kernel
+        buf_test = buf.clone()
+        torch.ops.sgl_kernel.set_k_cpu(
+            buf_test, loc, index_k, page_size, index_head_dim
+        )
+
+        torch.testing.assert_close(buf_ref, buf_test)
+
+    def test_set_k(self):
+        for params in itertools.product(
+            self.num_pages_list, self.page_size_list, self.num_tokens_list
+        ):
+            with self.subTest(
+                num_pages=params[0], page_size=params[1], num_tokens=params[2]
+            ):
+                self._test_set_k(*params)
+
+    def test_set_k_int32_loc(self):
+        """Test with int32 loc tensor."""
+        buf, loc, index_k = make_set_k_test_data(8, 64, 20)
+        loc_i32 = loc.to(torch.int32)
+
+        buf_ref = buf.clone()
+        _set_k_torch(buf_ref, loc, index_k, 64, 128)
+
+        buf_test = buf.clone()
+        torch.ops.sgl_kernel.set_k_cpu(buf_test, loc_i32, index_k, 64, 128)
+
+        torch.testing.assert_close(buf_ref, buf_test)
+
+    def test_set_k_large(self):
+        """Larger stress test."""
+        num_pages, page_size, num_tokens = 64, 64, 2048
+        buf, loc, index_k = make_set_k_test_data(
+            num_pages, page_size, num_tokens
+        )
+
+        buf_ref = buf.clone()
+        _set_k_torch(buf_ref, loc, index_k, page_size, 128)
+
+        buf_test = buf.clone()
+        torch.ops.sgl_kernel.set_k_cpu(buf_test, loc, index_k, page_size, 128)
+
+        torch.testing.assert_close(buf_ref, buf_test)
+
+
+# ===========================================================================
 # Reference for set_s (from index_buf_accessor.py SetS.torch_fast)
 # ===========================================================================
 

@@ -292,6 +292,64 @@ void set_k_and_s_cpu(
 }
 
 
+// set_k_cpu: scatter-copy index key data (fp8, viewed as uint8) into
+// a paged buffer for NSA (non-sparse attention) index cache.
+//
+// Buffer layout per page (buf shape: [num_pages, buf_numel_per_page]):
+//   K data region: page_size * index_head_dim bytes (fp8 key data)
+//   S data region: page_size * 4 bytes (fp32 scale per token)
+//
+// index_k is fp8 (index_head_dim elements per token), stored as raw bytes.
+//
+void set_k_cpu(
+    at::Tensor& buf,       // [num_pages, buf_numel_per_page], uint8
+    at::Tensor& loc,       // [num_tokens], int32 or int64
+    at::Tensor& index_k,   // [num_tokens, index_head_dim], fp8 (viewed as uint8)
+    int64_t page_size,
+    int64_t index_head_dim) {
+  const int64_t num_tokens = loc.size(0);
+  const int64_t buf_numel_per_page = buf.size(1);
+  const int64_t num_k_bytes_per_token = index_head_dim;
+
+  uint8_t* buf_ptr = buf.data_ptr<uint8_t>();
+  const uint8_t* k_ptr = reinterpret_cast<const uint8_t*>(index_k.data_ptr());
+
+  const bool loc_is_int64 = (loc.scalar_type() == at::kLong);
+  const int32_t* loc_i32 = loc_is_int64 ? nullptr : loc.data_ptr<int32_t>();
+  const int64_t* loc_i64 = loc_is_int64 ? loc.data_ptr<int64_t>() : nullptr;
+
+  at::parallel_for(0, num_tokens, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; ++i) {
+      const int64_t token_loc = loc_is_int64 ? loc_i64[i] : static_cast<int64_t>(loc_i32[i]);
+      const int64_t page_idx = token_loc / page_size;
+      const int64_t token_off = token_loc % page_size;
+
+      const int64_t dst_offset =
+          page_idx * buf_numel_per_page + token_off * num_k_bytes_per_token;
+
+      uint8_t* dst = buf_ptr + dst_offset;
+      const uint8_t* src = k_ptr + i * num_k_bytes_per_token;
+
+#if defined(CPU_CAPABILITY_AVX512)
+      // index_head_dim=128: 2 x 64-byte AVX512 stores
+      {
+        int64_t d = 0;
+        for (; d + 64 <= num_k_bytes_per_token; d += 64) {
+          __m512i v = _mm512_loadu_si512(reinterpret_cast<const __m512i*>(src + d));
+          _mm512_storeu_si512(reinterpret_cast<__m512i*>(dst + d), v);
+        }
+        if (d < num_k_bytes_per_token) {
+          std::memcpy(dst + d, src + d, num_k_bytes_per_token - d);
+        }
+      }
+#else
+      std::memcpy(dst, src, num_k_bytes_per_token);
+#endif
+    }
+  });
+}
+
+
 // set_s_cpu: scatter-copy scale values (fp32, viewed as 4 bytes uint8)
 // into a paged buffer for NSA (non-sparse attention) index cache.
 //

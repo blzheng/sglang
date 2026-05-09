@@ -390,6 +390,14 @@ void set_k_and_s_cpu(
     at::Tensor& scale_k_nope,
     int64_t page_size);
 
+// set_k
+void set_k_cpu(
+    at::Tensor& buf,
+    at::Tensor& loc,
+    at::Tensor& index_k,
+    int64_t page_size,
+    int64_t index_head_dim);
+
 // set_s
 void set_s_cpu(
     at::Tensor& buf,
@@ -701,6 +709,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "set_k_and_s_cpu(Tensor(a!) buf, Tensor loc, Tensor k_nope, Tensor k_rope, "
       "Tensor scale_k_nope, int page_size) -> ()");
   m.impl("set_k_and_s_cpu", torch::kCPU, &set_k_and_s_cpu);
+
+  // set_k
+  m.def(
+      "set_k_cpu(Tensor(a!) buf, Tensor loc, Tensor index_k, "
+      "int page_size, int index_head_dim) -> ()");
+  m.impl("set_k_cpu", torch::kCPU, &set_k_cpu);
 
   // set_s
   m.def(
