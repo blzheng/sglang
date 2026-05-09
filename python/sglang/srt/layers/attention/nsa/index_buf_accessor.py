@@ -201,7 +201,15 @@ class GetKAndS:
 class SetK:
     @classmethod
     def execute(cls, *args, buf, **kwargs):
-        return cls.torch_fast(*args, **kwargs, buf=buf)
+        if _is_cpu and _is_cpu_amx_available:
+            pool = args[0] if args else kwargs["pool"]
+            loc = args[1] if len(args) > 1 else kwargs["loc"]
+            index_k = args[2] if len(args) > 2 else kwargs["index_k"]
+            torch.ops.sgl_kernel.set_k_cpu(
+                buf, loc, index_k, pool.page_size, pool.index_head_dim
+            )
+        else:
+            return cls.torch_fast(*args, **kwargs, buf=buf)
 
     @classmethod
     def slow(
