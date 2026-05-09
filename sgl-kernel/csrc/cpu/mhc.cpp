@@ -264,7 +264,6 @@ static void hc_pre_fuse_impl(
   constexpr int64_t kSmallTKBlockCap = 128;
   constexpr int64_t kLargeTKBlockCap = 256;
   constexpr int64_t kDVecsPerBlock = 16;
-  static_assert(kSmallTKBlockCap <= kLargeTKBlockCap, "small-T K block cap must not exceed large-T cap");
   constexpr int64_t kCacheKBlockCap = kLargeTKBlockCap;
   constexpr int64_t MAX_K_VECS = kCacheKBlockCap / kVecSize;
   const int mix_hc = (2 + hc) * hc;
