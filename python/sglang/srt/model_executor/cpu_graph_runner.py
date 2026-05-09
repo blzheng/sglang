@@ -114,6 +114,12 @@ def register_fake_ops():
         "fused_add_rmsnorm_cpu",
         "decode_attention_cpu",
         "extend_attention_cpu",
+        "set_k_and_s_cpu",
+        "set_k_cpu",
+        "set_s_cpu",
+        "layernorm_cpu",
+        "gemma_fused_add_rmsnorm_cpu",
+        "fused_add_layernorm_cpu",
     ]
     for op in none_return_ops:
 
@@ -126,6 +132,9 @@ def register_fake_ops():
         "l2norm_cpu",
         "fused_experts_cpu",
         "shared_expert_cpu",
+        "gemma_rmsnorm_cpu",
+        "gemma3_rmsnorm_cpu",
+        "fused_rmsnorm_gated_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
@@ -339,6 +348,114 @@ def register_fake_ops():
         M = mat1.shape[0]
         N = mat2.shape[0]
         return mat1.new_empty(M, N, dtype=out_dtype)
+
+    @torch.library.register_fake("sgl_kernel::compress_decode_cpu")
+    def _(
+        pool_kv,
+        pool_score,
+        kv,
+        score,
+        seq_lens,
+        req_pool_indices,
+        ape,
+        norm_weight,
+        freqs_cis,
+        ratio,
+        head_dim,
+        rope_head_dim,
+        overlap,
+        rotate,
+        norm_eps,
+    ):
+        bs = kv.shape[0]
+        return kv.new_empty(bs, head_dim)
+
+    @torch.library.register_fake("sgl_kernel::compress_extend_cpu")
+    def _(
+        pool_kv,
+        pool_score,
+        kv,
+        score,
+        prefix_lens,
+        extend_lens,
+        req_pool_indices,
+        ape,
+        norm_weight,
+        freqs_cis,
+        ratio,
+        head_dim,
+        rope_head_dim,
+        overlap,
+        rotate,
+        norm_eps,
+    ):
+        total_tokens = kv.shape[0]
+        return kv.new_empty(total_tokens, head_dim)
+
+    @torch.library.register_fake("sgl_kernel::apply_rotary_emb_interleaved_cpu")
+    def _(x, freqs, inverse, positions=None, k=None):
+        return torch.empty_like(x)
+
+    @torch.library.register_fake("sgl_kernel::fast_hadamard_transform_cpu")
+    def _(x, scale):
+        return torch.empty_like(x)
+
+    @torch.library.register_fake("sgl_kernel::gelu_tanh_and_mul_cpu")
+    def _(input):
+        return input.new_empty(input.shape[0], input.shape[1] // 2)
+
+    @torch.library.register_fake("sgl_kernel::gelu_and_mul_cpu")
+    def _(input):
+        return input.new_empty(input.shape[0], input.shape[1] // 2)
+
+    @torch.library.register_fake("sgl_kernel::hc_pre_fused_cpu")
+    def _(x, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, rms_eps, hc_eps):
+        return (
+            torch.empty_like(x),
+            torch.empty_like(x),
+            torch.empty_like(x),
+        )
+
+    @torch.library.register_fake("sgl_kernel::hc_post_fused_cpu")
+    def _(x, residual, post, comb):
+        return torch.empty_like(x)
+
+    @torch.library.register_fake("sgl_kernel::hc_head_fused_cpu")
+    def _(x, hc_fn, hc_scale, hc_base, hc_eps, norm_eps):
+        return torch.empty_like(x)
+
+    @torch.library.register_fake("sgl_kernel::fused_linear_sigmoid_mul")
+    def _(mat1, mat2, bias, is_vnni, post_mul_mat):
+        M = mat1.shape[0]
+        N = mat2.shape[0]
+        return mat1.new_empty(M, N)
+
+    @torch.library.register_fake("sgl_kernel::mxfp4_scaled_mm_cpu")
+    def _(mat1, mat2, scales2, bias, is_vnni):
+        M = mat1.shape[0]
+        N = mat2.shape[0]
+        return mat1.new_empty(M, N, dtype=mat1.dtype)
+
+    @torch.library.register_fake("sgl_kernel::flash_mla_with_kvcache_cpu")
+    def _(
+        q, k_cache, head_dim_v, softmax_scale, indices,
+        topk_length=None, attn_sink=None, extra_k_cache=None,
+        extra_indices=None, extra_topk_length=None,
+        is_fp8_kvcache=False, fp8_layout=0,
+    ):
+        bs = q.shape[0]
+        num_heads = q.shape[1]
+        o = q.new_empty(bs, num_heads, head_dim_v)
+        lse = q.new_empty(bs, num_heads, dtype=torch.float32)
+        return o, lse
+
+    @torch.library.register_fake("sgl_kernel::alloc_decode_kernel_cpu")
+    def _(seq_lens, last_loc, free_pages, out_indices, page_size):
+        return
+
+    @torch.library.register_fake("sgl_kernel::alloc_extend_kernel_cpu")
+    def _(pre_lens, seq_lens, last_loc, free_pages, out_indices, page_size):
+        return
 
 
 # TODO Remove unnecessary settings for CPUGraphRunner.
