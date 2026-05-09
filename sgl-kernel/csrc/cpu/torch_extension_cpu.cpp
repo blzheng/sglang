@@ -452,6 +452,42 @@ at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& po
 
 at::Tensor hc_head_fused_cpu(
     at::Tensor& x, at::Tensor& hc_fn, at::Tensor& hc_scale, at::Tensor& hc_base, double hc_eps, double norm_eps);
+// compressor
+at::Tensor compress_decode_cpu(
+    at::Tensor& pool_kv,
+    at::Tensor& pool_score,
+    at::Tensor& kv,
+    at::Tensor& score,
+    at::Tensor& seq_lens,
+    at::Tensor& req_pool_indices,
+    at::Tensor& ape,
+    at::Tensor& norm_weight,
+    at::Tensor& freqs_cis,
+    int64_t ratio,
+    int64_t head_dim,
+    int64_t rope_head_dim,
+    bool overlap,
+    bool rotate,
+    double norm_eps);
+
+at::Tensor compress_extend_cpu(
+    at::Tensor& pool_kv,
+    at::Tensor& pool_score,
+    at::Tensor& kv,
+    at::Tensor& score,
+    at::Tensor& prefix_lens,
+    at::Tensor& extend_lens,
+    at::Tensor& req_pool_indices,
+    at::Tensor& ape,
+    at::Tensor& norm_weight,
+    at::Tensor& freqs_cis,
+    int64_t ratio,
+    int64_t head_dim,
+    int64_t rope_head_dim,
+    bool overlap,
+    bool rotate,
+    double norm_eps);
+
 // scheduler: paged allocation
 void alloc_extend_kernel_cpu(
     at::Tensor& pre_lens,
@@ -753,6 +789,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "hc_head_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
       "float hc_eps, float norm_eps) -> Tensor");
   m.impl("hc_head_fused_cpu", torch::kCPU, &hc_head_fused_cpu);
+
+  // scheduler: paged allocation
+  m.def(
+      "compress_decode_cpu(Tensor(a!) pool_kv, Tensor(b!) pool_score, Tensor kv, Tensor score, "
+      "Tensor seq_lens, Tensor req_pool_indices, Tensor ape, Tensor norm_weight, Tensor freqs_cis, "
+      "int ratio, int head_dim, int rope_head_dim, bool overlap, bool rotate, float norm_eps) -> Tensor");
+  m.impl("compress_decode_cpu", torch::kCPU, &compress_decode_cpu);
+
+  m.def(
+      "compress_extend_cpu(Tensor(a!) pool_kv, Tensor(b!) pool_score, Tensor kv, Tensor score, "
+      "Tensor prefix_lens, Tensor extend_lens, Tensor req_pool_indices, Tensor ape, Tensor norm_weight, "
+      "Tensor freqs_cis, int ratio, int head_dim, int rope_head_dim, bool overlap, bool rotate, "
+      "float norm_eps) -> Tensor");
+  m.impl("compress_extend_cpu", torch::kCPU, &compress_extend_cpu);
 
   // scheduler: paged allocation
   m.def(

@@ -531,6 +531,18 @@ class Compressor(nn.Module):
 
         return compressed_kv_output
 
+    def _get_freqs_cis_real(self):
+        """Return freqs_cis as real float32 [N, rope_dim] for CPU kernel."""
+        if not hasattr(self, "_freqs_cis_real"):
+            fc = self.freqs_cis
+            if fc.is_complex():
+                self._freqs_cis_real = torch.view_as_real(fc).contiguous().reshape(
+                    fc.size(0), -1
+                )
+            else:
+                self._freqs_cis_real = fc.contiguous()
+        return self._freqs_cis_real
+
     def compress_dispatch(
         self,
         kv_score: torch.Tensor,
@@ -544,10 +556,66 @@ class Compressor(nn.Module):
         assert (
             envs.SGLANG_OPT_USE_OLD_COMPRESSOR.get()
         ), "Compressor: non-fused path requires SGLANG_OPT_USE_OLD_COMPRESSOR=1"
-        self.compress_decode = self.compress_decode_old
-        self.compress_extend = self.compress_extend_old
+
         kv = kv_score[:, : self.coff * self.head_dim]
         score = kv_score[:, self.coff * self.head_dim :]
+
+        if _is_cpu and _is_cpu_amx_available:
+            pool = self._get_states(forward_batch)
+            assert isinstance(pool, KVAndScoreOld)
+            freqs_real = self._get_freqs_cis_real()
+            norm_weight = self.norm.weight.float()
+
+            forward_mode = forward_batch.forward_mode
+            if forward_mode.is_decode() or forward_mode.is_target_verify():
+                return torch.ops.sgl_kernel.compress_decode_cpu(
+                    pool.kv,
+                    pool.score,
+                    kv,
+                    score,
+                    forward_batch.seq_lens.to(torch.int64),
+                    forward_batch.req_pool_indices.to(torch.int64),
+                    self.ape,
+                    norm_weight,
+                    freqs_real,
+                    self.ratio,
+                    self.head_dim,
+                    self.rope_head_dim,
+                    self.overlap,
+                    self.rotate,
+                    self.norm.eps,
+                )
+            if forward_mode.is_extend():
+                prefix_lens_t = torch.tensor(
+                    forward_batch.extend_prefix_lens_cpu, dtype=torch.int64
+                )
+                extend_lens_t = torch.tensor(
+                    forward_batch.extend_seq_lens_cpu, dtype=torch.int64
+                )
+                return torch.ops.sgl_kernel.compress_extend_cpu(
+                    pool.kv,
+                    pool.score,
+                    kv,
+                    score,
+                    prefix_lens_t,
+                    extend_lens_t,
+                    forward_batch.req_pool_indices.to(torch.int64),
+                    self.ape,
+                    norm_weight,
+                    freqs_real,
+                    self.ratio,
+                    self.head_dim,
+                    self.rope_head_dim,
+                    self.overlap,
+                    self.rotate,
+                    self.norm.eps,
+                )
+            raise NotImplementedError(
+                f"Forward mode {forward_mode} not supported in CPU compressor."
+            )
+
+        self.compress_decode = self.compress_decode_old
+        self.compress_extend = self.compress_extend_old
         kv_and_scores = KVAndScoreOld(kv=kv, score=score)
         forward_mode = forward_batch.forward_mode
         if forward_mode.is_decode() or forward_mode.is_target_verify():
