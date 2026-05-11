@@ -108,6 +108,23 @@ std::tuple<at::Tensor, at::Tensor> hash_topk_cpu(
     int64_t num_experts,
     double routed_scaling_factor);
 
+void topk_transform_512_cpu(
+    at::Tensor& scores,
+    at::Tensor& seq_lens,
+    at::Tensor& page_tables,
+    at::Tensor& out_page_indices,
+    int64_t page_size,
+    const std::optional<at::Tensor>& out_raw_indices);
+
+at::Tensor fp8_paged_mqa_logits_cpu(
+    at::Tensor& q_fp8,
+    at::Tensor& kvcache_fp8,
+    at::Tensor& weight,
+    at::Tensor& seq_lens,
+    at::Tensor& page_table,
+    int64_t max_seq_len,
+    bool clean_logits);
+
 // attention
 void decode_attention_cpu(
     at::Tensor& query,
@@ -386,6 +403,13 @@ std::tuple<at::Tensor, at::Tensor> multimodal_rotary_embedding_cpu(
     bool mrope_interleaved,
     bool is_neox);
 
+at::Tensor apply_rotary_emb_interleaved_cpu(
+    at::Tensor& x,
+    at::Tensor& freqs,
+    bool inverse,
+    const std::optional<at::Tensor>& positions,
+    const std::optional<at::Tensor>& k);
+
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
@@ -508,6 +532,22 @@ void alloc_decode_kernel_cpu(
     at::Tensor& out_indices,
     int64_t page_size);
 
+// mhc kernels
+std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_fused_cpu(
+    at::Tensor& x,
+    at::Tensor& hc_fn,
+    at::Tensor& hc_scale,
+    at::Tensor& hc_base,
+    int64_t hc_mult,
+    int64_t sinkhorn_iters,
+    double rms_eps,
+    double hc_eps);
+
+at::Tensor hc_post_fused_cpu(at::Tensor& x, at::Tensor& residual, at::Tensor& post, at::Tensor& comb);
+
+at::Tensor hc_head_fused_cpu(
+    at::Tensor& x, at::Tensor& hc_fn, at::Tensor& hc_scale, at::Tensor& hc_base, double hc_eps, double norm_eps);
+
 // [NOTE] When registering kernels, we should accurately describe the in-place information.
 // Taking fused_add_rmsnorm_cpu as an example, add `Tensor(a!)` modifier to all tensors that
 // will be modified in-place to avoid incorrect fusing and execution order on graph mode.
@@ -574,6 +614,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "hash_topk_cpu(Tensor gating_output, Tensor tid2eid, int topk, str scoring_func, "
       "int num_fused_shared_experts, int num_experts, float routed_scaling_factor) -> (Tensor, Tensor)");
   m.impl("hash_topk_cpu", torch::kCPU, &hash_topk_cpu);
+
+  // DeepSeek V4 compressed attention top-k transform
+  m.def(
+      "topk_transform_512_cpu(Tensor scores, Tensor seq_lens, Tensor page_tables, Tensor(a!) out_page_indices, "
+      "int page_size, Tensor(a!)? out_raw_indices) -> ()");
+  m.impl("topk_transform_512_cpu", torch::kCPU, &topk_transform_512_cpu);
+
+  // DeepSeek V4 compressed attention FP8 paged MQA logits
+  m.def(
+      "fp8_paged_mqa_logits_cpu(Tensor q_fp8, Tensor kvcache_fp8, Tensor weight, Tensor seq_lens, "
+      "Tensor page_table, int max_seq_len, bool clean_logits) -> Tensor");
+  m.impl("fp8_paged_mqa_logits_cpu", torch::kCPU, &fp8_paged_mqa_logits_cpu);
 
   // decode
   m.def(
@@ -735,6 +787,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
   m.def("apply_rotary_pos_emb_cpu(Tensor query, Tensor key, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
+  m.def(
+      "apply_rotary_emb_interleaved_cpu(Tensor(a!) x, Tensor freqs, bool inverse, Tensor? positions=None, Tensor(b!)? "
+      "k=None) -> Tensor(a!)");
+  m.impl("apply_rotary_emb_interleaved_cpu", torch::kCPU, &apply_rotary_emb_interleaved_cpu);
 
   // multimodal rope
   m.def(
@@ -818,6 +874,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "alloc_decode_kernel_cpu(Tensor seq_lens, Tensor last_loc, "
       "Tensor free_pages, Tensor(a!) out_indices, int page_size) -> ()");
   m.impl("alloc_decode_kernel_cpu", torch::kCPU, &alloc_decode_kernel_cpu);
+
+  // mhc
+  m.def(
+      "hc_pre_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "int hc_mult, int sinkhorn_iters, float rms_eps, float hc_eps) -> (Tensor, Tensor, Tensor)");
+  m.impl("hc_pre_fused_cpu", torch::kCPU, &hc_pre_fused_cpu);
+
+  m.def("hc_post_fused_cpu(Tensor x, Tensor residual, Tensor post, Tensor comb) -> Tensor");
+  m.impl("hc_post_fused_cpu", torch::kCPU, &hc_post_fused_cpu);
+
+  m.def(
+      "hc_head_fused_cpu(Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
+      "float hc_eps, float norm_eps) -> Tensor");
+  m.impl("hc_head_fused_cpu", torch::kCPU, &hc_head_fused_cpu);
 }
 
 TORCH_LIBRARY_IMPL(sgl_kernel, CatchAll, m) {
