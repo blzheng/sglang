@@ -585,34 +585,34 @@ class Compressor(nn.Module):
                     self.rotate,
                     self.norm.eps,
                 )
-            if forward_mode.is_extend():
-                prefix_lens_t = torch.tensor(
-                    forward_batch.extend_prefix_lens_cpu, dtype=torch.int64
-                )
-                extend_lens_t = torch.tensor(
-                    forward_batch.extend_seq_lens_cpu, dtype=torch.int64
-                )
-                return torch.ops.sgl_kernel.compress_extend_cpu(
-                    pool.kv,
-                    pool.score,
-                    kv,
-                    score,
-                    prefix_lens_t,
-                    extend_lens_t,
-                    forward_batch.req_pool_indices.to(torch.int64),
-                    self.ape,
-                    norm_weight,
-                    freqs_real,
-                    self.ratio,
-                    self.head_dim,
-                    self.rope_head_dim,
-                    self.overlap,
-                    self.rotate,
-                    self.norm.eps,
-                )
-            raise NotImplementedError(
-                f"Forward mode {forward_mode} not supported in CPU compressor."
-            )
+            # if forward_mode.is_extend():
+            #     prefix_lens_t = torch.tensor(
+            #         forward_batch.extend_prefix_lens_cpu, dtype=torch.int64
+            #     )
+            #     extend_lens_t = torch.tensor(
+            #         forward_batch.extend_seq_lens_cpu, dtype=torch.int64
+            #     )
+            #     return torch.ops.sgl_kernel.compress_extend_cpu(
+            #         pool.kv,
+            #         pool.score,
+            #         kv,
+            #         score,
+            #         prefix_lens_t,
+            #         extend_lens_t,
+            #         forward_batch.req_pool_indices.to(torch.int64),
+            #         self.ape,
+            #         norm_weight,
+            #         freqs_real,
+            #         self.ratio,
+            #         self.head_dim,
+            #         self.rope_head_dim,
+            #         self.overlap,
+            #         self.rotate,
+            #         self.norm.eps,
+            #     )
+            # raise NotImplementedError(
+            #     f"Forward mode {forward_mode} not supported in CPU compressor."
+            # )
 
         self.compress_decode = self.compress_decode_old
         self.compress_extend = self.compress_extend_old
