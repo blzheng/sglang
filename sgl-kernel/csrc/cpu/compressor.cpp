@@ -370,17 +370,11 @@ void compress_decode_cpu_impl(
         int64_t d = 0;
 #if defined(CPU_CAPABILITY_AVX512)
         for (; d <= head_dim - 16; d += 16) {
-          __m512 sv = _mm512_loadu_ps(sr + d);
-          __m512 mx = _mm512_loadu_ps(compressed.data() + d);
-          __m512 diff = _mm512_sub_ps(sv, mx);
-          // Fast exp approximation via Sleef or cephes-style
-          // Use the vectorized exp from ATen
           fVec diff_v = fVec::loadu(sr + d) - fVec::loadu(compressed.data() + d);
           fVec exp_v = diff_v.exp();
           exp_v.store(sr + d);
-          __m512 ev = _mm512_loadu_ps(sr + d);
           __m512 sm = _mm512_loadu_ps(sum_buf + d);
-          _mm512_storeu_ps(sum_buf + d, _mm512_add_ps(sm, ev));
+          _mm512_storeu_ps(sum_buf + d, _mm512_add_ps(sm, (__m512)exp_v));
         }
 #endif
         for (; d < head_dim; ++d) {
@@ -388,7 +382,20 @@ void compress_decode_cpu_impl(
           sum_buf[d] += sr[d];
         }
       }
-      // 3) Compute inv_sum and weighted sum: output = sum(kv * softmax_weight) / sum
+      // 3) Pre-compute inv_sum, then weighted sum with division fused
+      // Compute inv_sum = 1/sum in-place in sum_buf
+      {
+        int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+        for (; d <= head_dim - 16; d += 16) {
+          __m512 sm = _mm512_loadu_ps(sum_buf + d);
+          _mm512_storeu_ps(sum_buf + d, _mm512_rcp14_ps(sm));
+        }
+#endif
+        for (; d < head_dim; ++d) {
+          sum_buf[d] = 1.0f / sum_buf[d];
+        }
+      }
       std::memset(compressed.data(), 0, head_dim * sizeof(float));
       for (int64_t r = 0; r < compress_rows; ++r) {
         const float* kr = kv_work.data() + r * head_dim;
@@ -397,27 +404,13 @@ void compress_decode_cpu_impl(
 #if defined(CPU_CAPABILITY_AVX512)
         for (; d <= head_dim - 16; d += 16) {
           __m512 kv = _mm512_loadu_ps(kr + d);
-          __m512 sw = _mm512_loadu_ps(sr + d);
+          __m512 sw = _mm512_mul_ps(_mm512_loadu_ps(sr + d), _mm512_loadu_ps(sum_buf + d));
           __m512 acc = _mm512_loadu_ps(compressed.data() + d);
           _mm512_storeu_ps(compressed.data() + d, _mm512_fmadd_ps(kv, sw, acc));
         }
 #endif
         for (; d < head_dim; ++d) {
-          compressed[d] += kr[d] * sr[d];
-        }
-      }
-      // Divide by sum
-      {
-        int64_t d = 0;
-#if defined(CPU_CAPABILITY_AVX512)
-        for (; d <= head_dim - 16; d += 16) {
-          __m512 acc = _mm512_loadu_ps(compressed.data() + d);
-          __m512 sm = _mm512_loadu_ps(sum_buf + d);
-          _mm512_storeu_ps(compressed.data() + d, _mm512_div_ps(acc, sm));
-        }
-#endif
-        for (; d < head_dim; ++d) {
-          compressed[d] /= sum_buf[d];
+          compressed[d] += kr[d] * sr[d] * sum_buf[d];
         }
       }
 
@@ -435,7 +428,7 @@ void compress_decode_cpu_impl(
 
       // Optional rotate (Hadamard transform)
       if (rotate) {
-        float scale = std::pow((float)head_dim, -0.5f);
+        float scale = 1.0f / std::sqrt((float)head_dim);
         hadamard_transform_row(output + b * head_dim, head_dim, scale);
       }
     }
@@ -642,9 +635,8 @@ void compress_extend_cpu_impl(
             fVec diff_v = fVec::loadu(sr + d) - fVec::loadu(col_max.data() + d);
             fVec exp_v = diff_v.exp();
             exp_v.store(sr + d);
-            __m512 ev = _mm512_loadu_ps(sr + d);
             __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
-            _mm512_storeu_ps(col_sum.data() + d, _mm512_add_ps(sm, ev));
+            _mm512_storeu_ps(col_sum.data() + d, _mm512_add_ps(sm, (__m512)exp_v));
           }
 #endif
           for (; d < head_dim; ++d) {
@@ -652,7 +644,19 @@ void compress_extend_cpu_impl(
             col_sum[d] += sr[d];
           }
         }
-        // 3) Weighted sum: compressed = sum(kv * softmax_weight) / sum
+        // 3) Pre-compute inv_sum, then fused weighted sum
+        {
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
+            _mm512_storeu_ps(col_sum.data() + d, _mm512_rcp14_ps(sm));
+          }
+#endif
+          for (; d < head_dim; ++d) {
+            col_sum[d] = 1.0f / col_sum[d];
+          }
+        }
         std::memset(compressed.data(), 0, head_dim * sizeof(float));
         for (int64_t r = 0; r < compress_rows; ++r) {
           const float* kr = kv_g + r * head_dim;
@@ -661,27 +665,13 @@ void compress_extend_cpu_impl(
 #if defined(CPU_CAPABILITY_AVX512)
           for (; d <= head_dim - 16; d += 16) {
             __m512 kv = _mm512_loadu_ps(kr + d);
-            __m512 sw = _mm512_loadu_ps(sr + d);
+            __m512 sw = _mm512_mul_ps(_mm512_loadu_ps(sr + d), _mm512_loadu_ps(col_sum.data() + d));
             __m512 acc = _mm512_loadu_ps(compressed.data() + d);
             _mm512_storeu_ps(compressed.data() + d, _mm512_fmadd_ps(kv, sw, acc));
           }
 #endif
           for (; d < head_dim; ++d) {
-            compressed[d] += kr[d] * sr[d];
-          }
-        }
-        // Divide by sum
-        {
-          int64_t d = 0;
-#if defined(CPU_CAPABILITY_AVX512)
-          for (; d <= head_dim - 16; d += 16) {
-            __m512 acc = _mm512_loadu_ps(compressed.data() + d);
-            __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
-            _mm512_storeu_ps(compressed.data() + d, _mm512_div_ps(acc, sm));
-          }
-#endif
-          for (; d < head_dim; ++d) {
-            compressed[d] /= col_sum[d];
+            compressed[d] += kr[d] * sr[d] * col_sum[d];
           }
         }
 
@@ -698,7 +688,7 @@ void compress_extend_cpu_impl(
             false);
 
         if (rotate) {
-          float scale = std::pow((float)head_dim, -0.5f);
+          float scale = 1.0f / std::sqrt((float)head_dim);
           hadamard_transform_row(normed.data(), head_dim, scale);
         }
 
@@ -756,9 +746,8 @@ void compress_extend_cpu_impl(
             fVec diff_v = fVec::loadu(sr + d) - fVec::loadu(col_max.data() + d);
             fVec exp_v = diff_v.exp();
             exp_v.store(sr + d);
-            __m512 ev = _mm512_loadu_ps(sr + d);
             __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
-            _mm512_storeu_ps(col_sum.data() + d, _mm512_add_ps(sm, ev));
+            _mm512_storeu_ps(col_sum.data() + d, _mm512_add_ps(sm, (__m512)exp_v));
           }
 #endif
           for (; d < head_dim; ++d) {
@@ -766,7 +755,19 @@ void compress_extend_cpu_impl(
             col_sum[d] += sr[d];
           }
         }
-        // 3) Weighted sum
+        // 3) Pre-compute inv_sum, then fused weighted sum
+        {
+          int64_t d = 0;
+#if defined(CPU_CAPABILITY_AVX512)
+          for (; d <= head_dim - 16; d += 16) {
+            __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
+            _mm512_storeu_ps(col_sum.data() + d, _mm512_rcp14_ps(sm));
+          }
+#endif
+          for (; d < head_dim; ++d) {
+            col_sum[d] = 1.0f / col_sum[d];
+          }
+        }
         std::memset(compressed.data(), 0, head_dim * sizeof(float));
         for (int64_t r = 0; r < compress_rows; ++r) {
           const float* kr = kv_g + r * head_dim;
@@ -775,27 +776,13 @@ void compress_extend_cpu_impl(
 #if defined(CPU_CAPABILITY_AVX512)
           for (; d <= head_dim - 16; d += 16) {
             __m512 kv = _mm512_loadu_ps(kr + d);
-            __m512 sw = _mm512_loadu_ps(sr + d);
+            __m512 sw = _mm512_mul_ps(_mm512_loadu_ps(sr + d), _mm512_loadu_ps(col_sum.data() + d));
             __m512 acc = _mm512_loadu_ps(compressed.data() + d);
             _mm512_storeu_ps(compressed.data() + d, _mm512_fmadd_ps(kv, sw, acc));
           }
 #endif
           for (; d < head_dim; ++d) {
-            compressed[d] += kr[d] * sr[d];
-          }
-        }
-        // Divide by sum
-        {
-          int64_t d = 0;
-#if defined(CPU_CAPABILITY_AVX512)
-          for (; d <= head_dim - 16; d += 16) {
-            __m512 acc = _mm512_loadu_ps(compressed.data() + d);
-            __m512 sm = _mm512_loadu_ps(col_sum.data() + d);
-            _mm512_storeu_ps(compressed.data() + d, _mm512_div_ps(acc, sm));
-          }
-#endif
-          for (; d < head_dim; ++d) {
-            compressed[d] /= col_sum[d];
+            compressed[d] += kr[d] * sr[d] * col_sum[d];
           }
         }
 
@@ -810,7 +797,7 @@ void compress_extend_cpu_impl(
             false);
 
         if (rotate) {
-          float scale = std::pow((float)head_dim, -0.5f);
+          float scale = 1.0f / std::sqrt((float)head_dim);
           hadamard_transform_row(normed.data(), head_dim, scale);
         }
 
