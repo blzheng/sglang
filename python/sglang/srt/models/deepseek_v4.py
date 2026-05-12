@@ -863,11 +863,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
-            from sglang.srt.layers.mhc import mhc_post
-
-            return mhc_post(x, residual, post, comb)
-
         if _is_cpu and _cpu_amx:
             return torch.ops.sgl_kernel.hc_post_fused_cpu(
                 x,
@@ -875,6 +870,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 post,
                 comb,
             )
+
+        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+            from sglang.srt.layers.mhc import mhc_post
+
+            return mhc_post(x, residual, post, comb)
+
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
