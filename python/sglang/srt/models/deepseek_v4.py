@@ -404,6 +404,8 @@ class MQALayer(nn.Module):
         )
 
         self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
+        if _is_cpu and _cpu_amx:
+            self.overlap_store_cache = False
         self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
 
     def _compute_q_a(
