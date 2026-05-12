@@ -785,6 +785,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
+        if _is_cpu and _cpu_amx:
+            y, post, comb = torch.ops.sgl_kernel.hc_pre_fused_cpu(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
+            return y, post, comb, False
+
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
 
@@ -807,18 +820,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post.squeeze(-1), comb, norm is not None
 
-        if _is_cpu and _cpu_amx:
-            y, post, comb = torch.ops.sgl_kernel.hc_pre_fused_cpu(
-                x,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                self.hc_mult,
-                self.hc_sinkhorn_iters,
-                self.rms_norm_eps,
-                self.hc_eps,
-            )
-            return y, post, comb, False
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             import deep_gemm
 
