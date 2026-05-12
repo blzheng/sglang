@@ -3249,7 +3249,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Step span
         step_span_ctx = (
             torch.profiler.record_function(_build_step_span_name(forward_batch))
-            if torch.autograd._profiler_enabled() and not (_is_cpu and _is_cpu_amx_available)
+            if torch.autograd._profiler_enabled()
+            and not (_is_cpu and _is_cpu_amx_available)
             else contextlib.nullcontext()
         )
         with (

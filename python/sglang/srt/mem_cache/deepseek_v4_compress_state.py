@@ -8,12 +8,13 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
-
+from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
+
+
 @dataclasses.dataclass
 class KVAndScore:
     kv_score: torch.Tensor

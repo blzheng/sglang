@@ -171,9 +171,7 @@ class CompressorBackendMixin:
                 cache_k=new_compressed_kv,
             )
         else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(
-                new_compressed_kv.bfloat16()
-            )
+            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
             token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(

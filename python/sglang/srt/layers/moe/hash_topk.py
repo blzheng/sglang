@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
+
 class HashTopK(nn.Module):
     def __init__(
         self,
@@ -113,7 +114,9 @@ class HashTopK(nn.Module):
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
             if _is_cpu and _is_cpu_amx_available:
                 # CPU SGL kernel path: tid2eid lookup done in Python, kernel does scoring + gather
-                tid2eid_for_tokens = self.tid2eid[input_ids]  # [num_tokens, routed_topk]
+                tid2eid_for_tokens = self.tid2eid[
+                    input_ids
+                ]  # [num_tokens, routed_topk]
                 topk_weights, topk_ids = torch.ops.sgl_kernel.hash_topk_cpu(
                     router_logits,
                     tid2eid_for_tokens,
