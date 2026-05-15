@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
@@ -220,11 +222,16 @@ class FusedMoE(torch.nn.Module):
         self.reduce_results = reduce_results
         self.use_presharded_weights = use_presharded_weights
 
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        self.use_triton_kernels = (
+            get_moe_runner_backend().is_triton_kernels()
+            if not (_is_cpu and _is_cpu_amx_available)
+            else False
+        )
         self.use_flashinfer_trtllm_moe = (
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
+        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
 
         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
         # Pad the intermediate_size_per_partition if necessary
@@ -282,7 +289,9 @@ class FusedMoE(torch.nn.Module):
                 self.quant_method = quant_config.get_quant_method(self, prefix)
             if self.quant_method is None:
                 self.quant_method = UnquantizedFusedMoEMethod(
-                    self.use_triton_kernels, self.use_flashinfer_trtllm_moe
+                    self.use_triton_kernels,
+                    self.use_flashinfer_trtllm_moe,
+                    self.use_deep_gemm,
                 )
 
         self.quant_method.create_weights(
@@ -454,6 +463,9 @@ class FusedMoE(torch.nn.Module):
             start = 0
 
         if self.use_padded_loading:
+            if _is_cpu:
+                if is_bias:
+                    shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -523,6 +535,9 @@ class FusedMoE(torch.nn.Module):
             shard_size = expert_data.shape[shard_dim]
 
         if self.use_padded_loading:
+            if _is_cpu:
+                if is_bias:
+                    shard_dim = 1
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -197,6 +199,10 @@ class DeepseekMoE(nn.Module):
                 None,  # w1_zp
                 None,  # w2_zp
                 None,  # block_size
+                None,  # w1_bias
+                None,  # w2_bias
+                None,  # alpha
+                None,  # limit
                 True,  # is_vnni
             )
         else:
