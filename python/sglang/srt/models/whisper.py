@@ -80,7 +80,7 @@ class WhisperAttention(torch.nn.Module):
         self.attn = RadixAttention(
             self.num_heads,
             head_dim,
-            scaling=1.0,
+            scaling=self.scaling,
             num_kv_heads=self.num_heads,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -170,7 +170,6 @@ class WhisperAttention(torch.nn.Module):
             else:
                 # CUDA path: KV cached during prefill, read from pool during decode.
                 q, _ = self.q_proj(hidden_states)
-                q = q * self.scaling
                 if cross_hidden_states is not None:
                     kv, _ = self.kv_proj(cross_hidden_states)
                     k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
@@ -181,7 +180,6 @@ class WhisperAttention(torch.nn.Module):
         else:
             qkv, _ = self.qkv_proj(hidden_states)
             q, k, v = qkv.chunk(chunks=3, dim=-1)
-            q = q * self.scaling
 
             if self.is_encoder:
                 num_heads = self.attn.tp_q_head_num
@@ -193,7 +191,7 @@ class WhisperAttention(torch.nn.Module):
                 v = v.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
 
                 attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    q, k, v, scale=1.0
+                    q, k, v, scale=self.scaling
                 )
                 attn_output = attn_output.permute(0, 2, 1, 3).reshape(
                     batch_size, seq_len, num_heads * head_dim
