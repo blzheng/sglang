@@ -18,7 +18,7 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, use_intel_amx_backend
 
 _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
@@ -195,6 +195,7 @@ class WhisperEncoderLayer(torch.nn.Module):
         self.activation_fn = get_act_fn(
             config.activation_function, quant_config=quant_config
         )
+        self.act = config.activation_function
 
         self.fc1 = ColumnParallelLinear(orig_embed_dim, config.encoder_ffn_dim)
         self.fc2 = RowParallelLinear(config.encoder_ffn_dim, orig_embed_dim)
@@ -214,10 +215,27 @@ class WhisperEncoderLayer(torch.nn.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states, _ = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
+        if (
+            self.act == "gelu"
+            and self.fc1.tp_size == 1
+            and use_intel_amx_backend(self.fc1)
+            and use_intel_amx_backend(self.fc2)
+        ):
+            hidden_states_shape = hidden_states.shape
+            hidden_states = torch.ops.sgl_kernel.fused_linear_gelu_linear(
+                hidden_states.view(-1, hidden_states_shape[-1]),
+                self.fc1.weight,
+                self.fc2.weight,
+                self.fc1.bias,
+                self.fc2.bias,
+                True,
+                True,
+            ).view(hidden_states_shape[0], hidden_states_shape[1], -1)
+        else:
+            hidden_states, _ = self.fc1(hidden_states)
+            hidden_states = self.activation_fn(hidden_states)
 
-        hidden_states, _ = self.fc2(hidden_states)
+            hidden_states, _ = self.fc2(hidden_states)
 
         hidden_states = residual + hidden_states
 
@@ -260,6 +278,7 @@ class WhisperDecoderLayer(torch.nn.Module):
         self.activation_fn = get_act_fn(
             config.activation_function, quant_config=quant_config
         )
+        self.act = config.activation_function
         self.self_attn_layer_norm = LayerNorm(orig_embed_dim)
         self.encoder_attn = WhisperAttention(
             orig_embed_dim=orig_embed_dim,
@@ -295,9 +314,25 @@ class WhisperDecoderLayer(torch.nn.Module):
 
         residual = decoder_hidden_states
         decoder_hidden_states = self.final_layer_norm(decoder_hidden_states)
-        decoder_hidden_states, _ = self.fc1(decoder_hidden_states)
-        decoder_hidden_states = self.activation_fn(decoder_hidden_states)
-        decoder_hidden_states, _ = self.fc2(decoder_hidden_states)
+        if (
+            self.act == "gelu"
+            and self.fc1.tp_size == 1
+            and use_intel_amx_backend(self.fc1)
+            and use_intel_amx_backend(self.fc2)
+        ):
+            decoder_hidden_states = torch.ops.sgl_kernel.fused_linear_gelu_linear(
+                decoder_hidden_states,
+                self.fc1.weight,
+                self.fc2.weight,
+                self.fc1.bias,
+                self.fc2.bias,
+                True,
+                True,
+            )
+        else:
+            decoder_hidden_states, _ = self.fc1(decoder_hidden_states)
+            decoder_hidden_states = self.activation_fn(decoder_hidden_states)
+            decoder_hidden_states, _ = self.fc2(decoder_hidden_states)
 
         decoder_hidden_states = residual + decoder_hidden_states
 
