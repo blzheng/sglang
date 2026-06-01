@@ -22,12 +22,14 @@ class CPUQuantAlgo(IntEnum):
     GPTQ = 1
 
 
-def amx_process_weight_after_loading(weight, is_conv=False):
+def amx_process_weight_after_loading(weight, is_conv=False, is_conv1d=False):
     if weight.device != torch.device("cpu"):
         return weight
     if not cpu_has_amx_support():
         return weight
-    if is_conv:
+    if is_conv1d:
+        return torch.ops.sgl_kernel.conv1d_weight_pack(weight)
+    elif is_conv:
         return torch.ops.sgl_kernel.causal_conv1d_weight_pack(
             weight.view(-1, weight.size(-1))
         )
@@ -81,7 +83,11 @@ def _init_amx_conv_state(conv_state):
 
 
 def _amx_process_weight_after_loading(
-    module, weight_names, transpose_dims=None, qweight_packed_method=None
+    module,
+    weight_names,
+    transpose_dims=None,
+    qweight_packed_method=None,
+    is_conv1d=False,
 ) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
@@ -103,7 +109,7 @@ def _amx_process_weight_after_loading(
 
             if transpose_dims and transpose_dims[i]:
                 weight_tensor = weight_tensor.transpose(*transpose_dims[i])
-            is_conv_weight = is_dim_conv_weight(weight_tensor)
+            is_conv_weight = is_dim_conv_weight(weight_tensor) or is_conv1d
             # We don't pack weight or use intel amx backend if any weight of this module has unsupported dim.
             if (
                 (not dim_is_supported(weight_tensor))
@@ -117,12 +123,14 @@ def _amx_process_weight_after_loading(
                 return
 
             packed_weight = torch.nn.Parameter(
-                amx_process_weight_after_loading(weight_tensor, is_conv_weight),
+                amx_process_weight_after_loading(
+                    weight_tensor, is_conv_weight, is_conv1d
+                ),
                 requires_grad=False,
             )
             packed_weight.__dict__ = weight_tensor.__dict__
             setattr(module, weight_name, packed_weight)
-            if is_conv_weight:
+            if is_conv_weight and not is_conv1d:
                 # need to use inplace copy for conv weight amx packing,
                 # as its usage in radix_linear_attention will use the original conv weight.
                 weight_tensor = weight_tensor.view(-1, weight_tensor.size(-1))
@@ -160,16 +168,18 @@ def _amx_process_weight_after_loading(
         module.use_intel_amx_backend
         and hasattr(module, "bias")
         and module.bias is not None
+        and not is_conv1d
     ):
         module.bias = torch.nn.Parameter(module.bias.data.float(), requires_grad=False)
 
 
 class PackWeightMethod:
-    def __init__(self, weight_names, transpose_dims=None):
+    def __init__(self, weight_names, transpose_dims=None, is_conv1d=False):
         self.weight_names = weight_names
         self.transpose_dims = transpose_dims
+        self.is_conv1d = is_conv1d
 
     def process_weights_after_loading(self, module) -> None:
         _amx_process_weight_after_loading(
-            module, self.weight_names, self.transpose_dims
+            module, self.weight_names, self.transpose_dims, is_conv1d=self.is_conv1d
         )
